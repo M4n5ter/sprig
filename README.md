@@ -1,19 +1,14 @@
 # Sprig
 
-Small branches of a directory, using the filesystem you already have.
+Native filesystem workspaces with one content-addressed revision history.
 
-Sprig is a **Linux-first workspace snapshot CLI** for independent working copies
-and named checkpoints. It uses Linux `FICLONE` to share
-copy-on-write file extents when supported, and falls back to a normal byte copy
-otherwise. There are no hardlinks between workspaces, database, daemon, FUSE
-mount, async runtime, or Rust dependencies.
+Sprig combines ordinary directories you can edit and execute with immutable
+revision manifests, branches, merges and recoverable workspace transactions.
+History stores BLAKE3-addressed FastCDC chunks, not a full native tree per commit.
+Working copies use per-file native cloning where available, with ordinary copy
+fallback. There is no database, daemon, FUSE mount or network service.
 
 ## Build
-
-Use the current **stable Rust** toolchain and Linux x86-64 or AArch64.
-The repository selects stable through `rust-toolchain.toml`, including rustfmt
-and Clippy. Cargo's `rust-version = "1.89"` records the minimum language/API
-requirement, not a pinned toolchain; CI runs stable.
 
 ```sh
 cargo build --release
@@ -21,111 +16,337 @@ export PATH="$PWD/target/release:$PATH"
 sprig --help
 ```
 
-macOS/APFS and Windows backends are not implemented in this version. A filesystem
-without reflink support works through the explicit ordinary-copy fallback.
+The repository selects current stable Rust, including rustfmt and Clippy.
+Cargo's minimum Rust version is 1.89, not a pinned development toolchain.
+CI is configured for stable Rust on Linux and macOS. The macOS job sets
+`SPRIG_REQUIRE_REFLINK=1` to require actual native clones, but has not run yet;
+the macOS backend remains unverified. Linux uses `FICLONE`; macOS uses
+`fclonefileat`. Neither is an atomic whole-directory snapshot, and cloning
+requires filesystem support. Windows is unsupported.
 
 ## Quick start
 
-Choose a store path that **does not exist** and is outside your source tree.
-Stop programs writing the source/workspace before copying or checkpointing.
+Choose a new store path outside your source tree. Stop external writers while
+importing, forking or capturing changes.
 
 ```sh
-sprig --store "$HOME/sprig-store" init
-sprig --store "$HOME/sprig-store" import ./my-project main
-sprig --store "$HOME/sprig-store" fork main experiment
-sprig --store "$HOME/sprig-store" show workspace experiment
-# Edit files under the printed tree path with your usual tools.
-sprig --store "$HOME/sprig-store" checkpoint experiment before-refactor
-sprig --store "$HOME/sprig-store" restore before-refactor restored
-sprig --store "$HOME/sprig-store" list
-sprig --store "$HOME/sprig-store" status
+STORE="$HOME/sprig-store"
+sprig --store "$STORE" init
+sprig --store "$STORE" import ./my-project main
+sprig --store "$STORE" fork main experiment
+sprig --store "$STORE" show experiment
+# Edit files at the returned path with your usual tools.
+sprig --store "$STORE" checkpoint experiment -m "Try a refactor"
+sprig --store "$STORE" diff main experiment
+sprig --store "$STORE" merge main experiment combined
+sprig --store "$STORE" checkout combined merged-work
+sprig --store "$STORE" exec merged-work -- sh -c 'pwd; ls'
 ```
 
-`restore` always creates a **new** workspace. It never replaces an existing one.
-`checkpoint` creates a named snapshot; Sprig has no command to edit one.
-Snapshots are immutable **through the tool**, not protected against direct disk
-writes by their owner. Never work directly in a snapshot tree.
+Import creates a workspace and same-named branch with an initial revision.
+Fork copies the current working tree, including uncommitted changes, and creates
+a new branch at the source workspace's base revision. Checkpoint the new
+workspace to add those changes to its history. `commit` aliases `checkpoint`.
 
-To bypass reflink attempts, put `--copy` before the command:
+A branch is a movable reference; a workspace is a native directory plus its
+branch and base revision. `checkout BRANCH NAME` creates a new workspace attached
+to an existing branch. `restore REVISION NAME` creates a new workspace and a new
+same-named branch. Neither replaces existing content. References accepted by
+history commands can be full revision IDs, branch names or `workspace:NAME`.
+The explicit workspace form resolves its committed base, not uncommitted files.
 
-```sh
-sprig --store "$HOME/sprig-store" --copy fork main portable-copy
+Merge creates a new output branch and leaves both input references unchanged.
+If one input already contains the other's history, the output reuses the newer
+revision without creating a merge commit. A non-fast-forward merge creates a
+two-parent revision. Conflicts create neither a branch nor a revision.
+Rollback changes the named branch, **not existing workspace files**. Use a new
+checkout to work on that head. `status` lists stale workspaces.
+
+## Commands
+
+All commands take `--store PATH` before the command. Use `COMMAND --help` for
+individual arguments.
+
+```text
+init
+import SOURCE NAME
+fork WORKSPACE NEW_NAME
+checkout BRANCH NAME
+restore REVISION NAME
+checkpoint WORKSPACE [-m MESSAGE] [--expected-head REVISION]
+resolve WORKSPACE PATH...
+branch NAME REVISION
+merge OURS THEIRS OUTPUT [--strategy conflict|lww] [--unit PATH,PATH]...
+                        [--expected-head REVISION]
+rollback BRANCH REVISION [-m MESSAGE] [--expected-head REVISION]
+log [REFERENCE]
+diff FROM TO
+diff-files FROM TO
+blame REFERENCE PATH
+read REFERENCE PATH
+ls REFERENCE [PATH]
+stat REFERENCE PATH
+grep REFERENCE PATTERN
+glob REFERENCE PATTERN
+list
+status
+show WORKSPACE
+exec WORKSPACE -- PROGRAM [ARGS...]
+drop workspace|branch NAME
+recover TOKEN NAME
+doctor
+recover-state GENERATION
+gc [--dry-run]
+stats
+backend
+write WORKSPACE PATH (--file INPUT | --text TEXT) [-m MESSAGE]
+edit WORKSPACE PATH OLD NEW [-m MESSAGE]
+cp WORKSPACE FROM TO [-m MESSAGE]
+mkdir WORKSPACE PATH [-m MESSAGE]
+rm WORKSPACE PATH [-m MESSAGE]
+mv WORKSPACE FROM TO [-m MESSAGE]
+chmod WORKSPACE OCTAL_MODE PATH [-m MESSAGE]
 ```
 
-Every successful copy reports counts of reflinked files, ordinarily copied
-files, and symbolic links. `show` includes these historical creation counts;
-`status` reports backend policy, not a promise that every file supports reflink.
-Reflinks save initial disk space but still require a tree walk and metadata work.
-Large numbers of small files can therefore remain expensive.
+All seven managed mutation commands also accept `--expected-head REVISION`.
+Names use 1–96 ASCII letters, digits, underscores or hyphens. Managed paths are
+relative to the workspace, not absolute paths or parent-directory escapes.
+`write --file` accepts arbitrary bytes; `--text` adds no trailing newline.
+`edit` requires exactly one match of OLD in a UTF-8 file. `cp` and `mv` use an
+exact destination path that must not exist. `chmod` accepts ordinary octal
+permission bits, such as `644` or `0755`.
+`diff` reports entry changes and moves. `diff-files` adds unified patches for
+text files within the 16-MiB read limit; binary/large changes have no patch and
+are explicitly marked. `blame` attributes entry content, type, mode and location,
+not individual text lines.
+`log` without a reference walks the history of current branch heads.
 
-## Drop and recover
+Read operations resolve a reference once and inspect its immutable revision.
+`read` streams raw bytes without an added newline; `--json` instead buffers the
+file and returns a byte array.
+`ls` lists immediate children, defaulting to the root. `stat` returns recorded
+entry metadata. `grep` searches literal text and skips binary/NUL-containing or
+larger-than-16-MiB files. `glob` uses standard globset patterns; quote patterns
+such as `'**/*.rs'` so your shell does not expand them first.
 
-```sh
-sprig --store "$HOME/sprig-store" drop workspace experiment
-# Copy the exact token printed by drop into the command below:
-sprig --store "$HOME/sprig-store" recover TRASH_TOKEN recovered-experiment
+Copy policy applies to import, fork and recovery of native workspace trees:
+
+- `--copy-mode auto` (default): try native cloning; copy if unsupported.
+- `--copy-mode copy`, or `--copy`: never try native cloning.
+- `--copy-mode clone`: fail if a regular file cannot be natively cloned.
+
+Checkout, revision restore and recovery of a dropped branch reconstruct files
+from chunks; they do not use the copy policy. Managed transactions use automatic
+clone/copy. `backend` describes the platform and filesystem, not a guarantee
+that every source/destination pair can clone.
+
+## History, concurrency and merge
+
+Revisions form a DAG with parent IDs, a logical clock, a message and an entry
+manifest. Identical chunks are shared across revisions. Native workspaces stay
+independent: there are no hardlinks between them. Stable logical entry IDs let
+managed moves and recognized native renames participate in history and merge.
+Native rename recognition is best effort, not a guarantee for arbitrary editor
+or filesystem operations.
+
+`--expected-head` adds an explicit caller-side revision check before publishing.
+A store-wide advisory lock coordinates metadata publication; it does not freeze
+other apps. Workspace commits use the same three-way engine as branch merges
+when their branch has advanced, rather than silently overwriting newer history.
+A checkpoint with no manifest change reuses the current revision instead of
+creating history solely for a different message.
+
+If a workspace commit conflicts, the branch stays unchanged and the command
+returns an error, but a new recoverable conflict generation becomes active.
+`show WORKSPACE` gives its path and pending conflicts. Resolve the content with
+your normal tools or managed `write`/`edit` operations, then acknowledge each
+path with `resolve WORKSPACE PATH...` and run `checkpoint` again. Marker checks
+and explicit acknowledgments still apply; fork and recovery preserve these
+pending guards. The original generation is retained. A further head change can
+require another merge. Workspace merges take `.lww` rules from the current
+branch head.
+
+The default three-way merge handles independent changes, identity-aware moves
+and non-overlapping UTF-8 text edits. It reports incompatible content, deletion,
+location or structural changes without publishing an output branch. Binary or
+oversized files are not text-merged. Content, mode and modification time are
+merged as separate fields so independent changes can coexist. A one-sided time
+change is retained; bilateral time changes use the greater timestamp.
+
+The left input's `.lww` rules opt selected paths into last-write-wins handling.
+For `merge`, OURS must be a branch and `--expected-head` checks that input head.
+Rules support gitignore-like globs, `!` negation and last-match precedence.
+`%include` paths are relative to the including file; patterns remain relative
+to the tree root. Includes are limited to 16 levels, 4,096 patterns and 1 MiB of
+aggregate UTF-8 rules; cycles, unsafe paths and missing/nonregular includes fail.
+For affected conflicts, the newer recorded modification time wins; ties choose
+the left input. Deletion uses the nearest surviving ancestor's time.
+`--strategy lww` applies this policy to all conflicts, selecting a conflicting
+structural component by its maximum timestamp. These are source filesystem
+times, not commit chronology; competing changes can be discarded.
+
+Repeated `--unit a,b` options group paths and their subtrees. If both sides
+change a unit, the side with the latest member modification time wins as a
+whole, with ties choosing the left input. Units bypass text and `.lww` decisions;
+when units overlap, the first has priority.
+
+Rollback appends a new commit with the selected revision's content and the
+current head as its parent. It never erases intervening history.
+
+## Managed writes and execution
+
+`write`, `edit`, `cp`, `mkdir`, `rm`, `mv` and `chmod` share the Rust library's
+`apply` transaction path. They edit and capture a private native generation,
+including existing uncommitted changes, and retain the previous generation in
+recoverable trash. Normally the new workspace and branch head publish together,
+returning `committed: true`.
+
+While a merge is pending, these operations instead save a new working generation
+with `committed: false` and leave the branch unchanged. This permits managed
+conflict-resolution edits without publishing unresolved content. Explicit
+`resolve`, then `checkpoint`, is still required to publish the result.
+
+**Run `show WORKSPACE` again after a managed mutation.** Its native path can
+change. Quiesce external writers and readers while changing generations, then
+reopen readers at the new path. Previously opened paths or editor file handles
+can still refer to the retained old generation. Direct edits at the current path
+are ordinary filesystem writes; only a later checkpoint records them in history.
+
+`exec` runs in the current workspace directory and inherits standard input,
+output and error. It holds a lease excluding Sprig's managed mutations of that
+workspace while the child runs. It does not checkpoint afterward, stop unrelated
+external writers, restrict network/filesystem access or create a sandbox. Run a
+checkpoint after the child exits to capture changes. `exec` returns the child's
+exit status and cannot be combined with `--json`.
+
+Library callers can apply several mutations in one transaction:
+
+```rust
+use std::path::Path;
+use sprig::{Mutation, Store};
+
+fn main() -> sprig::Result<()> {
+    let store = Store::open(Path::new("/path/to/store"))?;
+    let result = store.apply(
+        "main",
+        &[
+            Mutation::Mkdir { path: "notes".into() },
+            Mutation::Write {
+                path: "notes/idea.txt".into(),
+                content: b"A small experiment\n".to_vec(),
+            },
+        ],
+        "Add experiment notes",
+        None,
+    )?;
+    if !result.committed {
+        eprintln!("Edits saved; resolve pending conflicts before checkpointing.");
+    }
+    Ok(())
+}
 ```
 
-`drop snapshot NAME` is also supported. Drop renames the entire entry into trash;
-there is **no permanent purge command**. Recovery makes a new workspace and keeps
-the trash entry. `list` includes trash tokens. Names are 1–96 ASCII letters,
-digits, hyphens or underscores. Existing names, including dangling symlinks, are
-never overwritten.
+## Recovery and inspection
 
-## Safety model and limitations
+`drop workspace NAME` retains the native tree, including uncommitted files, in
+recoverable trash. It does not delete the branch. Drop attached workspaces before
+`drop branch NAME`. A branch's revision remains recoverable. `recover TOKEN NAME`
+creates a new workspace and branch without consuming the trash entry. `list`
+shows the exact recovery tokens.
 
-- **Quiesce all external writers.** A store-wide OS advisory lock serializes
-  Sprig commands and is released automatically if the process exits. It does not
-  freeze editors, databases, build tools, or other applications. A reflink is
-  per-file, not an atomic whole-directory snapshot. Concurrent external mutation
-  can produce inconsistent content or race the path walk. This is not a tool for
-  snapshotting hostile live trees or live databases.
-- The store is private to one trusted operating-system user. Do not change its
-  metadata, lock file, entry layout, or parent paths while Sprig is running. This
-  is not a security boundary against other processes with the same permissions.
-- Symlinks are copied as symlinks and are **never traversed during copying**.
-  Absolute links, dangling links, and links outside the workspace retain their
-  original text. Opening these links later in your editor or shell may access
-  files outside the workspace; a fork is not a sandbox.
-- Only directories, regular files, and symbolic links are accepted. Sockets,
-  FIFOs and device files fail the operation. Store/source containment and source
-  root symlinks are rejected. Managed entry roots and metadata symlinks are
-  rejected. Hardlinked source files become independent files in the copy.
-- Ordinary Unix permission bits (including executable bits) are preserved;
-  ownership, timestamps, ACLs, extended attributes, sparse layout and hardlink
-  relationships are **not guaranteed**. Set-user-ID/set-group-ID bits are stripped.
-  Reflink failure falls back to copying, including when source and store reside on
-  different filesystems. Copy fallback may require the full logical file size.
-- An entry is copied to `staging`, files and directory metadata are synced, then
-  the complete entry directory is renamed into its published namespace. Failed
-  or interrupted copies are not listed as usable entries and stay in staging for
-  manual inspection. No user content is automatically purged on failure.
-- Publication and drop use atomic rename within the store. This is not a
-  multi-operation transaction or a promise against every filesystem, hardware,
-  kernel or power-loss failure. A failure syncing directories *after* rename can
-  mean the operation took effect despite an error; inspect `list` before retrying.
-  A crash can leave staging entries; `status` reports their count. There is no
-  automatic repair or stale-data cleanup. Keep independent backups.
-- Import copies, never moves, the source. Restore never overwrites. The source
-  itself and any data reached by its symlinks are not modified by Sprig.
+`doctor` checks metadata and referenced content hashes, and reports orphaned
+revisions, native generations and staging entries. It does not repair or delete
+them automatically. `gc` is **dry-run only**, including without `--dry-run`.
+Its conservative reachability roots include branch heads, workspace bases,
+pending conflict candidates, trash, revision parents and state backups. There is no permanent purge command.
+Backups and retained generations intentionally consume space.
 
-## Layout
+`recover-state GENERATION` explicitly restores a validated metadata backup,
+including when the current state cannot be opened. It preserves the current
+state bytes for inspection rather than discarding them. Choose a generation
+from the store's `backups` directory carefully: restoring older metadata can
+move references back and leave later data unreferenced. This is recovery, not
+normal content rollback. Run `doctor` afterward; keep a separate store backup
+before manual recovery work.
+
+The store layout is:
 
 ```text
 STORE/
-  format
-  lock
-  workspaces/NAME/{record,tree/}
-  snapshots/NAME/{record,tree/}
-  trash/TOKEN/{record,tree/}
-  staging/UNPUBLISHED/{record,tree/}
+  state.json          # Versioned branch/workspace/trash metadata
+  lock                # Advisory metadata lock
+  objects/HASH        # Immutable content chunks
+  revisions/HASH.json # Immutable revision manifests and parents
+  native/GENERATION/  # Native working generations and lease files
+  staging/            # Unpublished metadata and retained recovery records
+  backups/            # Previous state generations
 ```
 
-The tiny line-oriented records identify the format and record creation backend
-counts. Directory names are the index, so no separate database can drift out of
-sync. An entry's `tree` directory is the only place to edit workspace content.
+Schema v2 does not silently reinterpret the original v1 snapshot format.
+Opening a legacy store fails without modifying it. To migrate, create a separate
+v2 store and import the old workspace tree paths; keep the old store as a backup.
+This imports current contents, not the old snapshot names or history.
+
+## JSON and exit codes
+
+`--json` produces one pretty-printed JSON object on stdout for results and errors:
+
+```json
+{"schema_version": 1, "result": {"initialized": true, "store": "/path/to/store"}}
+```
+
+```json
+{"schema_version": 1, "error": {"code": "operation_failed", "message": "..."}}
+```
+
+The output schema version is separate from the on-disk store format version.
+Object ordering is deterministic; generated IDs and changing store state are
+not fixed fixtures. Without `--json`, results are readable JSON without the
+wrapper and errors go to stderr. `read` is the raw-byte exception. Help and
+version output remain text.
+
+Exit codes: `0` success, `1` operation failure or an unhealthy doctor report,
+`2` invalid CLI arguments, `3` uncommitted merge conflicts. Merge conflicts return
+the full result with `committed: false` and conflict details, not an error wrapper.
+An unhealthy doctor likewise returns its full report. A workspace checkpoint
+conflict returns an error with exit `1`; inspect `show` for its pending state.
+A managed edit to an already-pending workspace succeeds with exit `0` and
+`committed: false`: inspect that field rather than assuming success published a
+revision. Normal commit results use `committed: true`, including unchanged
+checkpoints that reuse a revision. `exec` uses the child exit code instead of
+these meanings. Inspect state before retrying a failed publish.
+
+## Safety boundaries
+
+- Use trusted, quiescent trees. Source-change checks detect some races, not every
+  external write or hostile ancestor replacement. This is not a live-database
+  snapshot tool or a security boundary against your own operating-system user.
+- Keep store metadata and immutable objects private and unmodified. Immutability
+  is a tool contract, not protection from an owner editing raw storage files.
+- Regular files, directories and symlinks are supported. Symlinks are retained
+  without following them while copying or capturing; opening them later can
+  access paths outside the workspace. Special files and non-UTF-8 entry names
+  are rejected. Source roots cannot be symlinks or contain the store.
+- Ordinary Unix modes, including executable bits, and recorded modification
+  times are preserved, subject to filesystem timestamp precision. Special mode
+  bits are stripped. Ownership, access/change times, ACLs, extended attributes
+  and sparse layout are not preserved. Source hardlinks become independent
+  files with distinct logical identities; equal bytes still deduplicate in CAS.
+- Publication uses synced data and atomic metadata replacement within the
+  store. It is not a guarantee against every filesystem, kernel, hardware or
+  power-loss failure. A failure after publication may mean the action took
+  effect despite an error. Check `status`, `list` and `doctor` before retrying.
+- Failed attempts may leave unpublished objects or native generations for
+  inspection. Nothing is automatically purged. Keep independent backups.
+- Fork and checkpoint scan and hash the source tree; reflinks avoid copying
+  payload bytes but not these scans or metadata work. Ordinary copying may need
+  the complete logical file size. Chunk history saves repeated content, but
+  native working trees and retained generations have their own storage cost.
 
 ## Development
+
+Follow the [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html)
+where applicable to this standalone Cargo project.
 
 ```sh
 cargo fmt --check
@@ -133,14 +354,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Code follows the [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html)
-in context: idiomatic errors, small focused modules, clear naming, rustfmt,
-minimal abstraction, and one documented unsafe Linux ioctl call in production code. Chromium- and
-Fuchsia-specific infrastructure is not adopted. CI runs the Linux checks above.
-Tests exercise copy/fork independence, symlink handling, recoverability, failure
-publication, locks and path validation. Filesystem reflink availability is not
-assumed by the tests.
-
-This first version deliberately does not implement diffs, merges, mountable
-layers, background synchronization, quota management or distributed storage.
-No project license has been selected yet.
+The CLI is a thin adapter over the `sprig` library. Default tests accommodate
+filesystems without clone support; `SPRIG_REQUIRE_REFLINK=1 cargo test` requires
+real cloning and verifies isolation. Tests cover history, concurrency,
+transactions, recovery, storage integrity and the parser. The configured macOS
+CI run remains outstanding. No project license has been selected.

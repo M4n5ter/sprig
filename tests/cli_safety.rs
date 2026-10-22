@@ -1,121 +1,75 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
+//! Three grouped end-to-end contracts: native storage, history, and recovery.
+//! All data and subprocesses belong to disposable fixtures; no clone support is required.
 
-//! Black-box safety regressions. These tests exercise the shipped binary and
-//! inspect real files, rather than treating a successful exit as proof of safety.
-//! No test requires a reflink-capable filesystem or any external utility.
-
-use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::collections::BTreeSet;
+use std::ffi::CString;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sprig::content::{Entry, EntryKind};
+use sprig::{CopyMode, MergeStrategy, Mutation, Result, Store};
+
+// POSIX fork can briefly retain another test thread's advisory-lock fds.
+static TEST_RUN_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
     root: PathBuf,
-    store: PathBuf,
     source: PathBuf,
+    store_path: PathBuf,
+    store: Store,
 }
 
 impl Fixture {
-    fn new() -> Self {
-        // create_dir, rather than create_dir_all, prevents accidentally adopting
-        // any preexisting test directory, including one containing a symlink.
+    fn new() -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
-            "sprig-test-{}-{}",
+            "sprig-v2-{}-{}-{}",
             std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&root).expect("test fixture operation should succeed");
-        let store = root.join("store");
+        fs::create_dir(&root)?;
         let source = root.join("source");
-        fs::create_dir(&source).expect("test fixture operation should succeed");
-        Self {
+        fs::create_dir(&source)?;
+        let store_path = root.join("store");
+        let store = Store::init(&store_path)?;
+        Ok(Self {
             root,
-            store,
             source,
-        }
+            store_path,
+            store,
+        })
     }
 
-    fn initialized() -> Self {
-        let fixture = Self::new();
-        fixture.ok(&["init"]);
-        fixture
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.run_os(args.iter().map(OsStr::new))
-    }
-
-    fn run_os<I, S>(&self, args: I) -> Output
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sprig"));
-        command.arg("--store").arg(&self.store).args(args);
-        bounded_output(command)
+        command.arg("--store").arg(&self.store_path).args(args);
+        command
     }
 
-    fn ok(&self, args: &[&str]) -> String {
-        success(self.run(args))
+    fn cli(&self, args: &[&str]) -> Output {
+        let mut child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("test CLI should start");
+        wait_child(&mut child);
+        child
+            .wait_with_output()
+            .expect("test CLI output should be readable")
     }
 
-    fn fail(&self, args: &[&str]) -> String {
-        failure(self.run(args))
-    }
-
-    fn import(&self, name: &str, plain: bool) -> String {
-        let mut args = Vec::<OsString>::new();
-        if plain {
-            args.push("--copy".into());
-        }
-        args.extend([
-            "import".into(),
-            self.source.as_os_str().to_owned(),
-            name.into(),
-        ]);
-        success(self.run_os(args))
-    }
-
-    fn tree(&self, area: &str, name: &str) -> PathBuf {
-        self.store.join(area).join(name).join("tree")
-    }
-
-    fn write_source(&self) {
-        fs::create_dir(self.source.join("nested")).expect("test fixture operation should succeed");
-        fs::create_dir(self.source.join("empty")).expect("test fixture operation should succeed");
-        fs::write(self.source.join("hello.txt"), b"original\n")
-            .expect("test fixture operation should succeed");
-        fs::write(self.source.join("nested/binary"), [0, 255, 0, 42, 128])
-            .expect("test fixture operation should succeed");
-        fs::write(self.source.join("run.sh"), b"#!/bin/sh\nexit 0\n")
-            .expect("test fixture operation should succeed");
-        fs::set_permissions(
-            self.source.join("run.sh"),
-            fs::Permissions::from_mode(0o751),
-        )
-        .expect("test fixture operation should succeed");
-        fs::set_permissions(
-            self.source.join("nested"),
-            fs::Permissions::from_mode(0o750),
-        )
-        .expect("test fixture operation should succeed");
-        fs::set_permissions(&self.source, fs::Permissions::from_mode(0o750))
-            .expect("test fixture operation should succeed");
-    }
-
-    fn dropped_token(&self, kind: &str, name: &str) -> String {
-        self.ok(&["drop", kind, name])
-            .trim()
-            .strip_prefix("trash token: ")
-            .expect("drop must expose a usable trash token")
-            .to_owned()
+    fn state(&self) -> Vec<u8> {
+        fs::read(self.store_path.join("state.json")).expect("state should be readable")
     }
 }
 
@@ -125,995 +79,680 @@ impl Drop for Fixture {
     }
 }
 
-fn bounded_output(mut command: Command) -> Output {
-    // In particular, a blocking lock or attempted read of a special file must
-    // fail the test, not hang the entire suite indefinitely.
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let description = format!("{command:?}");
-    let mut child = command.spawn().expect("Sprig test binary should start");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if child
-            .try_wait()
-            .expect("child process status should be available")
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .expect("child output should be available");
-        }
+fn wait_child(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child
+        .try_wait()
+        .expect("child status should be readable")
+        .is_none()
+    {
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("child output should be available");
-            panic!("command timed out: {description}\n{output:?}");
+            let _ = child.wait();
+            panic!("test command exceeded its deadline");
         }
         thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn success(output: Output) -> String {
-    assert!(output.status.success(), "expected success, got {output:?}");
-    String::from_utf8(output.stdout).expect("CLI stdout should be UTF-8")
+// A release gate makes lease checks deterministic; Drop also releases it on panic.
+struct LeasedCommand {
+    child: Child,
+    release: PathBuf,
 }
-
-fn failure(output: Output) -> String {
-    assert!(!output.status.success(), "expected failure, got {output:?}");
-    let error = String::from_utf8(output.stderr).expect("CLI stderr should be UTF-8");
-    assert!(
-        error.contains("sprig:"),
-        "missing actionable error: {error:?}"
-    );
-    error
-}
-
-fn contents(path: impl AsRef<Path>) -> Vec<u8> {
-    fs::read(path).expect("test fixture operation should succeed")
-}
-
-fn create_fifo(path: &Path) {
-    unsafe extern "C" {
-        fn mkfifo(
-            path: *const std::os::raw::c_char,
-            mode: std::os::raw::c_uint,
-        ) -> std::os::raw::c_int;
+impl Drop for LeasedCommand {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, b"release");
+        wait_child(&mut self.child);
     }
-    let path =
-        CString::new(path.as_os_str().as_bytes()).expect("fixture path must not contain NUL");
-    // SAFETY: the pathname is a live, NUL-terminated CString; mode_t is an
-    // unsigned int on the Linux platforms supported by this binary.
-    let result = unsafe { mkfifo(path.as_ptr(), 0o600) };
+}
+
+fn chunks(entry: &Entry) -> &[String] {
+    let EntryKind::File { chunks, .. } = &entry.kind else {
+        panic!("expected regular file");
+    };
+    chunks
+}
+
+fn file_names(path: &Path) -> BTreeSet<String> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect()
+}
+
+fn head(store: &Store, branch: &str) -> String {
+    store.list().unwrap().branches[branch].clone()
+}
+
+#[test]
+fn native_isolation_content_dedup_and_path_safety() -> Result<()> {
+    let _serial = TEST_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let f = Fixture::new()?;
+    let s = &f.store;
+    fs::create_dir(f.source.join("empty"))?;
+    fs::write(f.source.join("script"), b"#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(f.source.join("script"), fs::Permissions::from_mode(0o751))?;
+    let outside = f.root.join("outside");
+    fs::create_dir(&outside)?;
+    fs::write(outside.join("sentinel"), b"not imported")?;
+    symlink(&outside, f.source.join("escape"))?;
+    let mut random = 0x1234_5678_u64;
+    let data: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random as u8
+        })
+        .collect();
+    fs::write(f.source.join("large"), &data)?;
+    fs::write(f.source.join("duplicate"), &data)?;
+
+    let main = s.import(&f.source, "main", CopyMode::Copy)?;
+    let base = main.base_revision.clone();
+    assert!(main.path.is_dir() && main.path.join("empty").is_dir());
     assert_eq!(
-        result,
+        fs::metadata(main.path.join("script"))?.mode() & 0o777,
+        0o751
+    );
+    assert_eq!(fs::read_link(main.path.join("escape"))?, outside);
+    assert!(
+        s.read("main", "escape").is_err(),
+        "read must not dereference symbolic links"
+    );
+    assert!(
+        s.glob("main", "escape/**")?.is_empty(),
+        "symlink descendants must not be captured"
+    );
+    let original = s.stat("main", "large")?;
+    assert!(
+        chunks(&original).len() > 4,
+        "large files must be content-defined chunks"
+    );
+    assert_eq!(chunks(&original), chunks(&s.stat("main", "duplicate")?));
+    assert!(
+        s.stats()?.object_bytes < 2 * data.len() as u64,
+        "duplicate files share their chunk objects"
+    );
+    assert_eq!(
+        s.checkpoint("main", "no content change", None)?.revision,
+        base
+    );
+
+    let require_reflink = std::env::var_os("SPRIG_REQUIRE_REFLINK").is_some();
+    let mode = if require_reflink {
+        CopyMode::Clone
+    } else {
+        CopyMode::Auto
+    };
+    let fork = s.fork("main", "fork", mode)?;
+    if require_reflink {
+        let stats = fork.copy_stats.as_ref().expect("fork reports backend use");
+        assert!(
+            stats.cloned > 0 && stats.copied == 0,
+            "required CoW backend must not silently fall back"
+        );
+    }
+    for path in [&f.source, &main.path] {
+        assert_ne!(
+            fs::metadata(path.join("large"))?.ino(),
+            fs::metadata(fork.path.join("large"))?.ino(),
+            "copy-on-write may share extents but never mutable inodes across trees"
+        );
+    }
+    let mut inserted = b"a small insertion at the start\n".to_vec();
+    inserted.extend_from_slice(&data);
+    fs::write(fork.path.join("large"), &inserted)?;
+    let changed = s.checkpoint("fork", "insert prefix", None)?.revision;
+    assert_eq!(fs::read(f.source.join("large"))?, data);
+    assert_eq!(fs::read(main.path.join("large"))?, data);
+    assert_eq!(s.read(&base, "large")?, data);
+    let new_chunks = s.stat(&changed, "large")?;
+    let retained = chunks(&original)
+        .iter()
+        .filter(|chunk| chunks(&new_chunks).contains(chunk))
+        .count();
+    assert!(
+        retained * 4 >= chunks(&original).len() * 3,
+        "a shifted file must reuse most CDC chunks"
+    );
+    let restored = s.restore(&changed, "restored")?;
+    assert_eq!(fs::read(restored.path.join("large"))?, inserted);
+    assert_eq!(fs::read_link(restored.path.join("escape"))?, outside);
+    let mut streamed = Vec::new();
+    s.read_to(&changed, "large", &mut streamed)?;
+    assert_eq!(streamed, inserted);
+
+    let state = f.state();
+    for path in [
+        "../outside/sentinel".to_owned(),
+        outside.join("sentinel").to_string_lossy().into_owned(),
+        "escape/sentinel".to_owned(),
+        "escape".to_owned(),
+    ] {
+        assert!(
+            s.apply(
+                "main",
+                &[Mutation::Write {
+                    path,
+                    content: b"unsafe".to_vec()
+                }],
+                "reject",
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(f.state(), state, "unsafe paths must publish nothing");
+    }
+    assert_eq!(fs::read(outside.join("sentinel"))?, b"not imported");
+    let fifo = CString::new(f.source.join("special").as_os_str().as_bytes())?;
+    // SAFETY: a valid NUL-terminated path owned by this fixture, ordinary mode bits.
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) },
         0,
         "cannot create FIFO fixture: {}",
         std::io::Error::last_os_error()
     );
+    assert!(
+        s.import(&f.source, "special", CopyMode::Copy).is_err(),
+        "special files are not snapshot data"
+    );
+    assert_eq!(f.state(), state);
+    assert!(!s.list()?.branches.contains_key("special"));
+    Ok(())
 }
 
-fn assert_distinct_files(a: impl AsRef<Path>, b: impl AsRef<Path>) {
-    let a = fs::metadata(a).expect("test fixture operation should succeed");
-    let b = fs::metadata(b).expect("test fixture operation should succeed");
+#[test]
+fn shared_branch_merges_conflicts_and_immutable_branch_outputs() -> Result<()> {
+    let _serial = TEST_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let f = Fixture::new()?;
+    let s = &f.store;
+    let original_text = b"first\nkeep one\nkeep two\nkeep three\nlast\n";
+    fs::write(f.source.join("text"), original_text)?;
+    fs::write(f.source.join("script"), b"old script\n")?;
+    fs::set_permissions(f.source.join("script"), fs::Permissions::from_mode(0o644))?;
+    fs::create_dir(f.source.join("directory"))?;
+    fs::write(f.source.join("directory/child"), b"before\n")?;
+    let first = s.import(&f.source, "main", CopyMode::Copy)?;
+    let base = first.base_revision.clone();
+    let child_id = s.stat(&base, "directory/child")?.id;
+    let stale = s.checkout("main", "stale")?;
+    fs::write(
+        first.path.join("text"),
+        b"FIRST\nkeep one\nkeep two\nkeep three\nlast\n",
+    )?;
+    fs::rename(first.path.join("directory"), first.path.join("renamed"))?;
+    fs::set_permissions(first.path.join("script"), fs::Permissions::from_mode(0o755))?;
+    let advanced = s.checkpoint("main", "first writer", None)?.revision;
+    fs::write(
+        stale.path.join("text"),
+        b"first\nkeep one\nkeep two\nkeep three\nLAST\n",
+    )?;
+    fs::write(
+        stale.path.join("directory/child"),
+        b"edited through original path\n",
+    )?;
+    fs::write(stale.path.join("script"), b"new script\n")?;
+    assert!(s.status()?.stale_workspaces.contains(&"stale".to_owned()));
+    let state = f.state();
+    assert!(
+        s.checkpoint("stale", "wrong expected head", Some(&base))
+            .is_err()
+    );
+    assert_eq!(
+        f.state(),
+        state,
+        "explicit CAS failures must not publish a generation"
+    );
+    let merged = s.checkpoint("stale", "second writer", None)?.revision;
+    let log = s.log(Some(&merged))?;
+    assert_eq!(
+        log[0].parents.len(),
+        2,
+        "automatic merges retain both histories"
+    );
+    assert!(log[0].parents.contains(&advanced));
+    assert_eq!(
+        s.read("main", "text")?,
+        b"FIRST\nkeep one\nkeep two\nkeep three\nLAST\n"
+    );
+    assert_eq!(
+        s.read("main", "renamed/child")?,
+        b"edited through original path\n"
+    );
+    assert_eq!(s.stat("main", "renamed/child")?.id, child_id);
+    assert_eq!(
+        s.stat("main", "script")?.mode,
+        0o755,
+        "mode and contents merge independently"
+    );
+    assert_eq!(s.read("main", "script")?, b"new script\n");
+    assert!(
+        s.diff(&base, &merged)?
+            .iter()
+            .any(|change| change.path == "renamed/child"
+                && change.previous_path.as_deref() == Some("directory/child"))
+    );
+
+    let writer = s.checkout("main", "writer")?;
+    let rival = s.checkout("main", "rival")?;
+    fs::write(writer.path.join("text"), b"writer choice\n")?;
+    let winning = s.checkpoint("writer", "winner", None)?.revision;
+    fs::write(rival.path.join("text"), b"rival choice\n")?;
+    let error = s
+        .checkpoint("rival", "conflict", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("merge_conflict"), "{error}");
+    assert_eq!(
+        head(s, "main"),
+        winning,
+        "a conflict cannot move the branch"
+    );
+    let conflict = s.show("rival")?;
     assert_ne!(
-        (a.dev(), a.ino()),
-        (b.dev(), b.ino()),
-        "copies must never share a writable inode"
-    );
-}
-
-fn assert_fixture_contents(tree: &Path) {
-    assert_eq!(contents(tree.join("hello.txt")), b"original\n");
-    assert_eq!(contents(tree.join("nested/binary")), [0, 255, 0, 42, 128]);
-    assert_eq!(contents(tree.join("run.sh")), b"#!/bin/sh\nexit 0\n");
-    assert!(tree.join("empty").is_dir());
-    assert_eq!(
-        fs::metadata(tree.join("run.sh"))
-            .expect("test fixture operation should succeed")
-            .mode()
-            & 0o777,
-        0o751
+        conflict.path, rival.path,
+        "conflicts use a new recoverable generation"
     );
     assert_eq!(
-        fs::metadata(tree.join("nested"))
-            .expect("test fixture operation should succeed")
-            .mode()
-            & 0o777,
-        0o750
+        fs::read(rival.path.join("text"))?,
+        b"rival choice\n",
+        "original dirty bytes remain intact"
     );
-    assert_eq!(
-        fs::metadata(tree)
-            .expect("test fixture operation should succeed")
-            .mode()
-            & 0o777,
-        0o750
-    );
-}
-
-#[test]
-fn forced_copy_preserves_bytes_permissions_empty_directories_and_independence() {
-    let f = Fixture::initialized();
-    f.write_source();
-    fs::write(f.source.join("read_only"), b"read-only data")
-        .expect("test fixture operation should succeed");
-    fs::set_permissions(
-        f.source.join("read_only"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .expect("test fixture operation should succeed");
-    let output = f.import("main", true);
-    assert!(output.contains("reflink=0 copy=4 symlink=0"), "{output}");
-    let main = f.tree("workspaces", "main");
-    assert_fixture_contents(&main);
-    assert_eq!(contents(main.join("read_only")), b"read-only data");
-    assert_eq!(
-        fs::metadata(main.join("read_only"))
-            .expect("test fixture operation should succeed")
-            .mode()
-            & 0o777,
-        0o444
-    );
-    assert_distinct_files(f.source.join("hello.txt"), main.join("hello.txt"));
-    fs::write(main.join("hello.txt"), b"workspace changed")
-        .expect("test fixture operation should succeed");
-    assert_eq!(contents(f.source.join("hello.txt")), b"original\n");
-    fs::write(f.source.join("nested/binary"), b"source changed")
-        .expect("test fixture operation should succeed");
-    assert_eq!(contents(main.join("nested/binary")), [0, 255, 0, 42, 128]);
-    assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
-    );
-}
-
-#[test]
-fn default_backend_and_fork_checkpoint_restore_are_independent() {
-    let f = Fixture::initialized();
-    f.write_source();
-    let report = f.import("main", false);
-    assert!(report.starts_with("published: reflink="));
-    let main = f.tree("workspaces", "main");
-    assert_fixture_contents(&main);
-    assert_distinct_files(f.source.join("hello.txt"), main.join("hello.txt"));
-    f.ok(&["fork", "main", "branch"]);
-    let branch = f.tree("workspaces", "branch");
-    assert_fixture_contents(&branch);
-    assert_distinct_files(main.join("hello.txt"), branch.join("hello.txt"));
-    fs::write(branch.join("hello.txt"), b"branch checkpoint\n")
-        .expect("test fixture operation should succeed");
-    assert_eq!(contents(main.join("hello.txt")), b"original\n");
-    f.ok(&["checkpoint", "branch", "saved"]);
-    let saved = f.tree("snapshots", "saved");
-    assert_distinct_files(branch.join("hello.txt"), saved.join("hello.txt"));
-    fs::write(branch.join("hello.txt"), b"branch after checkpoint\n")
-        .expect("test fixture operation should succeed");
-    assert_eq!(contents(saved.join("hello.txt")), b"branch checkpoint\n");
-    f.ok(&["restore", "saved", "restored"]);
-    let restored = f.tree("workspaces", "restored");
-    assert_distinct_files(saved.join("hello.txt"), restored.join("hello.txt"));
-    assert_eq!(contents(restored.join("hello.txt")), b"branch checkpoint\n");
-    fs::write(restored.join("hello.txt"), b"restored changed\n")
-        .expect("test fixture operation should succeed");
-    assert_eq!(contents(saved.join("hello.txt")), b"branch checkpoint\n");
-    assert_eq!(
-        contents(branch.join("hello.txt")),
-        b"branch after checkpoint\n"
-    );
-    assert_eq!(contents(main.join("hello.txt")), b"original\n");
-    assert_eq!(contents(f.source.join("hello.txt")), b"original\n");
-    for tree in [&branch, &saved, &restored] {
-        assert_eq!(
-            fs::metadata(tree.join("run.sh"))
-                .expect("test fixture operation should succeed")
-                .mode()
-                & 0o777,
-            0o751
-        );
-    }
-}
-
-#[test]
-fn source_hardlinks_become_independent_regular_files() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("first"), b"linked source")
-        .expect("test fixture operation should succeed");
-    fs::hard_link(f.source.join("first"), f.source.join("second"))
-        .expect("test fixture operation should succeed");
-    f.import("main", false);
-    let tree = f.tree("workspaces", "main");
-    assert_distinct_files(tree.join("first"), tree.join("second"));
-    assert_distinct_files(f.source.join("first"), tree.join("first"));
-    fs::write(tree.join("first"), b"only one copy changed")
-        .expect("test fixture operation should succeed");
-    assert_eq!(contents(tree.join("second")), b"linked source");
-    assert_eq!(contents(f.source.join("first")), b"linked source");
-}
-
-#[test]
-fn copies_preserve_ordinary_permissions_but_strip_special_mode_bits() {
-    let f = Fixture::initialized();
-    fs::write(
-        f.source.join("data"),
-        b"inert permission fixture; never executed",
-    )
-    .expect("test fixture operation should succeed");
-    fs::create_dir(f.source.join("directory")).expect("test fixture operation should succeed");
-    fs::set_permissions(f.source.join("data"), fs::Permissions::from_mode(0o6751))
-        .expect("test fixture operation should succeed");
-    fs::set_permissions(
-        f.source.join("directory"),
-        fs::Permissions::from_mode(0o3750),
-    )
-    .expect("test fixture operation should succeed");
-    assert_eq!(
-        fs::metadata(f.source.join("data"))
-            .expect("test fixture operation should succeed")
-            .mode()
-            & 0o7777,
-        0o6751
-    );
-    assert_eq!(
-        fs::metadata(f.source.join("directory"))
-            .expect("test fixture operation should succeed")
-            .mode()
-            & 0o7777,
-        0o3750
-    );
-    for (name, plain) in [("copy", true), ("default", false)] {
-        f.import(name, plain);
-        let tree = f.tree("workspaces", name);
-        assert_eq!(
-            fs::metadata(tree.join("data"))
-                .expect("test fixture operation should succeed")
-                .mode()
-                & 0o7777,
-            0o751
-        );
-        assert_eq!(
-            fs::metadata(tree.join("directory"))
-                .expect("test fixture operation should succeed")
-                .mode()
-                & 0o7777,
-            0o750
-        );
-    }
-}
-
-#[test]
-fn symbolic_links_are_preserved_verbatim_and_never_traversed() {
-    let f = Fixture::initialized();
-    f.write_source();
-    let outside = f.root.join("outside");
-    fs::create_dir(&outside).expect("test fixture operation should succeed");
-    fs::write(outside.join("private"), b"outside sentinel")
-        .expect("test fixture operation should succeed");
-    create_fifo(&outside.join("must-not-traverse.fifo"));
-    let links = [
-        ("relative", PathBuf::from("nested/binary")),
-        ("dangling", PathBuf::from("missing")),
-        ("directory", outside.clone()),
-        ("external_file", outside.join("private")),
-        ("parent", PathBuf::from("..")),
-        ("loop", PathBuf::from("loop")),
-        ("store_link", f.store.clone()),
-    ];
-    for (name, target) in &links {
-        symlink(target, f.source.join(name)).expect("test fixture operation should succeed");
-    }
+    assert!(!conflict.pending_conflicts.is_empty());
+    assert!(fs::read_to_string(conflict.path.join("text"))?.contains("<<<<<<<"));
     assert!(
-        f.import("main", true)
-            .contains("reflink=0 copy=3 symlink=7")
+        s.checkpoint("rival", "cannot bypass resolve", None)
+            .is_err()
     );
-    f.ok(&["fork", "main", "branch"]);
-    f.ok(&["checkpoint", "main", "saved"]);
-    f.ok(&["restore", "saved", "restored"]);
-    let token = f.dropped_token("workspace", "branch");
-    f.ok(&["recover", &token, "recovered"]);
-    for (area, name) in [
-        ("workspaces", "main"),
-        ("snapshots", "saved"),
-        ("workspaces", "restored"),
-        ("workspaces", "recovered"),
-    ] {
-        let tree = f.tree(area, name);
-        for (link, target) in &links {
-            assert!(
-                fs::symlink_metadata(tree.join(link))
-                    .expect("test fixture operation should succeed")
-                    .file_type()
-                    .is_symlink()
-            );
-            assert_eq!(
-                fs::read_link(tree.join(link)).expect("test fixture operation should succeed"),
-                *target
-            );
-        }
-    }
-    assert_eq!(contents(outside.join("private")), b"outside sentinel");
-}
-
-#[test]
-fn non_utf8_file_names_and_link_targets_are_preserved() {
-    let f = Fixture::initialized();
-    let file_name = OsString::from_vec(vec![b'f', 0xff]);
-    let link_name = OsString::from_vec(vec![b'l', 0xfe]);
-    fs::write(f.source.join(&file_name), b"non-UTF8 name")
-        .expect("test fixture operation should succeed");
-    symlink(&file_name, f.source.join(&link_name)).expect("test fixture operation should succeed");
-    f.import("main", true);
-    let tree = f.tree("workspaces", "main");
-    assert_eq!(contents(tree.join(&file_name)), b"non-UTF8 name");
-    assert_eq!(
-        fs::read_link(tree.join(&link_name)).expect("test fixture operation should succeed"),
-        PathBuf::from(file_name)
-    );
-}
-
-#[test]
-fn drop_and_recover_retain_trash_and_never_reuse_its_writable_inode() {
-    let f = Fixture::initialized();
-    f.write_source();
-    f.import("main", true);
-    f.ok(&["checkpoint", "main", "saved"]);
-    for (kind, area, name, recovered) in [
-        ("workspace", "workspaces", "main", "recovered_workspace"),
-        ("snapshot", "snapshots", "saved", "recovered_snapshot"),
-    ] {
-        let old_inode = fs::metadata(f.tree(area, name).join("hello.txt"))
-            .expect("test fixture operation should succeed")
-            .ino();
-        let token = f.dropped_token(kind, name);
-        assert!(!f.store.join(area).join(name).exists());
-        let trash = f.tree("trash", &token);
-        assert_fixture_contents(&trash);
-        assert_eq!(
-            fs::metadata(trash.join("hello.txt"))
-                .expect("test fixture operation should succeed")
-                .ino(),
-            old_inode
-        );
-        assert!(f.ok(&["show", "trash", &token]).contains("sprig-entry-v1"));
-        f.ok(&["recover", &token, recovered]);
-        let restored = f.tree("workspaces", recovered);
-        assert_fixture_contents(&restored);
-        assert_distinct_files(trash.join("hello.txt"), restored.join("hello.txt"));
-        fs::write(restored.join("hello.txt"), b"recovered changed")
-            .expect("test fixture operation should succeed");
-        assert_eq!(contents(trash.join("hello.txt")), b"original\n");
-        let again = format!("{recovered}_again");
-        f.ok(&["recover", &token, &again]);
-        assert_fixture_contents(&f.tree("workspaces", &again));
-        assert!(f.ok(&["list"]).contains(&format!("trash\t{token}")));
-        f.fail(&["drop", "trash", &token]);
-        assert!(trash.exists());
-    }
-}
-
-#[test]
-fn existing_destinations_are_never_overwritten() {
-    let f = Fixture::initialized();
-    f.write_source();
-    f.import("main", true);
-    f.ok(&["fork", "main", "occupied"]);
-    f.ok(&["checkpoint", "main", "saved"]);
-    fs::write(
-        f.tree("workspaces", "occupied").join("hello.txt"),
-        b"keep workspace",
-    )
-    .expect("test fixture operation should succeed");
-    fs::write(
-        f.tree("snapshots", "saved").join("hello.txt"),
-        b"keep snapshot",
-    )
-    .expect("test fixture operation should succeed");
-    failure(f.run_os([
-        OsStr::new("import"),
-        f.source.as_os_str(),
-        OsStr::new("occupied"),
-    ]));
-    f.fail(&["fork", "main", "occupied"]);
-    f.fail(&["fork", "main", "main"]);
-    f.fail(&["checkpoint", "main", "saved"]);
-    f.fail(&["restore", "saved", "occupied"]);
-    let token = f.dropped_token("workspace", "main");
-    f.fail(&["recover", &token, "occupied"]);
-    assert_eq!(
-        contents(f.tree("workspaces", "occupied").join("hello.txt")),
-        b"keep workspace"
-    );
-    assert_eq!(
-        contents(f.tree("snapshots", "saved").join("hello.txt")),
-        b"keep snapshot"
-    );
-    assert!(f.tree("trash", &token).exists());
-    assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
-    );
-}
-
-#[test]
-fn dangling_symlink_destinations_are_collisions_not_free_names() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("data"), b"safe").expect("test fixture operation should succeed");
-    f.import("main", true);
-    for (area, command) in [("workspaces", "fork"), ("snapshots", "checkpoint")] {
-        let path = f.store.join(area).join("occupied");
-        let outside = f.root.join(format!("must-not-create-{area}"));
-        symlink(&outside, &path).expect("test fixture operation should succeed");
-        f.fail(&[command, "main", "occupied"]);
-        assert_eq!(
-            fs::read_link(path).expect("test fixture operation should succeed"),
-            outside
-        );
-        assert!(!outside.exists());
-    }
-    assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
-    );
-}
-
-#[test]
-fn unsafe_names_are_rejected_in_every_source_and_destination_position() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("data"), b"safe").expect("test fixture operation should succeed");
-    f.import("main", true);
-    f.ok(&["checkpoint", "main", "saved"]);
-    let token = f.dropped_token("workspace", "main");
-    f.ok(&["recover", &token, "main"]);
-    let escaped = f.root.join("escape").to_string_lossy().into_owned();
-    let too_long = "a".repeat(97);
-    let bad_names = [
-        "",
-        ".",
-        "..",
-        "../escape",
-        "a/b",
-        "a\\b",
-        "a.b",
-        "with space",
-        "é",
-        "a\nb",
-        &escaped,
-        &too_long,
-    ];
-    for bad in bad_names {
-        failure(f.run_os([OsStr::new("import"), f.source.as_os_str(), OsStr::new(bad)]));
-        for command in ["fork", "checkpoint"] {
-            f.fail(&[command, "main", bad]);
-            f.fail(&[command, bad, "new"]);
-        }
-        f.fail(&["restore", "saved", bad]);
-        f.fail(&["restore", bad, "new"]);
-        f.fail(&["recover", &token, bad]);
-        f.fail(&["recover", bad, "new"]);
-        for kind in ["workspace", "snapshot"] {
-            f.fail(&["drop", kind, bad]);
-            f.fail(&["show", kind, bad]);
-        }
-        f.fail(&["show", "trash", bad]);
-    }
-    assert!(!f.root.join("escape").exists());
-    assert!(!f.store.join("workspaces/new").exists());
-    assert!(!f.store.join("snapshots/new").exists());
-    assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
-    );
-    assert_eq!(contents(f.tree("workspaces", "main").join("data")), b"safe");
-}
-
-#[test]
-fn valid_name_boundaries_and_separate_namespaces_work() {
-    let f = Fixture::initialized();
-    let longest = "a".repeat(96);
-    f.import(&longest, true);
-    f.ok(&["fork", &longest, "AZaz09_-job"]);
-    f.ok(&["checkpoint", "AZaz09_-job", "AZaz09_-job"]);
-    assert!(f.tree("workspaces", "AZaz09_-job").is_dir());
-    assert!(f.tree("snapshots", "AZaz09_-job").is_dir());
-}
-
-#[test]
-fn non_utf8_entry_names_are_rejected_without_publication() {
-    let f = Fixture::initialized();
-    let invalid = OsString::from_vec(vec![b'n', 0xff]);
-    failure(f.run_os([OsStr::new("import"), f.source.as_os_str(), &invalid]));
-    assert_eq!(f.ok(&["list"]), "");
-    assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
-    );
-}
-
-#[test]
-fn store_source_overlap_is_rejected_even_through_canonical_aliases() {
-    let f = Fixture::initialized();
-    fs::create_dir(f.store.join("nested-source")).expect("test fixture operation should succeed");
-    let alias = f.root.join("alias");
-    symlink(&f.root, &alias).expect("test fixture operation should succeed");
-    for source in [
-        f.store.clone(),
-        f.root.clone(),
-        f.store.join("nested-source"),
-        alias.join("store/nested-source"),
-        f.source.join(".."),
-    ] {
-        let error =
-            failure(f.run_os([OsStr::new("import"), source.as_os_str(), OsStr::new("bad")]));
-        assert!(error.contains("contain one another"), "{source:?}: {error}");
-    }
-    assert_eq!(f.ok(&["list"]), "");
-    assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
-    );
-}
-
-#[test]
-fn import_requires_a_real_directory_not_a_root_symlink_or_regular_file() {
-    let f = Fixture::initialized();
-    let link = f.root.join("source-link");
-    let file = f.root.join("file");
-    symlink(&f.source, &link).expect("test fixture operation should succeed");
-    fs::write(&file, b"not a directory").expect("test fixture operation should succeed");
-    let trailing_slash = PathBuf::from(format!("{}/", link.display()));
-    let trailing_dot = link.join(".");
-    let repeated_slash_dot = PathBuf::from(format!("{}//./", link.display()));
-    for source in [
-        link,
-        trailing_slash,
-        trailing_dot,
-        repeated_slash_dot,
-        file,
-        f.root.join("missing"),
-    ] {
-        failure(f.run_os([OsStr::new("import"), source.as_os_str(), OsStr::new("bad")]));
-    }
-    assert_eq!(f.ok(&["list"]), "");
-}
-
-#[test]
-fn special_file_failure_leaves_only_unpublished_staging() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("normal"), b"normal file")
-        .expect("test fixture operation should succeed");
-    fs::create_dir(f.source.join("nested")).expect("test fixture operation should succeed");
-    create_fifo(&f.source.join("nested/fifo"));
-    let error = failure(f.run_os([
-        OsStr::new("import"),
-        f.source.as_os_str(),
-        OsStr::new("failed"),
-    ]));
-    assert!(error.contains("special file rejected"), "{error}");
-    assert!(!f.store.join("workspaces/failed").exists());
-    assert_eq!(f.ok(&["list"]), "");
-    let staged: Vec<_> = fs::read_dir(f.store.join("staging"))
-        .expect("test fixture operation should succeed")
-        .map(|entry| entry.expect("test fixture operation should succeed").path())
+    let paths: Vec<_> = conflict
+        .pending_conflicts
+        .iter()
+        .map(|item| item.path.clone())
         .collect();
-    assert_eq!(staged.len(), 1);
-    assert!(staged[0].join("tree").is_dir());
-    assert!(!staged[0].join("record").exists());
-    assert!(f.ok(&["status"]).contains("staging entries: 1"));
-    f.fail(&["fork", "failed", "forked"]);
-    f.fail(&["checkpoint", "failed", "saved"]);
-    f.fail(&["restore", "failed", "restored"]);
-    assert_eq!(contents(f.source.join("normal")), b"normal file");
-    fs::remove_file(f.source.join("nested/fifo")).expect("test fixture operation should succeed");
-    f.import("failed", true);
-    assert_eq!(
-        contents(f.tree("workspaces", "failed").join("normal")),
-        b"normal file"
+    assert!(
+        s.resolve_conflicts("rival", &paths)
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved_markers")
     );
     assert!(
-        staged[0].exists(),
-        "retry must not silently discard diagnostic staging"
+        s.gc()?.unreachable_revisions.is_empty(),
+        "pending candidates remain GC roots"
     );
-}
+    let pending_fork = s.fork("rival", "pending-fork", CopyMode::Copy)?;
+    assert_eq!(pending_fork.pending_conflicts.len(), paths.len());
+    assert!(
+        s.checkpoint("pending-fork", "must not escape conflict", None)
+            .is_err()
+    );
+    let pending_trash = s.drop_entry("workspace", "pending-fork")?;
+    let pending_recovered = s.recover(&pending_trash.token, "pending-recovered", CopyMode::Copy)?;
+    assert_eq!(pending_recovered.pending_conflicts.len(), paths.len());
+    assert!(
+        s.checkpoint("pending-recovered", "recovery must retain conflict", None)
+            .is_err()
+    );
 
-#[test]
-fn special_files_in_existing_entries_cannot_publish_forks_or_restores() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("data"), b"original").expect("test fixture operation should succeed");
-    f.import("main", true);
-    f.ok(&["checkpoint", "main", "saved"]);
-    f.ok(&["fork", "main", "dropped"]);
-    let token = f.dropped_token("workspace", "dropped");
-    for (area, name) in [
-        ("workspaces", "main"),
-        ("snapshots", "saved"),
-        ("trash", token.as_str()),
-    ] {
-        create_fifo(&f.tree(area, name).join("special"));
-    }
-    for (command, from, to, area) in [
-        ("fork", "main", "failed_fork", "workspaces"),
-        ("checkpoint", "main", "failed_checkpoint", "snapshots"),
-        ("restore", "saved", "failed_restore", "workspaces"),
-        ("recover", token.as_str(), "failed_recover", "workspaces"),
-    ] {
-        let error = f.fail(&[command, from, to]);
-        assert!(error.contains("special file rejected"), "{error}");
-        assert!(!f.store.join(area).join(to).exists());
-    }
+    let staged_edit = s.apply(
+        "rival",
+        &[Mutation::Edit {
+            path: "text".into(),
+            old: "rival choice".into(),
+            new: "staged choice".into(),
+        }],
+        "edit unresolved workspace",
+        None,
+    )?;
+    assert!(!staged_edit.committed);
+    assert_eq!(head(s, "main"), winning);
+    assert!(fs::read_to_string(s.show("rival")?.path.join("text"))?.contains("staged choice"));
+    let staged_write = s.apply(
+        "rival",
+        &[Mutation::Write {
+            path: "text".into(),
+            content: b"resolved explicitly\n".to_vec(),
+        }],
+        "prepare resolution",
+        None,
+    )?;
+    assert!(!staged_write.committed);
     assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        4
+        head(s, "main"),
+        winning,
+        "pending SDK writes must not publish a revision"
     );
-    assert!(!f.ok(&["list"]).contains("failed_"));
-    for (area, name) in [
-        ("workspaces", "main"),
-        ("snapshots", "saved"),
-        ("trash", token.as_str()),
-    ] {
-        assert_eq!(contents(f.tree(area, name).join("data")), b"original");
-    }
+    assert_eq!(s.read("main", "text")?, b"writer choice\n");
+    assert_eq!(s.show("rival")?.pending_conflicts.len(), paths.len());
+    assert!(
+        s.checkpoint("rival", "clean bytes still require explicit resolve", None)
+            .is_err()
+    );
+    assert!(fs::read_to_string(conflict.path.join("text"))?.contains("<<<<<<<"));
+    s.resolve_conflicts("rival", &paths)?;
+    let resolution = s.checkpoint("rival", "resolved", None)?;
+    assert!(resolution.committed);
+    let resolved = resolution.revision;
+    assert_eq!(s.log(Some(&resolved))?[0].parents.len(), 2);
+    assert_eq!(s.read("main", "text")?, b"resolved explicitly\n");
+
+    let left = s.restore(&base, "left")?;
+    let right = s.restore(&base, "right")?;
+    fs::write(left.path.join("left-only"), b"left")?;
+    fs::write(right.path.join("right-only"), b"right")?;
+    let left_head = s.checkpoint("left", "left", None)?.revision;
+    let right_head = s.checkpoint("right", "right", None)?.revision;
+    let output = s.merge(
+        "left",
+        "right",
+        "combined",
+        MergeStrategy::Conflict,
+        &[],
+        Some(&left_head),
+    )?;
+    assert!(output.committed && output.conflicts.is_empty());
+    let combined = output.revision.unwrap();
+    assert_eq!(
+        s.log(Some(&combined))?[0].parents,
+        [left_head.clone(), right_head.clone()]
+    );
+    assert_eq!(head(s, "left"), left_head);
+    assert_eq!(head(s, "right"), right_head);
+    assert!(!left.path.join("right-only").exists() && !right.path.join("left-only").exists());
+    assert_eq!(s.read("combined", "left-only")?, b"left");
+    assert_eq!(s.read("combined", "right-only")?, b"right");
+    let revisions = s.stats()?.revisions;
+    let ff = s.merge(
+        "left",
+        "combined",
+        "fast-forward",
+        MergeStrategy::Conflict,
+        &[],
+        None,
+    )?;
+    assert_eq!(ff.revision.as_deref(), Some(combined.as_str()));
+    assert_eq!(
+        s.stats()?.revisions,
+        revisions,
+        "fast-forward creates only a new reference"
+    );
+    assert!(
+        s.merge("left", "right", "left", MergeStrategy::Conflict, &[], None)
+            .is_err()
+    );
+    assert_eq!(head(s, "left"), left_head);
+    Ok(())
 }
 
 #[test]
-fn staging_entries_are_never_listed_or_used_as_published_sources() {
-    let f = Fixture::initialized();
-    let stage = f.store.join("staging/interrupted");
-    fs::create_dir_all(stage.join("tree")).expect("test fixture operation should succeed");
-    fs::write(stage.join("tree/partial"), b"unfinished")
-        .expect("test fixture operation should succeed");
-    fs::write(
-        stage.join("record"),
-        b"sprig-entry-v1\ncloned=0\ncopied=1\nsymlinks=0\n",
-    )
-    .expect("test fixture operation should succeed");
-    assert_eq!(f.ok(&["list"]), "");
-    assert!(f.ok(&["status"]).contains("staging entries: 1"));
-    f.fail(&["fork", "interrupted", "new"]);
-    f.fail(&["restore", "interrupted", "new"]);
-    f.fail(&["recover", "interrupted", "new"]);
-    f.fail(&["show", "workspace", "interrupted"]);
-    assert_eq!(contents(stage.join("tree/partial")), b"unfinished");
-}
+fn transactional_sdk_exec_leases_recovery_and_non_destructive_inspection() -> Result<()> {
+    let _serial = TEST_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let f = Fixture::new()?;
+    let s = &f.store;
+    fs::write(f.source.join("document"), b"one two\n")?;
+    let original = s.import(&f.source, "main", CopyMode::Copy)?;
+    let old_id = s.stat("main", "document")?.id;
+    let restore_generation = s.status()?.generation;
+    let state = f.state();
+    assert!(
+        s.apply(
+            "main",
+            &[
+                Mutation::Write {
+                    path: "document".into(),
+                    content: b"partial".to_vec()
+                },
+                Mutation::Edit {
+                    path: "document".into(),
+                    old: "absent".into(),
+                    new: "never".into()
+                },
+            ],
+            "must roll back all operations",
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(f.state(), state);
+    assert_eq!(fs::read(original.path.join("document"))?, b"one two\n");
+    assert_eq!(s.read("main", "document")?, b"one two\n");
+    let committed = s
+        .apply(
+            "main",
+            &[
+                Mutation::Copy {
+                    from: "document".into(),
+                    to: "copy".into(),
+                },
+                Mutation::Move {
+                    from: "document".into(),
+                    to: "moved".into(),
+                },
+                Mutation::Edit {
+                    path: "moved".into(),
+                    old: "one".into(),
+                    new: "three".into(),
+                },
+                Mutation::Chmod {
+                    path: "moved".into(),
+                    mode: 0o750,
+                },
+                Mutation::Mkdir {
+                    path: "directory".into(),
+                },
+                Mutation::Write {
+                    path: "directory/binary".into(),
+                    content: vec![0, 255, 128, 42],
+                },
+            ],
+            "atomic batch",
+            Some(&original.base_revision),
+        )?
+        .revision;
+    let current = s.show("main")?;
+    assert_ne!(current.path, original.path);
+    assert_eq!(
+        fs::read(original.path.join("document"))?,
+        b"one two\n",
+        "old generations stay recoverable"
+    );
+    assert!(!current.path.join("document").exists());
+    assert_eq!(s.read("main", "moved")?, b"three two\n");
+    assert_eq!(
+        s.stat("main", "moved")?.id,
+        old_id,
+        "move/edit preserves identity"
+    );
+    assert_ne!(
+        s.stat("main", "copy")?.id,
+        old_id,
+        "copy creates a new identity"
+    );
+    assert_eq!(s.stat("main", "moved")?.mode, 0o750);
+    let raw = f.cli(&["read", "main", "directory/binary"]);
+    assert!(raw.status.success(), "{raw:?}");
+    assert_eq!(
+        raw.stdout,
+        [0, 255, 128, 42],
+        "read stdout is exact bytes, not formatted text"
+    );
+    let json = f.cli(&["--json", "read", "main", "missing"]);
+    assert!(!json.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+    assert_eq!(error["schema_version"], 1);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("path not found"))
+    );
 
-#[test]
-fn init_refuses_existing_directories_files_symlinks_and_stores() {
-    for kind in ["directory", "file", "symlink"] {
-        let f = Fixture::new();
-        match kind {
-            "directory" => {
-                fs::create_dir(&f.store).expect("test fixture operation should succeed");
-                fs::write(f.store.join("sentinel"), b"do not adopt")
-                    .expect("test fixture operation should succeed");
-            }
-            "file" => fs::write(&f.store, b"do not replace")
-                .expect("test fixture operation should succeed"),
-            _ => symlink(f.root.join("missing"), &f.store)
-                .expect("test fixture operation should succeed"),
-        }
-        f.fail(&["init"]);
-        match kind {
-            "directory" => {
-                assert_eq!(contents(f.store.join("sentinel")), b"do not adopt");
-                assert!(!f.store.join("format").exists());
-            }
-            "file" => assert_eq!(contents(&f.store), b"do not replace"),
-            _ => assert_eq!(
-                fs::read_link(&f.store).expect("test fixture operation should succeed"),
-                f.root.join("missing")
-            ),
-        }
-    }
-    let f = Fixture::initialized();
-    f.import("main", true);
-    f.fail(&["init"]);
-    assert_eq!(f.ok(&["list"]), "workspaces\tmain\n");
-}
+    fs::write(current.path.join("uncommitted"), b"preserve dirty work")?;
+    let dropped = s.drop_entry("workspace", "main")?;
+    let branch = s.drop_entry("branch", "main")?;
+    let recovered = s.recover(&dropped.token, "recovered", CopyMode::Copy)?;
+    let recovered_branch = s.recover(&branch.token, "recovered-branch", CopyMode::Copy)?;
+    assert_eq!(
+        fs::read(recovered.path.join("uncommitted"))?,
+        b"preserve dirty work"
+    );
+    assert!(
+        !recovered_branch.path.join("uncommitted").exists(),
+        "branch recovery restores committed content only"
+    );
+    assert_eq!(
+        fs::read(current.path.join("uncommitted"))?,
+        b"preserve dirty work"
+    );
+    let trash = s.list()?.trash;
+    assert!(
+        trash.iter().any(|item| item.token == dropped.token)
+            && trash.iter().any(|item| item.token == branch.token),
+        "recovery copies rather than consumes trash"
+    );
 
-#[test]
-fn invalid_store_layout_and_format_are_rejected() {
-    for component in [
-        "format",
-        "lock",
-        "workspaces",
-        "snapshots",
-        "trash",
-        "staging",
-    ] {
-        let f = Fixture::initialized();
-        let path = f.store.join(component);
-        if path.is_dir() {
-            fs::remove_dir(&path).expect("test fixture operation should succeed");
-            fs::write(&path, b"not a directory").expect("test fixture operation should succeed");
-        } else {
-            fs::remove_file(&path).expect("test fixture operation should succeed");
-            fs::create_dir(&path).expect("test fixture operation should succeed");
-        }
-        f.fail(&["list"]);
-    }
-    for bad_format in [
-        b"".as_slice(),
-        b"sprig-store-v2\n",
-        b"sprig-store-v1\nextra\n",
-        &[0xff],
-    ] {
-        let f = Fixture::initialized();
-        fs::write(f.store.join("format"), bad_format)
-            .expect("test fixture operation should succeed");
-        f.fail(&["status"]);
-        assert_eq!(
-            fs::read_dir(f.store.join("staging"))
-                .expect("test fixture operation should succeed")
-                .count(),
-            0
-        );
-    }
-}
-
-#[test]
-fn store_components_and_root_cannot_be_symlinks() {
-    for component in [
-        "format",
-        "lock",
-        "workspaces",
-        "snapshots",
-        "trash",
-        "staging",
-    ] {
-        let f = Fixture::initialized();
-        let original = f.store.join(component);
-        let moved = f.root.join(format!("outside-{component}"));
-        fs::rename(&original, &moved).expect("test fixture operation should succeed");
-        symlink(&moved, &original).expect("test fixture operation should succeed");
-        f.fail(&["list"]);
+    let release = recovered.path.join("lease-release");
+    let mut running = LeasedCommand {
+        child: f.command(&["exec", "recovered", "--", "sh", "-c",
+            "printf started > lease-started; while test ! -e lease-release; do sleep 0.01; done; exit 7"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?,
+        release: release.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !recovered.path.join("lease-started").exists() {
+        assert!(Instant::now() < deadline, "exec must enter its workspace");
         assert!(
-            fs::symlink_metadata(original)
-                .expect("test fixture operation should succeed")
-                .file_type()
-                .is_symlink()
+            running.child.try_wait()?.is_none(),
+            "exec must stay alive until released"
         );
+        thread::sleep(Duration::from_millis(5));
     }
-    let f = Fixture::initialized();
-    let moved = f.root.join("real-store");
-    fs::rename(&f.store, &moved).expect("test fixture operation should succeed");
-    symlink(&moved, &f.store).expect("test fixture operation should succeed");
-    f.fail(&["list"]);
-    for suffix in ["/", "/.", "//./"] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sprig"));
-        command
-            .arg("--store")
-            .arg(format!("{}{suffix}", f.store.display()))
-            .arg("list");
-        failure(bounded_output(command));
-    }
-}
-
-#[test]
-fn malformed_entry_metadata_is_rejected_before_read_or_mutation() {
-    for bad_record in [
-        b"".as_slice(),
-        b"sprig-entry-v2\ncloned=0\ncopied=1\nsymlinks=0\n",
-        b"sprig-entry-v1\n",
-        b"sprig-entry-v1\ncloned=no\ncopied=1\nsymlinks=0\n",
-        b"sprig-entry-v1\ncloned=-1\ncopied=1\nsymlinks=0\n",
-        b"sprig-entry-v1\ncloned=0\ncopied=18446744073709551616\nsymlinks=0\n",
-        b"sprig-entry-v1\ncloned=0\ncopied=1\n",
-        b"sprig-entry-v1\ncloned=0\ncloned=1\nsymlinks=0\n",
-        b"sprig-entry-v1\ncloned=0\ncopied=1\nsymlinks=0",
-        b"sprig-entry-v1\ncloned=0\ncopied=1\nsymlinks=0\nextra=1\n",
-        &[0xff],
-    ] {
-        let f = Fixture::initialized();
-        fs::write(f.source.join("data"), b"original")
-            .expect("test fixture operation should succeed");
-        f.import("main", true);
-        fs::write(f.store.join("workspaces/main/record"), bad_record)
-            .expect("test fixture operation should succeed");
-        f.fail(&["show", "workspace", "main"]);
-        f.fail(&["list"]);
-        f.fail(&["fork", "main", "new"]);
-        f.fail(&["checkpoint", "main", "saved"]);
-        f.fail(&["drop", "workspace", "main"]);
-        assert_eq!(
-            contents(f.tree("workspaces", "main").join("data")),
-            b"original"
-        );
-        assert!(!f.store.join("workspaces/new").exists());
-        assert!(!f.store.join("snapshots/saved").exists());
-        assert_eq!(
-            fs::read_dir(f.store.join("trash"))
-                .expect("test fixture operation should succeed")
-                .count(),
-            0
-        );
-        assert_eq!(
-            fs::read_dir(f.store.join("staging"))
-                .expect("test fixture operation should succeed")
-                .count(),
-            0
-        );
-    }
-}
-
-#[test]
-fn missing_or_symlinked_entry_components_cannot_escape_validation() {
-    for component in ["entry", "tree", "record"] {
-        for replacement in ["missing", "symlink"] {
-            let f = Fixture::initialized();
-            fs::write(f.source.join("data"), b"original")
-                .expect("test fixture operation should succeed");
-            f.import("main", true);
-            let original = match component {
-                "entry" => f.store.join("workspaces/main"),
-                "tree" => f.tree("workspaces", "main"),
-                _ => f.store.join("workspaces/main/record"),
-            };
-            let moved = f.root.join("outside-entry-component");
-            fs::rename(&original, &moved).expect("test fixture operation should succeed");
-            if replacement == "symlink" {
-                symlink(&moved, &original).expect("test fixture operation should succeed");
-            }
-            f.fail(&["show", "workspace", "main"]);
-            f.fail(&["fork", "main", "new"]);
-            f.fail(&["drop", "workspace", "main"]);
-            assert!(moved.exists());
-            assert!(!f.store.join("workspaces/new").exists());
-            assert_eq!(
-                fs::read_dir(f.store.join("trash"))
-                    .expect("test fixture operation should succeed")
-                    .count(),
-                0
-            );
-        }
-    }
-}
-
-#[test]
-fn invalid_snapshot_and_trash_records_cannot_be_restored_or_recovered() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("data"), b"original").expect("test fixture operation should succeed");
-    f.import("main", true);
-    f.ok(&["checkpoint", "main", "saved"]);
-    let token = f.dropped_token("workspace", "main");
-    for (area, name, command) in [
-        ("snapshots", "saved", "restore"),
-        ("trash", token.as_str(), "recover"),
-    ] {
-        fs::write(f.store.join(area).join(name).join("record"), b"invalid\n")
-            .expect("test fixture operation should succeed");
-        f.fail(&[command, name, "new"]);
-        assert_eq!(contents(f.tree(area, name).join("data")), b"original");
-        assert!(!f.store.join("workspaces/new").exists());
-    }
-}
-
-#[test]
-fn operating_system_store_lock_blocks_readers_and_mutators_then_releases() {
-    let f = Fixture::initialized();
-    fs::write(f.source.join("data"), b"original").expect("test fixture operation should succeed");
-    f.import("main", true);
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(f.store.join("lock"))
-        .expect("test fixture operation should succeed");
-    lock.try_lock()
-        .expect("test fixture operation should succeed");
-    for args in [
-        vec!["list"],
-        vec!["status"],
-        vec!["show", "workspace", "main"],
-        vec!["fork", "main", "new"],
-        vec!["drop", "workspace", "main"],
-    ] {
-        let error = f.fail(&args);
-        assert!(error.contains("locked"), "{error}");
-    }
-    assert_eq!(
-        contents(f.tree("workspaces", "main").join("data")),
-        b"original"
+    assert!(
+        s.checkpoint("recovered", "blocked by lease", None)
+            .unwrap_err()
+            .to_string()
+            .contains("workspace_busy")
     );
+    assert!(s.status()?.active_leases.contains(&"recovered".to_owned()));
+    s.checkpoint("recovered-branch", "other workspaces remain usable", None)?;
+    fs::write(&release, b"release")?;
+    wait_child(&mut running.child);
     assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
+        running.child.wait()?.code(),
+        Some(7),
+        "CLI must preserve child exit status"
     );
-    assert_eq!(
-        fs::read_dir(f.store.join("trash"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
+    drop(running);
+    assert!(s.status()?.active_leases.is_empty());
+    s.checkpoint("recovered", "lease released", None)?;
+    assert!(
+        s.exec("recovered", "/definitely-not-a-sprig-program", &[])
+            .is_err()
     );
-    drop(lock);
-    f.ok(&["fork", "main", "new"]);
-    // A completed CLI process must not leave a stale userspace lock behind.
-    File::open(f.store.join("lock"))
-        .expect("test fixture operation should succeed")
-        .try_lock()
-        .expect("test fixture operation should succeed");
-}
+    s.checkpoint("recovered", "failed spawn also releases lease", None)?;
 
-#[test]
-fn list_status_and_show_report_actual_entries_and_copy_counts() {
-    let f = Fixture::initialized();
-    f.write_source();
-    symlink("hello.txt", f.source.join("link")).expect("test fixture operation should succeed");
-    f.import("zeta", true);
-    f.ok(&["--copy", "fork", "zeta", "alpha"]);
-    f.ok(&["--copy", "checkpoint", "alpha", "saved"]);
-    assert_eq!(
-        f.ok(&["list"]),
-        "workspaces\talpha\nworkspaces\tzeta\nsnapshots\tsaved\n"
+    // Revert metadata, not history, including after an interrupted generation and
+    // parseable but structurally invalid state. Keep the invalid bytes for diagnosis.
+    let incomplete = f.store_path.join("native/interrupted-generation");
+    fs::create_dir(&incomplete)?;
+    fs::write(incomplete.join("retained"), b"unfinished generation")?;
+    let mut invalid: serde_json::Value = serde_json::from_slice(&f.state())?;
+    invalid["branches"]["invalid/name"] = serde_json::Value::String(committed.clone());
+    let invalid_bytes = serde_json::to_vec(&invalid)?;
+    fs::write(f.store_path.join("state.json"), &invalid_bytes)?;
+    assert!(
+        Store::open(&f.store_path).is_err(),
+        "the fixture must actually be invalid"
     );
-    let shown = f.ok(&["show", "snapshot", "saved"]);
+    let recovered_state = Store::recover_state(&f.store_path, restore_generation)?;
+    assert!(recovered_state.generation > invalid["generation"].as_u64().unwrap());
     assert_eq!(
-        shown
-            .lines()
-            .next()
-            .expect("test fixture operation should succeed"),
-        f.tree("snapshots", "saved")
+        fs::read(incomplete.join("retained"))?,
+        b"unfinished generation"
+    );
+    let retained_invalid = fs::read_dir(f.store_path.join("staging"))?.any(|entry| {
+        let entry = entry.unwrap();
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("retained-state-")
+            && fs::read(entry.path()).is_ok_and(|bytes| bytes == invalid_bytes)
+    });
+    assert!(
+        retained_invalid,
+        "recovery must retain the invalid metadata bytes"
+    );
+    assert_eq!(s.read("main", "document")?, b"one two\n");
+    assert!(recovered.path.exists() && current.path.exists());
+    assert!(s.doctor()?.healthy);
+    let loose = b"unreachable test object";
+    let loose_hash = blake3::hash(loose).to_hex().to_string();
+    fs::write(f.store_path.join("objects").join(&loose_hash), loose)?;
+    let objects_before = file_names(&f.store_path.join("objects"));
+    let revisions_before = file_names(&f.store_path.join("revisions"));
+    let plan = s.gc()?;
+    assert!(plan.dry_run && plan.unreachable_objects.contains(&loose_hash));
+    assert!(
+        !plan.unreachable_revisions.contains(&committed),
+        "state backups protect former heads"
+    );
+    for retained in [&original.path, &current.path, &recovered.path] {
+        let directory = retained
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
             .to_str()
-            .expect("test fixture operation should succeed")
+            .unwrap();
+        assert!(
+            !plan.orphan_workspaces.iter().any(|name| name == directory),
+            "workspace/trash/backup roots are protected"
+        );
+    }
+    assert_eq!(
+        file_names(&f.store_path.join("objects")),
+        objects_before,
+        "GC must not delete objects"
+    );
+    assert_eq!(
+        file_names(&f.store_path.join("revisions")),
+        revisions_before
+    );
+    let entry = s.stat("main", "document")?;
+    let object = f.store_path.join("objects").join(&chunks(&entry)[0]);
+    let saved = fs::read(&object)?;
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o644))?;
+    fs::write(&object, b"corrupt")?;
+    let report = s.doctor()?;
+    assert!(
+        !report.healthy
+            && report
+                .errors
+                .iter()
+                .any(|message| message.contains("hash mismatch"))
     );
     assert!(
-        shown.contains("sprig-entry-v1\ncloned=0\ncopied=3\nsymlinks=1\n"),
-        "{shown}"
+        s.read("main", "document").is_err(),
+        "reads verify chunk hashes"
     );
-    let status = f.ok(&["status"]);
-    assert!(status.contains("FICLONE"));
-    assert!(status.contains("staging entries: 0"));
-    assert!(status.contains("external writers"));
-    assert!(status.contains("snapshots\tsaved"));
-}
-
-#[test]
-fn command_grammar_errors_do_not_mutate_store() {
-    let f = Fixture::initialized();
-    for args in [
-        vec![],
-        vec!["--copy"],
-        vec!["unknown"],
-        vec!["init", "extra"],
-        vec!["import"],
-        vec!["fork", "one"],
-        vec!["restore", "one"],
-        vec!["checkpoint", "one", "two", "three"],
-        vec!["list", "extra"],
-        vec!["status", "extra"],
-        vec!["show", "unknown", "one"],
-        vec!["drop", "trash", "one"],
-        vec!["recover", "one"],
-    ] {
-        f.fail(&args);
-    }
-    assert_eq!(f.ok(&["list"]), "");
+    fs::write(&object, saved)?;
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o444))?;
+    assert!(s.doctor()?.healthy);
+    let legacy = f.root.join("legacy-v1");
+    fs::create_dir(&legacy)?;
+    fs::write(legacy.join("format"), b"sprig 1\n")?;
+    let legacy_error = Store::open(&legacy).unwrap_err().to_string();
+    assert!(legacy_error.contains("legacy"), "{legacy_error}");
     assert_eq!(
-        fs::read_dir(f.store.join("staging"))
-            .expect("test fixture operation should succeed")
-            .count(),
-        0
+        file_names(&legacy),
+        BTreeSet::from(["format".to_owned()]),
+        "legacy rejection must not migrate or mutate data"
     );
-    for args in [vec![], vec!["--help"], vec!["-h"]] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sprig"));
-        command.args(args);
-        assert!(success(bounded_output(command)).contains("Usage: sprig"));
-    }
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sprig"));
-    command.arg("--version");
-    assert_eq!(
-        success(bounded_output(command)).trim(),
-        format!("sprig {}", env!("CARGO_PKG_VERSION"))
-    );
+    Ok(())
 }

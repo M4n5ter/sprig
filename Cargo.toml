@@ -1,6 +1,6 @@
 [package]
 name = "sprig"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Small native-filesystem workspace snapshots"
@@ -13,3 +13,14 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+fastcdc = "3"
+libc = "0.2"
+diffy = "0.4"
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+ignore = "0.4"

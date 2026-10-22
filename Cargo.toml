@@ -1,0 +1,15 @@
+[package]
+name = "sprig"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Small native-filesystem workspace snapshots"
+publish = false
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

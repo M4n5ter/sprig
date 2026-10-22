@@ -5,12 +5,14 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Sprig supports Linux and macOS");
 
+pub mod blame;
 pub mod content;
 pub mod copy_tree;
 pub mod merge;
 mod model;
 mod store;
 
+pub use blame::{BlameLine, LineBlame as Blame};
 pub use copy_tree::CopyMode;
 pub use merge::MergeStrategy;
 pub use model::*;

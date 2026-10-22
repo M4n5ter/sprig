@@ -90,15 +90,6 @@ pub struct Change {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Blame {
-    pub path: String,
-    pub identity: String,
-    pub revision: String,
-    pub message: String,
-    pub granularity: String,
-}
-
-#[derive(Debug, Serialize)]
 pub struct Listing {
     pub branches: BTreeMap<String, String>,
     pub workspaces: BTreeMap<String, WorkspaceResult>,

@@ -8,15 +8,14 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::Result;
 use crate::content::{self, EntryKind, Manifest, Observed};
 use crate::copy_tree::{self, CopyMode};
 use crate::merge::{self, MergeStrategy};
 use crate::model::{
-    Blame, BranchResult, Change, CommitResult, DoctorReport, GcPlan, Listing, MergeOutcome,
-    Mutation, Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace,
-    WorkspaceResult,
+    BranchResult, Change, CommitResult, DoctorReport, GcPlan, Listing, MergeOutcome, Mutation,
+    Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace, WorkspaceResult,
 };
+use crate::{Blame, Result};
 
 const VERSION: u32 = 2;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
@@ -995,49 +994,13 @@ impl Store {
         })
     }
 
-    /// Attribute an entry's latest content/type/mode/location change. This is
-    /// identity-aware entry blame, not line-by-line text attribution.
+    /// Attribute text lines along first-parent history, following logical identity.
+    /// Merge-introduced lines are attributed to that merge, not its second parent.
     pub fn blame(&self, reference: &str, path: &str) -> Result<Blame> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let mut id = self.resolve(&state, reference)?;
-        let initial = self.revision(&id)?;
-        let entry = initial
-            .manifest
-            .get(path)
-            .ok_or_else(|| failure("path not found in revision"))?
-            .clone();
-        let mut current_path = path.to_owned();
-        loop {
-            let revision = self.revision(&id)?;
-            let mut unchanged_parent = None;
-            for parent in &revision.parents {
-                let previous = self.revision(parent)?;
-                if let Some((old_path, old)) =
-                    previous.manifest.iter().find(|(_, old)| old.id == entry.id)
-                    && *old == entry
-                    && *old_path == current_path
-                {
-                    unchanged_parent = Some((parent.clone(), old_path.clone()));
-                    break;
-                }
-            }
-            match unchanged_parent {
-                Some((parent, path)) => {
-                    id = parent;
-                    current_path = path;
-                }
-                None => {
-                    return Ok(Blame {
-                        path: current_path,
-                        identity: entry.id,
-                        revision: id,
-                        message: revision.message,
-                        granularity: "entry content/type/mode/location".to_owned(),
-                    });
-                }
-            }
-        }
+        let revision = self.resolve(&state, reference)?;
+        crate::blame::attribute(&revision, path, &self.objects(), |id| self.revision(id))
     }
 
     pub fn doctor(&self) -> Result<DoctorReport> {

@@ -280,6 +280,23 @@ fn shared_branch_merges_conflicts_and_immutable_branch_outputs() -> Result<()> {
     fs::write(f.source.join("directory/child"), b"before\n")?;
     let first = s.import(&f.source, "main", CopyMode::Copy)?;
     let base = first.base_revision.clone();
+    let initial_blame = s.blame(&base, "text")?;
+    assert_eq!(initial_blame.lines.len(), 5);
+    for (index, line) in initial_blame.lines.iter().enumerate() {
+        assert_eq!(line.line, index + 1);
+        assert_eq!(line.original_line, index + 1);
+        assert_eq!(line.revision, base);
+        assert_eq!(line.original_path, "text");
+    }
+    assert_eq!(
+        initial_blame
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<String>()
+            .as_bytes(),
+        original_text
+    );
     let child_id = s.stat(&base, "directory/child")?.id;
     let stale = s.checkout("main", "stale")?;
     fs::write(
@@ -332,6 +349,14 @@ fn shared_branch_merges_conflicts_and_immutable_branch_outputs() -> Result<()> {
         "mode and contents merge independently"
     );
     assert_eq!(s.read("main", "script")?, b"new script\n");
+    let merged_blame = s.blame(&merged, "text")?;
+    assert_eq!(merged_blame.lines[0].revision, advanced);
+    assert_eq!(merged_blame.lines[1].revision, base);
+    assert_eq!(merged_blame.lines[4].text, "LAST\n");
+    assert_eq!(
+        merged_blame.lines[4].revision, merged,
+        "first-parent blame attributes a second-parent change to the merge"
+    );
     assert!(
         s.diff(&base, &merged)?
             .iter()
@@ -486,6 +511,76 @@ fn shared_branch_merges_conflicts_and_immutable_branch_outputs() -> Result<()> {
             .is_err()
     );
     assert_eq!(head(s, "left"), left_head);
+
+    s.checkout("combined", "blame-work")?;
+    let edited = s
+        .apply(
+            "blame-work",
+            &[
+                Mutation::Edit {
+                    path: "text".into(),
+                    old: "keep two\n".into(),
+                    new: "inserted\nchanged two\n".into(),
+                },
+                Mutation::Write {
+                    path: "binary".into(),
+                    content: vec![0, 255, 128],
+                },
+            ],
+            "blame edits",
+            None,
+        )?
+        .revision;
+    let edited_blame = s.blame(&edited, "text")?;
+    assert_eq!(edited_blame.identity, initial_blame.identity);
+    assert_eq!(edited_blame.lines.len(), 6);
+    for (index, (origin, original_line, text)) in [
+        (&base, 1, "first\n"),
+        (&base, 2, "keep one\n"),
+        (&edited, 3, "inserted\n"),
+        (&edited, 4, "changed two\n"),
+        (&base, 4, "keep three\n"),
+        (&base, 5, "last\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let line = &edited_blame.lines[index];
+        assert_eq!(line.line, index + 1);
+        assert_eq!(&line.revision, *origin);
+        assert_eq!(line.original_line, *original_line);
+        assert_eq!(line.original_path, "text");
+        assert_eq!(line.text, *text);
+    }
+    assert_eq!(edited_blame.lines[2].message, "blame edits");
+    assert!(
+        s.blame(&edited, "binary").is_err(),
+        "binary data has no text-line blame"
+    );
+    let moved = s
+        .apply(
+            "blame-work",
+            &[Mutation::Move {
+                from: "text".into(),
+                to: "moved-text".into(),
+            }],
+            "move without changing lines",
+            None,
+        )?
+        .revision;
+    let moved_blame = s.blame(&moved, "moved-text")?;
+    assert_eq!(moved_blame.path, "moved-text");
+    assert_eq!(moved_blame.identity, edited_blame.identity);
+    assert_eq!(moved_blame.lines.len(), edited_blame.lines.len());
+    for (before, after) in edited_blame.lines.iter().zip(&moved_blame.lines) {
+        assert_eq!(after.text, before.text);
+        assert_eq!(
+            after.revision, before.revision,
+            "moves must not steal line provenance"
+        );
+        assert_eq!(after.original_line, before.original_line);
+        assert_eq!(after.original_path, "text");
+    }
     Ok(())
 }
 

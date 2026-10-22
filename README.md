@@ -18,11 +18,13 @@ sprig --help
 
 The repository selects current stable Rust, including rustfmt and Clippy.
 Cargo's minimum Rust version is 1.89, not a pinned development toolchain.
-CI is configured for stable Rust on Linux and macOS. The macOS job sets
-`SPRIG_REQUIRE_REFLINK=1` to require actual native clones, but has not run yet;
-the macOS backend remains unverified. Linux uses `FICLONE`; macOS uses
-`fclonefileat`. Neither is an atomic whole-directory snapshot, and cloning
-requires filesystem support. Windows is unsupported.
+CI targets stable Rust on Linux and macOS. The native backend suite passed on
+both platforms at `f631f4c` ([verified run](https://github.com/M4n5ter/sprig/actions/runs/39740305505)).
+The macOS job enforced `SPRIG_REQUIRE_REFLINK=1`, verified actual clones with no
+copy fallback, and checked write isolation. Linux's passing checks do not
+establish successful reflinking. Linux uses `FICLONE`; macOS uses `fclonefileat`.
+Both clone individual files, not whole trees or Btrfs subvolumes. Cloning requires
+filesystem support. Windows is unsupported.
 
 ## Quick start
 
@@ -117,9 +119,17 @@ exact destination path that must not exist. `chmod` accepts ordinary octal
 permission bits, such as `644` or `0755`.
 `diff` reports entry changes and moves. `diff-files` adds unified patches for
 text files within the 16-MiB read limit; binary/large changes have no patch and
-are explicitly marked. `blame` attributes entry content, type, mode and location,
-not individual text lines.
-`log` without a reference walks the history of current branch heads.
+are explicitly marked. `log` without a reference walks the history of current
+branch heads.
+
+`blame` attributes individual text lines along first-parent history, following
+logical file identity across renames. Unchanged lines retain earlier attribution;
+lines introduced or changed by a merge belong to that merge, not its second
+parent. Each result line includes `line`, `text` (retaining line endings),
+`revision`, `original_line`, `original_path` and `message`. It accepts NUL-free
+UTF-8 within 16 MiB and 100,000 lines, and traverses at most 10,000 revisions.
+The same text bounds apply to compared historical files. Unsupported historical
+content or exceeding these bounds fails explicitly rather than returning partial blame.
 
 Read operations resolve a reference once and inspect its immutable revision.
 `read` streams raw bytes without an added newline; `--json` instead buffers the
@@ -357,5 +367,6 @@ cargo test
 The CLI is a thin adapter over the `sprig` library. Default tests accommodate
 filesystems without clone support; `SPRIG_REQUIRE_REFLINK=1 cargo test` requires
 real cloning and verifies isolation. Tests cover history, concurrency,
-transactions, recovery, storage integrity and the parser. The configured macOS
-CI run remains outstanding. No project license has been selected.
+transactions, recovery, storage integrity and the parser. The linked CI run
+records native-backend verification, not a substitute for testing later changes.
+No project license has been selected.

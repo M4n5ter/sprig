@@ -17,7 +17,8 @@ use crate::model::{
 };
 use crate::{Blame, Result};
 
-const VERSION: u32 = 2;
+// Identifies the one supported layout; this is not a compatibility layer.
+const STORAGE_SCHEMA: u32 = 2;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 /// Handle to a local, single-user store. Methods acquire their own metadata lock;
@@ -37,7 +38,7 @@ impl Store {
         }
         write_new(&root.join("lock"), b"")?;
         let state = State {
-            version: VERSION,
+            version: STORAGE_SCHEMA,
             generation: 0,
             branches: BTreeMap::new(),
             workspaces: BTreeMap::new(),
@@ -55,11 +56,6 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         require_directory(path)?;
         let root = path.canonicalize()?;
-        if root.join("format").exists() && !root.join("state.json").exists() {
-            return Err(failure(
-                "legacy store v1 is not modified; create a v2 store and import its workspace tree paths",
-            ));
-        }
         for area in AREAS {
             require_directory(&root.join(area))?;
         }
@@ -1555,10 +1551,8 @@ fn valid_hash(value: &str) -> bool {
 }
 
 fn validate_state(state: &State) -> Result<()> {
-    if state.version != VERSION {
-        return Err(failure(
-            "unsupported store version; no automatic destructive migration",
-        ));
+    if state.version != STORAGE_SCHEMA {
+        return Err(failure("unsupported store schema; store was not modified"));
     }
     for (name, revision) in &state.branches {
         validate_name(name)?;

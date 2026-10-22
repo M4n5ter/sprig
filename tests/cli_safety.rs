@@ -31,7 +31,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Result<Self> {
         let root = std::env::temp_dir().join(format!(
-            "sprig-v2-{}-{}-{}",
+            "sprig-fixture-{}-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -839,15 +839,25 @@ fn transactional_sdk_exec_leases_recovery_and_non_destructive_inspection() -> Re
     fs::write(&object, saved)?;
     fs::set_permissions(&object, fs::Permissions::from_mode(0o444))?;
     assert!(s.doctor()?.healthy);
-    let legacy = f.root.join("legacy-v1");
-    fs::create_dir(&legacy)?;
-    fs::write(legacy.join("format"), b"sprig 1\n")?;
-    let legacy_error = Store::open(&legacy).unwrap_err().to_string();
-    assert!(legacy_error.contains("legacy"), "{legacy_error}");
+    let unknown = f.root.join("unknown-store");
+    fs::create_dir(&unknown)?;
+    fs::write(unknown.join("user-file"), b"keep this data\n")?;
+    assert!(Store::open(&unknown).is_err());
+    assert!(Store::init(&unknown).is_err());
     assert_eq!(
-        file_names(&legacy),
-        BTreeSet::from(["format".to_owned()]),
-        "legacy rejection must not migrate or mutate data"
+        file_names(&unknown),
+        BTreeSet::from(["user-file".to_owned()])
     );
+    assert_eq!(fs::read(unknown.join("user-file"))?, b"keep this data\n");
+    let state_path = f.store_path.join("state.json");
+    let current_bytes = fs::read(&state_path)?;
+    let mut unsupported: serde_json::Value = serde_json::from_slice(&current_bytes)?;
+    unsupported["version"] = serde_json::json!(u32::MAX);
+    let unsupported_bytes = serde_json::to_vec(&unsupported)?;
+    fs::write(&state_path, &unsupported_bytes)?;
+    let error = Store::open(&f.store_path).unwrap_err().to_string();
+    assert!(error.contains("unsupported store schema"), "{error}");
+    assert_eq!(fs::read(&state_path)?, unsupported_bytes);
+    fs::write(state_path, current_bytes)?;
     Ok(())
 }

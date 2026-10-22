@@ -25,3 +25,13 @@ jobs:
         env:
           SPRIG_REQUIRE_REFLINK: '1'
         run: cargo test --locked
+      - name: Build optimized example binary
+        run: cargo build --release --locked
+      - name: Run reproducible effects comparison
+        shell: bash
+        run: |
+          args=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            args+=(--require-clone)
+          fi
+          python3 examples/compare.py --binary target/release/sprig "${args[@]}"

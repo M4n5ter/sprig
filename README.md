@@ -188,9 +188,9 @@ One measured run on **2026-10-22**, Linux/x86_64, **tmpfs**, release build:
 
 | Operation | Wall time | Files cloned / copied | New CAS bytes |
 | --- | ---: | ---: | ---: |
-| Ordinary byte copy | 5.722 ms | 0 / 4 | Not applicable |
-| Sprig fork, automatic | 33.225 ms | 0 / 4 | 0 |
-| Sprig fork, forced copy | 28.628 ms | 0 / 4 | 0 |
+| Ordinary byte copy | 6.211 ms | 0 / 4 | Not applicable |
+| Sprig fork, automatic | 41.251 ms | 0 / 4 | 0 |
+| Sprig fork, forced copy | 36.626 ms | 0 / 4 | 0 |
 
 The fixture held **12,582,984 logical bytes**; initial import stored **8,388,680
 chunk bytes** because the duplicate blob reused content. Inserting a **50-byte
@@ -430,11 +430,17 @@ STORE/
   state.json          # Branches, workspaces, trash and a schema marker
   lock                # Advisory metadata lock
   objects/HASH        # Immutable content chunks
-  revisions/HASH.json # Immutable revision manifests and parents
+  revisions/HASH.json.zst # Compressed immutable manifests and parents
   native/GENERATION/  # Native working trees and lease files
   staging/            # Unpublished data and retained recovery records
-  backups/            # Previous metadata generations
+  backups/            # Compressed previous metadata generations
 ```
+
+Revision manifests and metadata backups use lossless, checksummed Zstandard
+compression. Revision IDs still hash the original JSON bytes; reads validate the
+frame and revision hash. No history or recovery roots are discarded to save space.
+The current `state.json` stays uncompressed. Chunk files are synced individually,
+and their directory entries are synced before a capture can return references.
 
 `stats.object_bytes` totals stored chunk bytes, including unreferenced objects.
 `reachable_logical_bytes` sums file lengths across protected revisions; repeated

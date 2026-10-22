@@ -839,6 +839,36 @@ fn transactional_sdk_exec_leases_recovery_and_non_destructive_inspection() -> Re
     fs::write(&object, saved)?;
     fs::set_permissions(&object, fs::Permissions::from_mode(0o444))?;
     assert!(s.doctor()?.healthy);
+    // Compression is a representation change, never permission to skip integrity.
+    let revision_path = f
+        .store_path
+        .join("revisions")
+        .join(format!("{committed}.json.zst"));
+    let encoded = fs::read(&revision_path)?;
+    assert!(encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+    for invalid in [encoded[..encoded.len() - 1].to_vec(), {
+        let mut bytes = encoded.clone();
+        bytes.extend_from_slice(&encoded);
+        bytes
+    }] {
+        fs::write(&revision_path, invalid)?;
+        assert!(s.log(Some(&committed)).is_err());
+    }
+    fs::write(&revision_path, &encoded)?;
+    assert!(s.log(Some(&committed)).is_ok());
+    let backup_path = f
+        .store_path
+        .join("backups")
+        .join(format!("{restore_generation}.json.zst"));
+    let backup = fs::read(&backup_path)?;
+    let mut corrupt = backup.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    let before_recovery = f.state();
+    fs::write(&backup_path, corrupt)?;
+    assert!(Store::recover_state(&f.store_path, restore_generation).is_err());
+    assert_eq!(f.state(), before_recovery);
+    fs::write(backup_path, backup)?;
+    assert!(s.doctor()?.healthy);
     let unknown = f.root.join("unknown-store");
     fs::create_dir(&unknown)?;
     fs::write(unknown.join("user-file"), b"keep this data\n")?;
@@ -858,6 +888,14 @@ fn transactional_sdk_exec_leases_recovery_and_non_destructive_inspection() -> Re
     let error = Store::open(&f.store_path).unwrap_err().to_string();
     assert!(error.contains("unsupported store schema"), "{error}");
     assert_eq!(fs::read(&state_path)?, unsupported_bytes);
+    assert!(Store::recover_state(&f.store_path, restore_generation).is_err());
+    assert_eq!(fs::read(&state_path)?, unsupported_bytes);
+    unsupported["future_field"] = serde_json::json!(true);
+    let future_bytes = serde_json::to_vec(&unsupported)?;
+    fs::write(&state_path, &future_bytes)?;
+    assert!(Store::open(&f.store_path).is_err());
+    assert!(Store::recover_state(&f.store_path, restore_generation).is_err());
+    assert_eq!(fs::read(&state_path)?, future_bytes);
     fs::write(state_path, current_bytes)?;
     Ok(())
 }

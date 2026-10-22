@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::content::{self, EntryKind, Manifest, Observed};
 use crate::copy_tree::{self, CopyMode};
 use crate::merge::{self, MergeStrategy};
+use crate::metadata;
 use crate::model::{
     BranchResult, Change, CommitResult, DoctorReport, GcPlan, Listing, MergeOutcome, Mutation,
     Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace, WorkspaceResult,
@@ -18,7 +19,7 @@ use crate::model::{
 use crate::{Blame, Result};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 2;
+const STORAGE_SCHEMA: u32 = 3;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 /// Handle to a local, single-user store. Methods acquire their own metadata lock;
@@ -81,9 +82,9 @@ impl Store {
             let backup = store
                 .root
                 .join("backups")
-                .join(format!("{generation}.json"));
+                .join(format!("{generation}.json.zst"));
             require_file(&backup)?;
-            let mut restored: State = serde_json::from_slice(&fs::read(backup)?)?;
+            let (mut restored, _): (State, _) = metadata::read(&backup)?;
             validate_state(&restored)?;
             let roots = store.protected_roots(&restored)?;
             for id in store.ancestors(&roots)? {
@@ -120,7 +121,14 @@ impl Store {
             let current_path = store.root.join("state.json");
             require_file(&current_path)?;
             let current_bytes = fs::read(&current_path)?;
-            let current = serde_json::from_slice::<State>(&current_bytes).ok();
+            let current_json = serde_json::from_slice::<serde_json::Value>(&current_bytes).ok();
+            if let Some(version) = current_json.as_ref().and_then(|value| value.get("version"))
+                && version != &serde_json::json!(STORAGE_SCHEMA)
+            {
+                return Err(failure("unsupported store schema; store was not modified"));
+            }
+            let current =
+                current_json.and_then(|value| serde_json::from_value::<State>(value).ok());
             let highest = store
                 .historical_states()?
                 .iter()
@@ -141,8 +149,8 @@ impl Store {
                     &store
                         .root
                         .join("backups")
-                        .join(format!("{}.json", current.generation)),
-                    &current_bytes,
+                        .join(format!("{}.json.zst", current.generation)),
+                    &metadata::encode(&current_bytes)?,
                 )?;
             }
             let staged = store
@@ -1045,7 +1053,7 @@ impl Store {
             .collect();
         let orphan_revisions = names(&self.root.join("revisions"))?
             .into_iter()
-            .filter_map(|name| name.strip_suffix(".json").map(str::to_owned))
+            .filter_map(|name| name.strip_suffix(".json.zst").map(str::to_owned))
             .filter(|id| !reachable.contains(id))
             .collect();
         Ok(DoctorReport {
@@ -1073,7 +1081,7 @@ impl Store {
             .collect();
         let unreachable_revisions = names(&self.root.join("revisions"))?
             .into_iter()
-            .filter_map(|name| name.strip_suffix(".json").map(str::to_owned))
+            .filter_map(|name| name.strip_suffix(".json.zst").map(str::to_owned))
             .filter(|id| !reachable.contains(id))
             .collect();
         let directories = self.protected_directories(&state)?;
@@ -1312,9 +1320,8 @@ impl Store {
         let backup = self
             .root
             .join("backups")
-            .join(format!("{}.json", current.generation));
-        write_immutable(&backup, &serde_json::to_vec(&current)?)?;
-        sync_directory(&self.root.join("backups"))?;
+            .join(format!("{}.json.zst", current.generation));
+        write_immutable(&backup, &metadata::encode(&serde_json::to_vec(&current)?)?)?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -1347,10 +1354,9 @@ impl Store {
         let bytes = serde_json::to_vec(revision)?;
         let id = blake3::hash(&bytes).to_hex().to_string();
         write_immutable(
-            &self.root.join("revisions").join(format!("{id}.json")),
-            &bytes,
+            &self.root.join("revisions").join(format!("{id}.json.zst")),
+            &metadata::encode(&bytes)?,
         )?;
-        sync_directory(&self.root.join("revisions"))?;
         Ok(id)
     }
 
@@ -1358,13 +1364,12 @@ impl Store {
         if !valid_hash(id) {
             return Err(failure("invalid revision hash"));
         }
-        let path = self.root.join("revisions").join(format!("{id}.json"));
+        let path = self.root.join("revisions").join(format!("{id}.json.zst"));
         require_file(&path)?;
-        let bytes = fs::read(path)?;
-        if blake3::hash(&bytes).to_hex().as_str() != id {
+        let (revision, hash): (Revision, _) = metadata::read(&path)?;
+        if hash.to_hex().as_str() != id {
             return Err(failure("revision hash mismatch"));
         }
-        let revision: Revision = serde_json::from_slice(&bytes)?;
         if revision.clock == 0 || revision.parents.iter().any(|parent| !valid_hash(parent)) {
             return Err(failure("invalid revision metadata"));
         }
@@ -1435,14 +1440,14 @@ impl Store {
     fn historical_states(&self) -> Result<Vec<State>> {
         let mut states = Vec::new();
         for name in names(&self.root.join("backups"))? {
-            if !name.ends_with(".json") {
+            if !name.ends_with(".json.zst") {
                 return Err(failure(
                     "unknown state backup file; refuse unsafe reachability plan",
                 ));
             }
             let path = self.root.join("backups").join(name);
             require_file(&path)?;
-            let state: State = serde_json::from_slice(&fs::read(path)?)?;
+            let (state, _): (State, _) = metadata::read(&path)?;
             validate_state(&state)?;
             states.push(state);
         }
@@ -1642,7 +1647,10 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
             if !metadata.is_file() || fs::read(path)? != bytes {
                 return Err(failure("immutable object collision or corruption"));
             }
-            Ok(())
+            sync_directory(
+                path.parent()
+                    .ok_or_else(|| failure("object has no parent"))?,
+            )
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let parent = path

@@ -71,6 +71,10 @@ pub fn capture(root: &Path, objects: &Path, previous: &Observed) -> Result<(Mani
     capture_entry(&root, "", objects, &mut manifest, &mut observed)?;
     assign_ids(&mut manifest, &mut observed, previous);
     validate_manifest(&manifest)?;
+    // Flush all publications together before returning a usable manifest. Do
+    // this even for dedup-only captures: an earlier failure may have left an
+    // existing, fully synced chunk with an unsynced directory entry.
+    File::open(objects)?.sync_all()?;
     Ok((manifest, observed))
 }
 
@@ -306,9 +310,14 @@ pub fn read_file(entry: &Entry, objects: &Path) -> Result<Vec<u8>> {
 
 pub fn put_bytes(bytes: &[u8], objects: &Path) -> Result<EntryKind> {
     prepare_objects(objects)?;
-    put_reader(&mut Cursor::new(bytes), objects)
+    let kind = put_reader(&mut Cursor::new(bytes), objects)?;
+    // Like capture, sync even when every chunk already existed.
+    File::open(objects)?.sync_all()?;
+    Ok(kind)
 }
 
+// Publishes fully synced chunk inodes; callers must sync the object directory
+// before returning any references to them outside a capture/put_bytes batch.
 fn put_reader(reader: &mut impl Read, objects: &Path) -> Result<EntryKind> {
     // Refill to the maximum chunk length before cutting the first chunk. This
     // preserves CDC boundaries across read-buffer edges and bounds RAM usage.
@@ -344,9 +353,6 @@ fn put_reader(reader: &mut impl Read, objects: &Path) -> Result<EntryKind> {
         buffer.copy_within(chunk.length..filled, 0);
         filled -= chunk.length;
     }
-    // A dedup-only capture can reuse a previously orphaned publication. Flush
-    // its directory entry too before allowing any revision to reference it.
-    File::open(objects)?.sync_all()?;
     Ok(EntryKind::File { size, chunks })
 }
 
@@ -389,7 +395,6 @@ fn put_chunk(bytes: &[u8], objects: &Path) -> Result<String> {
         Err(error) => return Err(error.into()),
     }
     fs::remove_file(&temporary)?;
-    File::open(objects)?.sync_all()?;
     Ok(hash)
 }
 

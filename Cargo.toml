@@ -24,3 +24,4 @@ diffy = "0.4"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 ignore = "0.4"
+zstd = { version = "0.13", default-features = false }

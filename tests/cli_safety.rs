@@ -172,9 +172,10 @@ fn native_isolation_content_dedup_and_path_safety() -> Result<()> {
 
     let main = s.import(&f.source, "main", CopyMode::Copy)?;
     let base = main.base_revision.clone();
+    // macOS system temporary paths can have symlinked ancestors.
+    let objects = f.store_path.join("objects").canonicalize()?;
     for (path, &length) in boundary_paths.iter().zip(&boundaries) {
-        let fresh_buffer =
-            sprig::content::put_bytes(&data[..length], &f.store_path.join("objects"))?;
+        let fresh_buffer = sprig::content::put_bytes(&data[..length], &objects)?;
         assert_eq!(s.stat("main", path)?.kind, fresh_buffer);
         assert_eq!(s.read("main", path)?, data[..length]);
     }

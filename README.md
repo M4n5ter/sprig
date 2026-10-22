@@ -441,6 +441,8 @@ compression. Revision IDs still hash the original JSON bytes; reads validate the
 frame and revision hash. No history or recovery roots are discarded to save space.
 The current `state.json` stays uncompressed. Chunk files are synced individually,
 and their directory entries are synced before a capture can return references.
+Capture reuses one 256 KiB I/O buffer across files, not their contents: every file
+is still read and every existing chunk verified, even when size and mtime match.
 
 `stats.object_bytes` totals stored chunk bytes, including unreferenced objects.
 `reachable_logical_bytes` sums file lengths across protected revisions; repeated

@@ -68,7 +68,16 @@ pub fn capture(root: &Path, objects: &Path, previous: &Observed) -> Result<(Mani
     }
     let mut manifest = Manifest::new();
     let mut observed = Observed::new();
-    capture_entry(&root, "", objects, &mut manifest, &mut observed)?;
+    // Reuse allocation only, never content: every file is read and verified.
+    let mut buffer = vec![0_u8; MAX_CHUNK];
+    capture_entry(
+        &root,
+        "",
+        objects,
+        &mut manifest,
+        &mut observed,
+        &mut buffer,
+    )?;
     assign_ids(&mut manifest, &mut observed, previous);
     validate_manifest(&manifest)?;
     // Flush all publications together before returning a usable manifest. Do
@@ -84,6 +93,7 @@ fn capture_entry(
     objects: &Path,
     manifest: &mut Manifest,
     observed: &mut Observed,
+    buffer: &mut [u8],
 ) -> Result<()> {
     validate_path(relative)?;
     let metadata = fs::symlink_metadata(path)?;
@@ -99,7 +109,7 @@ fn capture_entry(
         if !unchanged(&metadata, &before) {
             return invalid(format!("source changed during capture: {}", path.display()));
         }
-        let kind = put_reader(&mut input, objects)?;
+        let kind = put_reader(&mut input, objects, buffer)?;
         let after = input.metadata()?;
         let EntryKind::File { size, .. } = &kind else {
             unreachable!()
@@ -140,7 +150,14 @@ fn capture_entry(
             } else {
                 format!("{relative}/{name}")
             };
-            capture_entry(&child.path(), &child_relative, objects, manifest, observed)?;
+            capture_entry(
+                &child.path(),
+                &child_relative,
+                objects,
+                manifest,
+                observed,
+                buffer,
+            )?;
         }
         if !unchanged(&metadata, &fs::symlink_metadata(path)?) {
             return invalid(format!(
@@ -310,7 +327,7 @@ pub fn read_file(entry: &Entry, objects: &Path) -> Result<Vec<u8>> {
 
 pub fn put_bytes(bytes: &[u8], objects: &Path) -> Result<EntryKind> {
     prepare_objects(objects)?;
-    let kind = put_reader(&mut Cursor::new(bytes), objects)?;
+    let kind = put_reader(&mut Cursor::new(bytes), objects, &mut vec![0_u8; MAX_CHUNK])?;
     // Like capture, sync even when every chunk already existed.
     File::open(objects)?.sync_all()?;
     Ok(kind)
@@ -318,10 +335,11 @@ pub fn put_bytes(bytes: &[u8], objects: &Path) -> Result<EntryKind> {
 
 // Publishes fully synced chunk inodes; callers must sync the object directory
 // before returning any references to them outside a capture/put_bytes batch.
-fn put_reader(reader: &mut impl Read, objects: &Path) -> Result<EntryKind> {
+fn put_reader(reader: &mut impl Read, objects: &Path, buffer: &mut [u8]) -> Result<EntryKind> {
+    debug_assert_eq!(buffer.len(), MAX_CHUNK);
+    // Each file starts with no valid bytes; stale buffer tails are never chunked.
     // Refill to the maximum chunk length before cutting the first chunk. This
     // preserves CDC boundaries across read-buffer edges and bounds RAM usage.
-    let mut buffer = vec![0_u8; MAX_CHUNK];
     let mut filled = 0;
     let mut eof = false;
     let mut size = 0_u64;

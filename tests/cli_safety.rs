@@ -151,8 +151,33 @@ fn native_isolation_content_dedup_and_path_safety() -> Result<()> {
     fs::write(f.source.join("large"), &data)?;
     fs::write(f.source.join("duplicate"), &data)?;
 
+    // A capture reuses its I/O allocation across files and directory boundaries.
+    // Empty and short files must not inherit bytes or CDC boundaries from a predecessor.
+    fs::create_dir_all(f.source.join("buffer/5"))?;
+    let boundaries = [262_145, 0, 1, 262_143, 262_144, 262_145];
+    let boundary_paths: Vec<_> = boundaries
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            if index == 5 {
+                "buffer/5/nested".to_owned()
+            } else {
+                format!("buffer/{index}")
+            }
+        })
+        .collect();
+    for (path, &length) in boundary_paths.iter().zip(&boundaries) {
+        fs::write(f.source.join(path), &data[..length])?;
+    }
+
     let main = s.import(&f.source, "main", CopyMode::Copy)?;
     let base = main.base_revision.clone();
+    for (path, &length) in boundary_paths.iter().zip(&boundaries) {
+        let fresh_buffer =
+            sprig::content::put_bytes(&data[..length], &f.store_path.join("objects"))?;
+        assert_eq!(s.stat("main", path)?.kind, fresh_buffer);
+        assert_eq!(s.read("main", path)?, data[..length]);
+    }
     assert!(main.path.is_dir() && main.path.join("empty").is_dir());
     assert_eq!(
         fs::metadata(main.path.join("script"))?.mode() & 0o777,
@@ -221,6 +246,9 @@ fn native_isolation_content_dedup_and_path_safety() -> Result<()> {
     );
     let restored = s.restore(&changed, "restored")?;
     assert_eq!(fs::read(restored.path.join("large"))?, inserted);
+    for (path, &length) in boundary_paths.iter().zip(&boundaries) {
+        assert_eq!(fs::read(restored.path.join(path))?, data[..length]);
+    }
     assert_eq!(fs::read_link(restored.path.join("escape"))?, outside);
     let mut streamed = Vec::new();
     s.read_to(&changed, "large", &mut streamed)?;

@@ -10,7 +10,10 @@ mount, async runtime, or Rust dependencies.
 
 ## Build
 
-Requires Rust 1.89 or newer and Linux x86-64 or AArch64:
+Use the current **stable Rust** toolchain and Linux x86-64 or AArch64.
+The repository selects stable through `rust-toolchain.toml`, including rustfmt
+and Clippy. Cargo's `rust-version = "1.89"` records the minimum language/API
+requirement, not a pinned toolchain; CI runs stable.
 
 ```sh
 cargo build --release

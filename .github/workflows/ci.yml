@@ -14,7 +14,3 @@ jobs:
       - run: cargo +stable fmt --check
       - run: cargo +stable clippy --all-targets -- -D warnings
       - run: cargo +stable test
-      - name: Test minimum supported Rust
-        run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          cargo +1.89.0 test

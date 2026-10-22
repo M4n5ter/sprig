@@ -784,6 +784,8 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory)?;
+        // macOS temporary paths may start with the system /var symlink.
+        let directory = directory.canonicalize()?;
         let make = |id: &str, kind| Entry {
             id: id.to_owned(),
             mode: 0o755,

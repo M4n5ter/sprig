@@ -305,6 +305,42 @@ fn owned_workspaces_share_publication_merge_and_recovery() {
         ["workspace c: incomplete writable journal; explicit prefix recovery required"]
     );
     assert!(!report.healthy);
+    for (name, marker) in [
+        ("partial-session", "writable-session.json"),
+        ("stray-session", "writable-clean.json"),
+    ] {
+        let abandoned = reopened.import_writable(&source, name).unwrap();
+        let marker = abandoned.path.parent().unwrap().join(marker);
+        fs::write(&marker, b"{incomplete").unwrap();
+        assert!(reopened.writable_status(name).unwrap().read_only);
+        assert!(reopened.checkpoint(name, "must refuse", None).is_err());
+        assert!(
+            reopened
+                .apply(
+                    name,
+                    &[Mutation::Write {
+                        path: "text".into(),
+                        content: b"must not write".to_vec()
+                    }],
+                    "must refuse",
+                    None
+                )
+                .is_err()
+        );
+        let recovered = reopened
+            .recover_writable(name, &format!("{name}-recovered"))
+            .unwrap();
+        assert_eq!(
+            reopened.read(&recovered.base_revision, "text").unwrap(),
+            b"one\ntwo\nthree\n"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"{incomplete");
+        assert_eq!(
+            reopened.show(name).unwrap().base_revision,
+            abandoned.base_revision
+        );
+    }
+    assert_eq!(reopened.doctor().unwrap().errors.len(), 3);
     assert!(reopened.gc().unwrap().dry_run);
     drop(reopened);
     fs::remove_dir_all(root).unwrap();

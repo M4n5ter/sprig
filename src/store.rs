@@ -245,7 +245,7 @@ impl Store {
             let core = self.writable_core(workspace)?;
             if core.recovery_info()?.read_only {
                 return Err(failure(
-                    "writable journal has an incomplete tail; normal capture refused; inspect writable-status and explicitly recover-writable into a new workspace",
+                    "writable journal has an incomplete tail or abandoned mapped session; normal capture refused; inspect writable-status and explicitly recover-writable into a new workspace",
                 ));
             }
             core.sync()?;
@@ -1670,7 +1670,8 @@ impl Store {
             if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
                 match self.writable_core(workspace) {
                     Ok(core) => match core.recovery_info() {
-                        Ok(info) if info.read_only => errors.push(format!("workspace {name}: incomplete writable journal; explicit prefix recovery required")),
+                        Ok(info) if info.incomplete_tail => errors.push(format!("workspace {name}: incomplete writable journal; explicit prefix recovery required")),
+                        Ok(info) if info.read_only => errors.push(format!("workspace {name}: abandoned or failed mapped session; explicit journal recovery required")),
                         Ok(_) => {},
                         Err(error) => errors.push(format!("workspace {name}: {error}")),
                     },

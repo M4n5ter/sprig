@@ -306,7 +306,9 @@ impl Store {
             drop(startup);
             result
         });
-        let filesystem = crate::writable_fuse::WritableFuse::new(core, 0, 0, Some(ready));
+        let session = crate::writable_session::begin(&path, revision)?;
+        let filesystem =
+            crate::writable_fuse::WritableFuse::new(core, 0, 0, Some(ready), path.clone(), session);
         crate::writable_lifecycle::serve(filesystem, &path, revision)
     }
 }

@@ -748,17 +748,32 @@ The old journal is retained in recoverable trash, never reset after an uncertain
 publication. If publication succeeds but remount fails, the result includes the
 committed revision and `mount_error`; do not repeat the commit blindly.
 
-The direct-I/O adapter does not support shared writable `mmap`,
-special nodes, ownership changes, xattrs/ACLs or advanced rename flags. Unsupported
-operations fail explicitly. Read-only mapping and executable-file behavior must
-be checked on the running kernel; this is not a complete POSIX filesystem or a
+The Linux adapter uses cached write-through I/O, not FUSE writeback-cache mode.
+Shared mappings and ordinary writes address the same inode and journal. A
+successful `msync(MS_SYNC)` or `fsync` is the mapped-data durability boundary;
+applications must check its return value. `MS_ASYNC`, closing a descriptor while
+its mapping remains live, and un-synchronized memory stores are not durability
+promises. Checkpoint refuses while a mapping still pins the mount.
+
+A durable session marker precedes mounting. After managed normal unmount, the
+controller requires a matching daemon completion certificate, zero remaining
+handles, no observed write/sync failure and a synced journal before clearing it.
+Daemon crashes, failed background writes and uncertain stops retain the marker
+and block ordinary capture/remount. Use `recover-writable SOURCE NEW` to recover
+journaled content explicitly while preserving the original generation. Manual
+unmount outside Sprig also lacks this managed handshake. The certificate does
+not prove that an application ignored no kernel-internal writeback error before
+a request reached the daemon; it cannot recover memory that was never journaled.
+
+Special nodes, ownership changes, xattrs/ACLs and advanced rename flags remain
+unsupported and fail explicitly. This is not a complete POSIX filesystem or a
 sandbox. Each generation has a 256 MiB journal quota, 1 MiB I/O request limit,
 one-million-node limit, and 256 GiB logical-growth allowance above its base.
 Retained unlinked nodes count toward those bounds. A quota error does not mean
 the host disk is full; checkpoint rotates a healthy generation without deleting
 the retained journal.
 
-An incomplete journal tail makes ordinary capture fail. `writable-status` on an
+An incomplete journal tail or an abandoned mapped session makes ordinary capture fail. `writable-status` on an
 unmounted workspace reports the verified prefix; `recover-writable SOURCE NEW`
 explicitly recovers that prefix into a separate workspace while preserving the
 original bytes. Complete corrupt records fail closed. Unmount owned workspaces
@@ -798,9 +813,9 @@ native backends and CLI parsing. No project license has been selected.
 
 The Linux CI lifecycle run on Ubuntu 24.04 has verified compiling a small C
 program inside an owned writable workspace and executing its output, running an
-existing ELF, and read-only private mappings. Shared mappings, including
-read-only shared mappings, are unsupported on that tested kernel. These are
-capability checks, not a claim of complete compiler or POSIX compatibility.
+existing ELF, and read-only private mappings. Shared-mapping lifecycle and
+failure handling are covered by the mounted test, not by local unit tests. These
+are capability checks, not a claim of complete compiler or POSIX compatibility.
 
 The [Linux hardlink lifecycle check](https://github.com/M4n5ter/sprig/actions/runs/40000224621)
 ran a small, dependency-free Cargo crate with incremental compilation both off

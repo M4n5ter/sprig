@@ -5,16 +5,18 @@
 //! adapter owns only FUSE lookup counts and open-handle protocol state. It does
 //! not maintain a second path index, dirty-file map, or materialized file tree.
 //!
-//! Every regular-file open uses direct I/O. We deliberately request neither
-//! writeback caching nor the direct-I/O shared-mmap capability: writable shared
-//! mappings must fail rather than bypass the journal. Entry/attribute TTLs are
-//! zero, and flush/fsync make the core journal durable, not a branch commit.
+//! Regular files use cached write-through I/O, never WRITEBACK_CACHE. Shared
+//! mappings still generate background page writes; those enter the same journal
+//! at explicit offsets. A durable session guard prevents known failed or
+//! abandoned sessions from silently becoming checkpoints. Successful msync/fsync
+//! is the mapped-data durability boundary, not a branch commit.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -46,10 +48,21 @@ pub(crate) struct WritableFuse {
     lookups: HashMap<u64, u64>,
     handles: HashMap<u64, Handle>,
     next_handle: u64,
+    session: crate::writable_session::SessionRecord,
+    generation: PathBuf,
+    initialized: bool,
+    failed: Cell<bool>,
 }
 
 impl WritableFuse {
-    pub(crate) fn new(core: WritableCas, uid: u32, gid: u32, ready: Option<ReadySignal>) -> Self {
+    pub(crate) fn new(
+        core: WritableCas,
+        uid: u32,
+        gid: u32,
+        ready: Option<ReadySignal>,
+        generation: PathBuf,
+        session: crate::writable_session::SessionRecord,
+    ) -> Self {
         Self {
             core,
             uid,
@@ -58,6 +71,23 @@ impl WritableFuse {
             lookups: HashMap::new(),
             handles: HashMap::new(),
             next_handle: 1,
+            session,
+            generation,
+            initialized: false,
+            failed: Cell::new(false),
+        }
+    }
+
+    fn record_io_failure(&self, error: &io::Error) {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::Other
+                | io::ErrorKind::InvalidData
+                | io::ErrorKind::StorageFull
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::WriteZero
+        ) {
+            self.failed.set(true);
         }
     }
 
@@ -164,19 +194,33 @@ impl WritableFuse {
         directory: bool,
         flush: bool,
     ) -> io::Result<()> {
-        self.handle(inode, handle, directory)?;
+        if let Err(error) = self.handle(inode, handle, directory) {
+            self.failed.set(true);
+            return Err(error);
+        }
         let handle = self
             .handles
             .remove(&handle)
             .ok_or_else(|| os_error(libc::EBADF))?;
         let synced = if flush { self.core.sync() } else { Ok(()) };
         let released = self.core.release(handle.core);
-        synced.and(released)
+        let result = synced.and(released);
+        if result.is_err() {
+            self.failed.set(true);
+        }
+        result
     }
 
     fn sync_handle(&self, inode: u64, handle: u64, directory: bool) -> io::Result<()> {
-        self.handle(inode, handle, directory)?;
-        self.core.sync()
+        if let Err(error) = self.handle(inode, handle, directory) {
+            self.failed.set(true);
+            return Err(error);
+        }
+        let result = self.core.sync();
+        if result.is_err() {
+            self.failed.set(true);
+        }
+        result
     }
 }
 
@@ -278,17 +322,33 @@ impl Filesystem for WritableFuse {
         if let Some(ready) = self.ready.take() {
             ready().map_err(|error| errno(&error))?;
         }
+        self.initialized = true;
         Ok(())
     }
 
     fn destroy(&mut self) {
-        // The caller must wait for the core's exclusive journal lease to be
-        // released, reopen/replay and sync before publishing any checkpoint.
-        // This best-effort callback is not the durable-cleanup authority.
-        if let Err(error) = self.core.sync() {
+        // fuser also invokes this callback after an abnormal session exit.
+        // It is only a quiescence certificate, never authority to clear the
+        // durable marker: the controller must itself complete normal unmount.
+        let result = (|| {
+            self.core.sync()?;
+            if !self.initialized
+                || self.failed.get()
+                || !self.handles.is_empty()
+                || self.core.recovery_info()?.read_only
+            {
+                return Err(io::Error::other("mapped session did not finish cleanly"));
+            }
+            if crate::writable_session::read_stop(&self.generation, &self.session)? {
+                crate::writable_session::acknowledge(&self.generation, &self.session)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed.set(true);
             eprintln!(
                 "{}",
-                serde_json::json!({"event":"writable_destroy_sync_error","error":error.to_string()})
+                serde_json::json!({"event":"writable_session_retained","error":error.to_string()})
             );
         }
     }
@@ -391,7 +451,10 @@ impl Filesystem for WritableFuse {
         })();
         match result {
             Ok(attr) => reply.attr(&TTL, &attr),
-            Err(error) => reply.error(errno(&error)),
+            Err(error) => {
+                self.record_io_failure(&error);
+                reply.error(errno(&error));
+            }
         }
     }
 
@@ -418,7 +481,7 @@ impl Filesystem for WritableFuse {
 
     fn open(&mut self, _request: &Request<'_>, inode: u64, flags: i32, reply: ReplyOpen) {
         match self.open_handle(inode, flags, false) {
-            Ok(handle) => reply.opened(handle, fuser::consts::FOPEN_DIRECT_IO),
+            Ok(handle) => reply.opened(handle, fuser::consts::FOPEN_KEEP_CACHE),
             Err(error) => reply.error(errno(&error)),
         }
     }
@@ -454,7 +517,10 @@ impl Filesystem for WritableFuse {
         })();
         match result {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(errno(&error)),
+            Err(error) => {
+                self.record_io_failure(&error);
+                reply.error(errno(&error));
+            }
         }
     }
 
@@ -475,16 +541,16 @@ impl Filesystem for WritableFuse {
             if data.len() > MAX_IO_BYTES {
                 return Err(os_error(libc::EFBIG));
             }
-            if write_flags & fuser::consts::FUSE_WRITE_CACHE != 0 {
-                return Err(os_error(libc::EOPNOTSUPP));
-            }
+
             let handle = self.handle(inode, handle, false)?;
             if !handle.writable {
                 return Err(os_error(libc::EBADF));
             }
             // Use current file flags, not the original open flags: F_SETFL can
             // enable or disable O_APPEND without another FUSE open callback.
-            let written = if flags & libc::O_APPEND != 0 {
+            let written = if write_flags & fuser::consts::FUSE_WRITE_CACHE == 0
+                && flags & libc::O_APPEND != 0
+            {
                 self.core.write_append(handle.core, data)?
             } else {
                 self.core.write(handle.core, offset, data)?
@@ -496,7 +562,10 @@ impl Filesystem for WritableFuse {
         })();
         match result {
             Ok(length) => reply.written(length),
-            Err(error) => reply.error(errno(&error)),
+            Err(error) => {
+                self.failed.set(true);
+                reply.error(errno(&error));
+            }
         }
     }
 
@@ -689,7 +758,7 @@ impl Filesystem for WritableFuse {
         match result {
             Ok((attr, handle)) => {
                 self.remember(attr.ino);
-                reply.created(&TTL, &attr, 1, handle, fuser::consts::FOPEN_DIRECT_IO);
+                reply.created(&TTL, &attr, 1, handle, fuser::consts::FOPEN_KEEP_CACHE);
             }
             Err(error) => reply.error(errno(&error)),
         }

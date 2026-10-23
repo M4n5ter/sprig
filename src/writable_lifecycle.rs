@@ -205,6 +205,7 @@ pub(crate) fn start(
         verify_binding(generation, revision)?;
         return Ok(());
     }
+    crate::writable_session::ensure_clean(generation)?;
     let target = generation.join("tree");
     if initialize {
         match DirBuilder::new().mode(0o700).create(&target) {
@@ -266,13 +267,20 @@ pub(crate) fn start(
 pub(crate) fn stop(generation: &Path) -> Result<()> {
     require_root()?;
     let _control = Control::acquire(generation)?;
-    if inspect(generation)? == MountState::Mounted {
+    let stopped = if inspect(generation)? == MountState::Mounted {
+        let record = crate::writable_session::request_stop(generation)?;
         normal_unmount(&generation.join("tree"))?;
-    }
+        Some(record)
+    } else {
+        None
+    };
     if inspect(generation)? != MountState::Unmounted {
         return Err(invalid("writable CAS mount remains after normal unmount").into());
     }
     wait_journal_release(generation)?;
+    if let Some(record) = stopped {
+        crate::writable_session::finish_stop(generation, &record)?;
+    }
     Ok(())
 }
 

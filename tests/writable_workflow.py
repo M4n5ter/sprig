@@ -13,6 +13,8 @@ import mmap
 import os
 from pathlib import Path
 import shutil
+import signal
+import sys
 import subprocess
 import tempfile
 
@@ -149,31 +151,78 @@ def run(binary):
                 assert os.fstat(old.fileno()).st_nlink == 0
                 assert os.fstat(new.fileno()).st_nlink == 0
 
-        # Do not merely inspect advertised flags: prove that this kernel does
-        # not accept a writable shared mapping on a direct-I/O regular file.
-        with (tree / "a.txt").open("r+b") as opened:
-            try:
-                mapping = mmap.mmap(opened.fileno(), 0, flags=mmap.MAP_SHARED,
-                                    prot=mmap.PROT_READ | mmap.PROT_WRITE)
-            except OSError as error:
-                assert error.errno in {errno.ENODEV, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL}, error
-                capabilities["writable_shared_mmap"] = {"supported": False, "errno": error.errno}
-            else:
-                mapping.close()
-                raise AssertionError("writable shared mmap unexpectedly succeeded")
-            busy_checkpoint()
+        # The ordinary page cache is shared by aliases and processes. msync is
+        # a durability boundary; checkpoint still requires every mapping closed.
+        mapped_path = tree / "mapped.bin"
+        mapped_path.write_bytes(b"A" * 8192)
+        os.link(mapped_path, tree / "mapped-alias.bin")
+        descriptor = os.open(mapped_path, os.O_RDWR | os.O_APPEND)
+        mapping = mmap.mmap(descriptor, 8192, flags=mmap.MAP_SHARED,
+                            prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        os.close(descriptor)
+        mapping[0:4] = b"MAP!"
+        mapping.flush()
+        assert mapped_path.stat().st_size == 8192, "mmap writes incorrectly appended"
+        assert (tree / "mapped-alias.bin").read_bytes()[:4] == b"MAP!"
+        child = subprocess.run([sys.executable, "-c",
+            "import mmap,sys; f=open(sys.argv[1],'r+b'); m=mmap.mmap(f.fileno(),0); "
+            "assert m[:4]==b'MAP!'; m[4:8]=b'CHLD'; m.flush(); m.close(); f.close()",
+            str(tree / "mapped-alias.bin")], capture_output=True, text=True, timeout=15)
+        assert child.returncode == 0, child.stderr
+        assert mapping[4:8] == b"CHLD"
+        protection_source = root / "mapped-protection.c"
+        protection_source.write_text('#include <sys/mman.h>\n#include <fcntl.h>\n#include <unistd.h>\n'
+            'int main(int n,char **v){(void)n;int f=open(v[1],O_RDWR);if(f<0)return 1;'
+            'char *p=mmap(0,4096,PROT_READ,MAP_SHARED,f,0);if(p==MAP_FAILED)return 2;'
+            'if(mprotect(p,4096,PROT_READ|PROT_WRITE))return 3;p[20]=82;'
+            'if(msync(p,4096,MS_SYNC))return 4;close(f);return munmap(p,4096)!=0;}\n')
+        protection_binary = root / "mapped-protection"
+        subprocess.run([shutil.which("cc"), str(protection_source), "-o", str(protection_binary)],
+                       check=True, capture_output=True, timeout=30)
+        subprocess.run([str(protection_binary), str(tree / "mapped-alias.bin")],
+                       check=True, capture_output=True, timeout=15)
+        assert mapping[20] == ord("R")
+        with (tree / "mapped-alias.bin").open("r+b") as opened:
+            opened.seek(8)
+            opened.write(b"FILE")
+            opened.flush()
+            os.fsync(opened.fileno())
+        assert mapping[8:12] == b"FILE"
+        busy_checkpoint()  # Original fd is closed; the mapping itself pins it.
+        os.rename(tree / "mapped-alias.bin", tree / "mapped-renamed.bin")
+        mapped_path.unlink()
+        mapping[12:16] = b"LINK"
+        mapping.flush()
+        assert (tree / "mapped-renamed.bin").read_bytes()[12:16] == b"LINK"
+        with (tree / "mapped-renamed.bin").open("r+b") as opened:
+            private = mmap.mmap(opened.fileno(), 8192, flags=mmap.MAP_PRIVATE,
+                                prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            private[0:4] = b"PRIV"
+            private.close()
+            assert mapping[:4] == b"MAP!"
+            os.ftruncate(opened.fileno(), 4096)
+            os.ftruncate(opened.fileno(), 8192)
+            assert mapping[4096:] == b"\0" * 4096
+            os.fsync(opened.fileno())
+        # SIGBUS is checked in an isolated child, never in this controller.
+        child = subprocess.run([sys.executable, "-c",
+            "import mmap,os,resource,sys; resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
+            "f=open(sys.argv[1],'r+b'); m=mmap.mmap(f.fileno(),0); "
+            "os.ftruncate(f.fileno(),4096); print(m[5000])",
+            str(tree / "mapped-renamed.bin")], capture_output=True, text=True, timeout=15)
+        assert child.returncode == -signal.SIGBUS, (child.returncode, child.stderr)
+        mapping[16:20] = b"LAST"  # No explicit msync: normal close must drain.
+        mapping.close()
+        capabilities["writable_shared_mmap"] = {"supported": True, "msync": True,
+            "closed_fd_mapping_busy": True, "truncate_sigbus": True,
+            "alias_and_process_coherence": True}
         for label, flags in [("read_only_private_mmap", mmap.MAP_PRIVATE),
                              ("read_only_shared_mmap", mmap.MAP_SHARED)]:
             with (tree / "a.txt").open("rb") as opened:
-                try:
-                    mapping = mmap.mmap(opened.fileno(), 0, flags=flags, prot=mmap.PROT_READ)
-                except OSError as error:
-                    assert error.errno in {errno.ENODEV, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL}, error
-                    capabilities[label] = {"supported": False, "errno": error.errno}
-                else:
-                    assert mapping[:] == b"atomic\nbeta\nappend\n"
-                    mapping.close()
-                    capabilities[label] = {"supported": True}
+                mapping = mmap.mmap(opened.fileno(), 0, flags=flags, prot=mmap.PROT_READ)
+                assert mapping[:] == b"atomic\nbeta\nappend\n"
+                mapping.close()
+                capabilities[label] = {"supported": True}
         try:
             executable = subprocess.run([str(tree / "native-tool")], cwd=root,
                                         capture_output=True, text=True, timeout=15)
@@ -230,6 +279,8 @@ def run(binary):
         assert read(initial, "a.txt") == "alpha\nbeta\n"
         assert read(committed, "moved/child") == "retained child\n"
         assert bytes(invoke("read", committed, "random.bin")) == b"ZbX" + b"\0" * 4 + b"Q\0"
+        assert bytes(invoke("read", committed, "mapped-renamed.bin"))[:20] == b"MAP!CHLDFILELINKLAST"
+        assert len(bytes(invoke("read", committed, "mapped-renamed.bin"))) == 4096
         assert not (path("main") / "victim").exists()
         checks.append("ordinary tools, positional/append I/O, truncate zero-fill, fsyncdir, inode pins, mmap policy and busy checkpoint")
 
@@ -360,6 +411,47 @@ def run(binary):
         assert invoke("gc", "--dry-run")["dry_run"]
         assert (source / "a.txt").read_text() == "alpha\nbeta\n"
         checks.append("writable restore/fork isolation, retained journal integrity and normal cleanup")
+        # Exhaust only this synthetic generation's journal, not the host disk.
+        # A background mmap write failure must survive daemon exit and block
+        # ordinary publication; explicit recovery keeps the journal evidence.
+        invoke("--writable", "restore", initial, "quota")
+        invoke("mount", "quota")
+        quota_tree = path("quota")
+        quota_generation = quota_tree.parent
+        quota_journal = quota_generation / "writable.journal"
+        quota_file = quota_tree / "quota.bin"
+        quota_file.write_bytes(b"Q" * (2 * 1024 * 1024))
+        with quota_file.open("r+b", buffering=0) as opened:
+            payload = b"P" * (1024 * 1024)
+            limit = 256 * 1024 * 1024
+            while limit - quota_journal.stat().st_size > 2 * 1024 * 1024:
+                assert os.pwrite(opened.fileno(), payload, 0) == len(payload)
+            mapping = mmap.mmap(opened.fileno(), 0, flags=mmap.MAP_SHARED,
+                                prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            mapping[:] = b"Z" * len(mapping)
+            try:
+                mapping.flush()
+            except OSError as error:
+                assert error.errno in {errno.ENOSPC, errno.EIO}, error
+            else:
+                raise AssertionError("quota-limited mmap synchronization succeeded")
+            mapping.close()
+        quota_head = invoke("show", "quota")["base_revision"]
+        invoke("unmount", "quota", fail=True)
+        assert path("quota", mounted=False) == quota_tree
+        assert (quota_generation / "writable-session.json").is_file()
+        invoke("checkpoint", "quota", fail=True)
+        assert invoke("show", "quota")["base_revision"] == quota_head
+        assert invoke("writable-status", "quota")["read_only"]
+        preserved = quota_journal.stat().st_size
+        recovered = invoke("recover-writable", "quota", "quota-recovered")
+        assert recovered["path"] != str(quota_tree)
+        assert quota_journal.stat().st_size == preserved
+        assert (quota_generation / "writable-session.json").is_file()
+        capabilities["mmap_failure_guard"] = {"quota_error_observed": True,
+            "publication_blocked_after_unmount": True, "journal_bytes_retained": preserved}
+        checks.append("shared mappings synchronize through journal; failed mapped writes require explicit recovery")
+
     except BaseException as error:
         failure = f"{type(error).__name__}: {error}"
     finally:

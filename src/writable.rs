@@ -122,6 +122,7 @@ struct Inner {
     content_dirty: BTreeSet<u64>,
     poisoned: bool,
     incomplete_tail: bool,
+    abandoned_session: bool,
 }
 
 struct Node {
@@ -253,6 +254,7 @@ impl WritableCas {
         let journal = platform::open_read_write(&generation_dir.join(JOURNAL_NAME))?;
         let mut inner = Inner::new(objects, base, revision, generation, lease, journal)?;
         inner.replay()?;
+        inner.abandoned_session = crate::writable_session::has_session(generation_dir)?;
         Ok(Self {
             objects: objects.to_owned(),
             inner: Mutex::new(inner),
@@ -268,7 +270,7 @@ impl WritableCas {
     pub(crate) fn recovery_info(&self) -> io::Result<RecoveryInfo> {
         let inner = self.lock()?;
         Ok(RecoveryInfo {
-            read_only: inner.poisoned || inner.incomplete_tail,
+            read_only: inner.poisoned || inner.incomplete_tail || inner.abandoned_session,
             incomplete_tail: inner.incomplete_tail,
             verified_bytes: inner.journal_bytes,
         })
@@ -744,11 +746,12 @@ impl Inner {
             content_dirty: BTreeSet::new(),
             poisoned: false,
             incomplete_tail: false,
+            abandoned_session: false,
         })
     }
 
     fn can_mutate(&self) -> io::Result<()> {
-        if self.incomplete_tail {
+        if self.incomplete_tail || self.abandoned_session {
             return Err(read_only());
         }
         if self.poisoned {

@@ -186,7 +186,8 @@ def compare(binary, temporary, require_clone, report):
         "original_chunk_references": len(old_chunks),
         "new_chunk_references": len(new_chunks),
         "reused_distinct_chunks": len(retained),
-        "reused_chunk_bytes": sum((sprig.store / "objects" / chunk).stat().st_size for chunk in retained),
+        "object_storage_bytes_before": before_prefix["object_storage_bytes"],
+        "object_storage_bytes_after": after_prefix["object_storage_bytes"],
     }
     # Verify a write in every materialization, including strict clone when requested.
     trees = {"ordinary_copy": ordinary, **{"fork_" + mode: path for mode, path in fork_paths.items()}}
@@ -275,7 +276,7 @@ def main():
             "One warm-cache-friendly synthetic run, fixed order; not a statistical benchmark or a speedup claim.",
             "Ordinary copy uses copyfileobj and copystat, without fsync, hashing, history, or transaction publication. It has no durability parity with Sprig.",
             "Sprig durations time whole CLI processes, including scans, hashing, synchronization and metadata work. Import is separate from fork; output validation and fixture generation are not timed.",
-            "CAS bytes count logical chunk-file lengths only, not manifests, native working trees, retained generations or filesystem overhead.",
+            "CAS bytes count unique logical chunk payloads, whether loose or packed. Object storage bytes also include index, lock and retained temporary/orphan files, but neither metric covers manifests, native trees or whole-store physical allocation.",
             "Exclusive physical allocation and shared extents were not measured. stat.st_blocks would not establish exclusive physical storage savings.",
             "$SPRIG denotes --binary; $TMP denotes this run's isolated temporary directory. Commands are recorded in execution order; all generated files are removed afterward.",
         ],

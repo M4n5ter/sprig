@@ -541,9 +541,10 @@ compression. Revision IDs still hash the original JSON bytes; reads validate the
 frame and revision hash. No history or recovery roots are discarded to save space.
 The current `state.json` stays uncompressed. A batch with exactly one new chunk
 publishes a loose object; two or more new chunks share an immutable payload pack.
-Content addresses and CDC boundaries do not change. The pack is synced and its directory entry made durable before an atomic,
-checksummed index replacement, which is durable before any revision/head can
-reference it. Reads still verify every chunk hash. A separate object-writer lock
+Content addresses and CDC boundaries do not change. Publication syncs the pack
+and its directory before an atomic, checksummed index replacement, then completes
+the index publication barriers before any revision/head can reference it. These
+namespace barriers have the weaker Windows guarantees described below. Reads still verify every chunk hash. A separate object-writer lock
 also serializes low-level `ObjectBatch` users; concurrent writers receive an error.
 An interrupted batch can leave an unreferenced pack, never a valid partial chunk.
 No published pack is deleted automatically.
@@ -666,9 +667,14 @@ Windows limitations are explicit rather than silent conversions:
   history materialization.
 - New directories inherit Windows ACLs; Unix private-mode bits are not an ACL
   guarantee. Keep the store in a location already private to your account.
-- Regular files are flushed and metadata replacement uses write-through rename.
-  Windows has no equivalent directory-fsync guarantee here; equal power-loss
-  namespace durability with the Unix backend is not claimed.
+- Regular files are flushed and metadata replacement first uses write-through
+  rename. For an immutable pack index held by existing readers, an access-denied
+  result can fall back to atomic POSIX-style replacement with checked file flushes
+  before and after the rename. This requires Windows 10 version 1607 or later on
+  local NTFS; unsupported systems fail rather than emulate replacement. Existing
+  readers retain their old index generation. This fallback is not a write-through
+  rename or a directory fsync. Equal power-loss namespace durability with the Unix
+  backend is not claimed.
 
 Windows `exec` keeps its lease through an inherited file handle opened without sharing.
 In a multithreaded SDK host, children spawned outside Sprig during the brief handle-

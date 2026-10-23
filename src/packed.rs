@@ -632,11 +632,12 @@ impl Batch {
         drop(file);
         #[cfg(test)]
         fail_finish(FinishPhase::BeforeIndexRename)?;
-        platform::rename(&temporary, &self.reader.objects.join(INDEX_NAME)).map_err(|error| {
-            io::Error::other(format!(
-                "pack index publication failed; outcome may be unknown: {error}"
-            ))
-        })?;
+        platform::replace_immutable_file(&temporary, &self.reader.objects.join(INDEX_NAME))
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "pack index publication failed; outcome may be unknown: {error}"
+                ))
+            })?;
         let final_barrier = || -> Result<()> {
             #[cfg(test)]
             fail_finish(FinishPhase::IndexRenamed)?;
@@ -1039,7 +1040,9 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("sprig-packs-{}", unique_id()));
             fs::create_dir(&path).unwrap();
-            Self(path)
+            // macOS's temporary-directory prefix can contain system symlinks.
+            // Resolve our synthetic fixture once; object paths still reject links.
+            Self(fs::canonicalize(path).unwrap())
         }
     }
     impl Drop for Fixture {

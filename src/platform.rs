@@ -5,8 +5,9 @@
 //! trusted and quiescent: this is not a sandbox against concurrent ancestor
 //! replacement. Windows has no unprivileged
 //! POSIX directory-fsync equivalent: file contents are flushed and publication
-//! uses write-through rename, but equal power-loss namespace durability is not
-//! claimed. Directory permissions inherit the user's existing ACLs.
+//! uses write-through rename or checked file flushes around immutable-index
+//! replacement. Equal power-loss namespace durability is not claimed. Directory
+//! permissions inherit the user's existing ACLs.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -256,6 +257,48 @@ pub(crate) fn rename(source: &Path, target: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         windows::rename(source, target)
+    }
+}
+
+/// Publishes an immutable index without invalidating readers of its old file.
+/// Windows falls back to POSIX replacement with checked file/metadata flushes,
+/// not a directory-fsync guarantee. An error may follow successful publication.
+pub(crate) fn replace_immutable_file(source: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        rename(source, target)
+    }
+    #[cfg(windows)]
+    {
+        match rename(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.raw_os_error() == Some(5) => {}
+            Err(error) => return Err(error),
+        }
+        // These helpers check ancestors, reject reparse points, and require
+        // local NTFS. Keep the source handle through publication and its flush.
+        let source_file = open_read_write(source)?;
+        let source_metadata = file_metadata(&source_file)?;
+        let target_metadata = symlink_metadata(target)?;
+        if !target_metadata.is_file() || target_metadata.permissions().readonly() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "immutable index replacement requires a writable regular target file",
+            ));
+        }
+        if source_metadata.dev() != target_metadata.dev() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "immutable index replacement requires the same NTFS volume",
+            ));
+        }
+        source_file.sync_all()?;
+        // Rust 1.89+ uses FileRenameInfoEx POSIX semantics after AccessDenied.
+        // Windows 10 1607+ with filesystem support is required; errors are not
+        // emulated by copying, deleting, or closing pinned readers. Std opens
+        // its own rename handle, so the explicit post-rename flush is required.
+        fs::rename(source, target)?;
+        source_file.sync_all()
     }
 }
 

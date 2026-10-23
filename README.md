@@ -792,3 +792,11 @@ program inside an owned writable workspace and executing its output, running an
 existing ELF, and read-only private mappings. Shared mappings, including
 read-only shared mappings, are unsupported on that tested kernel. These are
 capability checks, not a claim of complete compiler or POSIX compatibility.
+
+The same [Linux lifecycle check](https://github.com/M4n5ter/sprig/actions/runs/39985372223)
+ran a small, dependency-free Cargo crate with incremental compilation both off
+and on: clean build, no-op build, source edit, checkpoint, restore, and build,
+with executed-output checks. No-op and restored builds were `Fresh`. With
+incremental compilation enabled, rustc reported unsupported hard links and
+successfully fell back to copying cache files. This fallback has costs; the
+check does not establish compatibility or speed for every Cargo project.

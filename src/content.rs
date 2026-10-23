@@ -949,7 +949,8 @@ mod tests {
             }
         }
         let fixture = Fixture(
-            std::env::temp_dir().join(format!("sprig-content-links-{}", unique_id("test", 0, 0))),
+            fs::canonicalize(std::env::temp_dir())?
+                .join(format!("sprig-content-links-{}", unique_id("test", 0, 0))),
         );
         let source = fixture.0.join("source");
         let objects = fixture.0.join("objects");

@@ -1519,17 +1519,23 @@ mod tests {
         fs::set_permissions(&merged, fs::Permissions::from_mode(0o750)).unwrap();
         let upper_fd = open_directory(&upper).unwrap();
         let lower_fd = open_directory(&source).unwrap();
-        let make_context = |enabled: bool| Capture {
-            base: &base,
-            digest: &digest,
-            store: &store,
-            upper: &upper_fd,
-            lower: &lower_fd,
-            batch: content::ObjectBatch::open(&library.join("objects")).unwrap(),
-            manifest: Manifest::new(),
-            origins: BTreeMap::new(),
-            certificate: enabled.then(|| Certificate::new(&base)),
-            stats: CaptureStats::default(),
+        let next_context = std::cell::Cell::new(0_u64);
+        let make_context = |enabled: bool| {
+            let serial = next_context.get();
+            next_context.set(serial + 1);
+            Capture {
+                base: &base,
+                digest: &digest,
+                store: &store,
+                upper: &upper_fd,
+                lower: &lower_fd,
+                batch: content::ObjectBatch::open(&library.join(format!("context-{serial}")))
+                    .unwrap(),
+                manifest: Manifest::new(),
+                origins: BTreeMap::new(),
+                certificate: enabled.then(|| Certificate::new(&base)),
+                stats: CaptureStats::default(),
+            }
         };
         let mut certified = make_context(true);
         certified.walk(&merged, "").unwrap();
@@ -1627,7 +1633,13 @@ mod tests {
         let EntryKind::File { chunks, .. } = &base["ab"].kind else {
             unreachable!()
         };
-        let object = library.join("objects").join(&chunks[0]);
+        let catalog = crate::packed::Reader::open(&library.join("objects")).unwrap();
+        let locations = catalog.locations();
+        let object = library.join("objects").join(
+            locations
+                .get(&chunks[0])
+                .map_or(chunks[0].as_str(), |location| location.pack.as_str()),
+        );
         fs::remove_file(&object).unwrap();
         assert!(make_context(true).walk(&merged, "").is_err());
         // A fresh capture must reject symlinks and directories, not reuse a
@@ -1795,6 +1807,7 @@ mod tests {
                 random as u8
             })
             .collect();
+        let expected_objects = fixture.0.join("expected-objects");
         let mut batch = content::ObjectBatch::open(&objects).unwrap();
         for size in [
             0,
@@ -1805,7 +1818,7 @@ mod tests {
             MAX_CHUNK,
             data.len(),
         ] {
-            let expected = content::put_bytes(&data[..size], &objects).unwrap();
+            let expected = content::put_bytes(&data[..size], &expected_objects).unwrap();
             let direct = EntryKind::File {
                 size: size as u64,
                 chunks: fastcdc::v2020::FastCDC::new(
@@ -1851,7 +1864,7 @@ mod tests {
                     interrupt: false
                 })
                 .unwrap(),
-            content::put_bytes(&data, &objects).unwrap(),
+            content::put_bytes(&data, &expected_objects).unwrap(),
         );
         // A failed reader may have published complete chunks, but returns no
         // file entry. Reusing the batch must not retain stale buffered bytes.
@@ -1865,7 +1878,7 @@ mod tests {
         assert!(batch.put_reader(&mut failing).is_err());
         assert_eq!(
             batch.put_reader(&mut Cursor::new(b"fresh")).unwrap(),
-            content::put_bytes(b"fresh", &objects).unwrap()
+            content::put_bytes(b"fresh", &expected_objects).unwrap()
         );
         batch.finish().unwrap();
         let mut batch = content::ObjectBatch::open(&objects).unwrap();
@@ -1878,7 +1891,8 @@ mod tests {
             file.write_all(&data[..MAX_CHUNK]).unwrap();
         }
         drop(file);
-        let (expected, _) = content::capture(&source, &objects, &content::Observed::new()).unwrap();
+        let (expected, _) =
+            content::capture(&source, &expected_objects, &content::Observed::new()).unwrap();
         let streamed = batch
             .put_reader(&mut File::open(source.join("large")).unwrap())
             .unwrap();
@@ -1886,29 +1900,55 @@ mod tests {
         let EntryKind::File { chunks, .. } = streamed else {
             unreachable!()
         };
-        let target = objects.join(&chunks[0]);
+        batch.finish().unwrap();
+        let reader = crate::packed::Reader::open(&objects).unwrap();
+        let locations = reader.locations();
+        let location = locations.get(&chunks[0]);
+        let target =
+            objects.join(location.map_or(chunks[0].as_str(), |location| location.pack.as_str()));
+        let offset = location.map_or(0, |location| location.offset as usize);
+        let mut batch = content::ObjectBatch::open(&objects).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         let original = fs::read(&target).unwrap();
         // Same-length corruption is still rejected after reuse in this batch.
         let mut corrupt = original.clone();
-        corrupt[0] ^= 1;
+        corrupt[offset] ^= 1;
         fs::write(&target, &corrupt).unwrap();
         assert!(
             batch
                 .put_reader(&mut File::open(source.join("large")).unwrap())
                 .is_err()
         );
+        drop(batch);
         fs::remove_file(&target).unwrap();
         let alternate = fixture.0.join("alternate");
         fs::write(&alternate, &original).unwrap();
         std::os::unix::fs::symlink(&alternate, &target).unwrap();
-        assert!(batch.put_reader(&mut Cursor::new(&original)).is_err());
+        {
+            let mut batch = content::ObjectBatch::open(&objects).unwrap();
+            assert!(
+                batch
+                    .put_reader(&mut File::open(source.join("large")).unwrap())
+                    .is_err()
+            );
+        }
         fs::remove_file(&target).unwrap();
         fs::create_dir(&target).unwrap();
-        assert!(batch.put_reader(&mut Cursor::new(&original)).is_err());
+        {
+            let mut batch = content::ObjectBatch::open(&objects).unwrap();
+            assert!(
+                batch
+                    .put_reader(&mut File::open(source.join("large")).unwrap())
+                    .is_err()
+            );
+        }
         fs::remove_dir(&target).unwrap();
-        batch.put_reader(&mut Cursor::new(&original)).unwrap();
+        fs::write(&target, &original).unwrap();
+        let mut batch = content::ObjectBatch::open(&objects).unwrap();
+        batch
+            .put_reader(&mut File::open(source.join("large")).unwrap())
+            .unwrap();
         batch.finish().unwrap();
         assert!(
             fs::read_dir(&objects).unwrap().all(|item| !item
@@ -1920,10 +1960,12 @@ mod tests {
         // Even empty/dedup-only batches must execute a fallible final barrier.
         let empty = fixture.0.join("empty");
         let empty_batch = content::ObjectBatch::open(&empty).unwrap();
-        fs::remove_dir(&empty).unwrap();
+        fs::rename(&empty, fixture.0.join("moved-empty")).unwrap();
         assert!(empty_batch.finish().is_err());
         let mut dedup_batch = content::ObjectBatch::open(&objects).unwrap();
-        dedup_batch.put_reader(&mut Cursor::new(&original)).unwrap();
+        dedup_batch
+            .put_reader(&mut File::open(source.join("large")).unwrap())
+            .unwrap();
         fs::rename(&objects, fixture.0.join("moved-objects")).unwrap();
         assert!(dedup_batch.finish().is_err());
     }

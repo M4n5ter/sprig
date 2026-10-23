@@ -51,6 +51,7 @@ pub fn attribute(
     objects: &Path,
     mut load_revision: impl FnMut(&str) -> Result<Revision>,
 ) -> Result<LineBlame> {
+    let reader = crate::packed::Reader::open(objects)?;
     let mut current_id = revision_id.to_owned();
     let mut current = load_revision(&current_id)?;
     content::validate_manifest(&current.manifest)?;
@@ -61,7 +62,7 @@ pub fn attribute(
         .clone();
     let identity = entry.id.clone();
     let mut current_path = path.to_owned();
-    let mut text = read_text(&entry, objects)?;
+    let mut text = read_text(&entry, &reader)?;
     let mut lines: Vec<_> = text
         .split_inclusive('\n')
         .enumerate()
@@ -102,7 +103,7 @@ pub fn attribute(
         let parent_path = parent_path.clone();
         let parent_entry = parent_entry.clone();
         if parent_entry.kind != entry.kind {
-            let parent_text = read_text(&parent_entry, objects)?;
+            let parent_text = read_text(&parent_entry, &reader)?;
             let mapping = unchanged_lines(&parent_text, &text)?;
             let mut inherited = Vec::with_capacity(pending.len());
             for (output_line, current_line) in pending {
@@ -159,14 +160,14 @@ fn set_origin(
     line.message = message.to_owned();
 }
 
-fn read_text(entry: &Entry, objects: &Path) -> Result<String> {
+fn read_text(entry: &Entry, reader: &crate::packed::Reader) -> Result<String> {
     let EntryKind::File { size, .. } = &entry.kind else {
         return Err("line blame requires a regular text file".into());
     };
     if *size > content::MAX_READ_FILE {
         return Err("line blame rejects files larger than 16 MiB".into());
     }
-    let bytes = content::read_file(entry, objects)?;
+    let bytes = content::read_file_from(entry, reader)?;
     if bytes.contains(&0) {
         return Err("line blame rejects binary content containing NUL".into());
     }

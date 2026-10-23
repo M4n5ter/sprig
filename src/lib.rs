@@ -11,6 +11,7 @@ pub mod copy_tree;
 pub mod merge;
 mod metadata;
 mod model;
+mod packed;
 mod platform;
 #[cfg(all(target_os = "linux", feature = "projection"))]
 pub mod projection;

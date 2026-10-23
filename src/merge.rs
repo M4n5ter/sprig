@@ -101,7 +101,12 @@ pub fn merge(
         content::validate_manifest(manifest)?;
     }
     validate_units(units)?;
-    let rules = read_rules(ours, objects)?;
+    let mut content = MergeContent {
+        reader: crate::packed::Reader::open(objects)?,
+        objects,
+        batch: None,
+    };
+    let rules = read_rules(ours, &content.reader)?;
     let (ours, theirs) = align_additions(base, ours, theirs);
     let versions = [index(base), index(&ours), index(&theirs)];
     let ids: BTreeSet<_> = versions.iter().flat_map(|v| v.keys().cloned()).collect();
@@ -146,7 +151,7 @@ pub fn merge(
             if node.automatic && !same(0, 1) && !same(0, 2) && !same(1, 2) {
                 node.choice = Some(newer_side(&[i], &timestamps));
             } else {
-                merge_node(node, objects)?;
+                merge_node(node, &mut content)?;
             }
         }
         if let Some(side) = node.choice {
@@ -207,10 +212,36 @@ pub fn merge(
         }
         conflicts.sort_by(|a, b| (&a.path, &a.kind).cmp(&(&b.path, &b.kind)));
     }
+    if let Some(batch) = content.batch {
+        batch.finish()?;
+    }
     Ok(MergeResult {
         manifest,
         conflicts,
     })
+}
+
+// One immutable catalog and at most one durable write batch per tree merge.
+struct MergeContent<'a> {
+    objects: &'a Path,
+    reader: crate::packed::Reader,
+    batch: Option<content::ObjectBatch>,
+}
+
+impl MergeContent<'_> {
+    fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
+        content::read_file_from(entry, &self.reader)
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> Result<EntryKind> {
+        if self.batch.is_none() {
+            self.batch = Some(content::ObjectBatch::open(self.objects)?);
+        }
+        self.batch
+            .as_mut()
+            .expect("batch opened")
+            .put_reader(&mut std::io::Cursor::new(bytes))
+    }
 }
 
 fn index(manifest: &Manifest) -> BTreeMap<String, Version> {
@@ -282,7 +313,7 @@ fn align_additions(base: &Manifest, ours: &Manifest, theirs: &Manifest) -> (Mani
     (apply(ours), apply(theirs))
 }
 
-fn merge_node(node: &mut Node, objects: &Path) -> Result<()> {
+fn merge_node(node: &mut Node, objects: &mut MergeContent<'_>) -> Result<()> {
     let values: [Option<Value>; 3] =
         std::array::from_fn(|i| node.versions[i].as_ref().map(|v| v.value.clone()));
     let [base, ours, theirs] = &values;
@@ -352,7 +383,7 @@ fn merge_kind(
     base: Option<&Entry>,
     ours: &Entry,
     theirs: &Entry,
-    objects: &Path,
+    objects: &mut MergeContent<'_>,
 ) -> Result<std::result::Result<EntryKind, &'static str>> {
     if let Some(kind) = merge_field(base.map(|e| &e.kind), &ours.kind, &theirs.kind) {
         return Ok(Ok(kind));
@@ -377,8 +408,8 @@ fn merge_kind(
     if *our_size > MAX_TEXT_BYTES || *their_size > MAX_TEXT_BYTES {
         return Ok(Err("content_size_limit"));
     }
-    let our_bytes = content::read_file(ours, objects)?;
-    let their_bytes = content::read_file(theirs, objects)?;
+    let our_bytes = objects.read(ours)?;
+    let their_bytes = objects.read(theirs)?;
     if our_bytes == their_bytes {
         return Ok(Ok(ours.kind.clone()));
     }
@@ -391,7 +422,7 @@ fn merge_kind(
     if *size > MAX_TEXT_BYTES {
         return Ok(Err("content_size_limit"));
     }
-    let base_bytes = content::read_file(base, objects)?;
+    let base_bytes = objects.read(base)?;
     if our_bytes == base_bytes {
         return Ok(Ok(theirs.kind.clone()));
     }
@@ -413,7 +444,7 @@ fn merge_kind(
         return Ok(Err("binary"));
     };
     match diffy::merge(base_text, our_text, their_text) {
-        Ok(text) => Ok(Ok(content::put_bytes(text.as_bytes(), objects)?)),
+        Ok(text) => Ok(Ok(objects.put(text.as_bytes())?)),
         Err(_) => Ok(Err("content")),
     }
 }
@@ -570,7 +601,7 @@ fn rule_matches(rules: &[Gitignore], path: &str, is_directory: bool) -> bool {
     false
 }
 
-fn read_rules(manifest: &Manifest, objects: &Path) -> Result<Vec<Gitignore>> {
+fn read_rules(manifest: &Manifest, objects: &crate::packed::Reader) -> Result<Vec<Gitignore>> {
     if !manifest.contains_key(".lww") {
         return Ok(Vec::new());
     }
@@ -589,7 +620,7 @@ fn read_rules(manifest: &Manifest, objects: &Path) -> Result<Vec<Gitignore>> {
 fn read_rule_file(
     path: &str,
     manifest: &Manifest,
-    objects: &Path,
+    objects: &crate::packed::Reader,
     active: &mut BTreeSet<String>,
     bytes_read: &mut usize,
     rules: &mut Vec<Gitignore>,
@@ -606,7 +637,7 @@ fn read_rule_file(
     if *size > 1024 * 1024 || bytes_read.saturating_add(*size as usize) > 1024 * 1024 {
         return Err(".lww rules exceed 1 MiB aggregate limit".into());
     }
-    let bytes = content::read_file(entry, objects)?;
+    let bytes = content::read_file_from(entry, objects)?;
     *bytes_read += bytes.len();
     for line in std::str::from_utf8(&bytes)?.lines() {
         let trimmed = line.trim();

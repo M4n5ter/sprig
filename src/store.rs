@@ -18,11 +18,12 @@ use crate::model::{
     Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace, WorkspaceBackend,
     WorkspaceResult,
 };
+use crate::packed;
 use crate::platform;
 use crate::{Blame, Result};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 4;
+const STORAGE_SCHEMA: u32 = 5;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 /// Handle to a local, single-user store. Methods acquire their own metadata lock;
@@ -471,13 +472,10 @@ impl Store {
             let (mut restored, _): (State, _) = metadata::read(&backup)?;
             validate_state(&restored)?;
             let roots = store.protected_roots(&restored)?;
+            let reader = packed::Reader::open(&store.objects())?;
             for id in store.ancestors(&roots)? {
                 for hash in content::referenced_chunks(&store.revision(&id)?.manifest) {
-                    let object = store.objects().join(&hash);
-                    require_file(&object)?;
-                    if blake3::hash(&fs::read(object)?).to_hex().as_str() != hash {
-                        return Err(failure("corrupt content prevents metadata recovery"));
-                    }
+                    reader.read(&hash)?;
                 }
             }
             let protected_directories = store.protected_directories(&restored)?;
@@ -894,6 +892,7 @@ impl Store {
         manifest: &Manifest,
         conflicts: &[merge::MergeConflict],
     ) -> Result<()> {
+        let reader = packed::Reader::open(&self.objects())?;
         for conflict in conflicts {
             let (Some(base), Some(ours), Some(theirs)) =
                 (&conflict.base, &conflict.ours, &conflict.theirs)
@@ -919,9 +918,9 @@ impl Store {
                 continue;
             }
             let (Ok(base), Ok(ours), Ok(theirs)) = (
-                content::read_file(base, &self.objects()),
-                content::read_file(ours, &self.objects()),
-                content::read_file(theirs, &self.objects()),
+                content::read_file_from(base, &reader),
+                content::read_file_from(ours, &reader),
+                content::read_file_from(theirs, &reader),
             ) else {
                 continue;
             };
@@ -1449,6 +1448,7 @@ impl Store {
             .iter()
             .map(|(path, entry)| (entry.id.as_str(), (path, entry)))
             .collect();
+        let reader = packed::Reader::open(&self.objects())?;
         let mut seen = BTreeSet::new();
         let mut result = Vec::new();
         for (path, entry) in &after {
@@ -1459,11 +1459,11 @@ impl Store {
                     continue;
                 }
             }
-            result.push(self.file_diff(path, old, Some(entry))?);
+            result.push(self.file_diff(path, old, Some(entry), &reader)?);
         }
         for (path, entry) in &before {
             if !seen.contains(path) && !after.values().any(|new| new.id == entry.id) {
-                result.push(self.file_diff(path, Some((path, entry)), None)?);
+                result.push(self.file_diff(path, Some((path, entry)), None, &reader)?);
             }
         }
         Ok(result)
@@ -1474,13 +1474,14 @@ impl Store {
         path: &str,
         old: Option<(&String, &content::Entry)>,
         new: Option<&content::Entry>,
+        reader: &packed::Reader,
     ) -> Result<crate::FileDiff> {
         let load = |entry: Option<&content::Entry>| -> Result<Option<String>> {
             match entry {
                 None => Ok(Some(String::new())),
                 Some(entry) if matches!(entry.kind, EntryKind::File { size, .. } if size <= content::MAX_READ_FILE) =>
                 {
-                    let bytes = content::read_file(entry, &self.objects())?;
+                    let bytes = content::read_file_from(entry, reader)?;
                     Ok(String::from_utf8(bytes)
                         .ok()
                         .filter(|text| !text.contains('\0')))
@@ -1543,18 +1544,16 @@ impl Store {
                 Err(error) => errors.push(format!("revision {id}: {error}")),
             }
         }
-        for hash in referenced {
-            let path = self.objects().join(&hash);
-            let check = (|| -> Result<()> {
-                require_file(&path)?;
-                if blake3::hash(&fs::read(&path)?).to_hex().as_str() != hash {
-                    return Err(failure("content hash mismatch"));
+        let reader = packed::Reader::open(&self.objects());
+        match &reader {
+            Ok(reader) => {
+                for hash in referenced {
+                    if let Err(error) = reader.read(&hash) {
+                        errors.push(format!("object {hash}: {error}"));
+                    }
                 }
-                Ok(())
-            })();
-            if let Err(error) = check {
-                errors.push(format!("object {hash}: {error}"));
             }
+            Err(error) => errors.push(format!("object index: {error}")),
         }
         for (name, workspace) in &state.workspaces {
             if let Err(error) = require_directory(&self.tree(&workspace.directory)) {
@@ -1607,6 +1606,7 @@ impl Store {
             orphan_revisions,
             orphan_workspaces,
             staging_entries: names(&self.root.join("staging"))?,
+            object_store_entries: names(&self.objects())?,
         })
     }
 
@@ -1620,9 +1620,12 @@ impl Store {
         for id in &reachable {
             objects.extend(content::referenced_chunks(&self.revision(id)?.manifest));
         }
-        let unreachable_objects: Vec<_> = names(&self.objects())?
-            .into_iter()
-            .filter(|name| valid_hash(name) && !objects.contains(name))
+        let reader = packed::Reader::open(&self.objects())?;
+        let catalog = object_catalog(&self.objects(), &reader)?;
+        let unreachable_objects: Vec<_> = catalog
+            .keys()
+            .filter(|hash| !objects.contains(*hash))
+            .cloned()
             .collect();
         let unreachable_revisions = names(&self.root.join("revisions"))?
             .into_iter()
@@ -1634,24 +1637,52 @@ impl Store {
             .into_iter()
             .filter(|name| !directories.contains(name))
             .collect();
+        let locations = reader.locations();
         let mut reclaimable_bytes = 0;
         for hash in &unreachable_objects {
-            reclaimable_bytes += platform::symlink_metadata(self.objects().join(hash))?.len();
+            if !locations.contains_key(hash) {
+                reclaimable_bytes += catalog[hash];
+            }
         }
-        Ok(GcPlan { dry_run: true, generation: state.generation, unreachable_objects, unreachable_revisions, orphan_workspaces, reclaimable_bytes, note: "No files deleted. All heads, workspace bases, projection lowers, trash, parents and state backups are protected. No permanent purge API is provided.".to_owned() })
+        // A partially live pack cannot be reclaimed without rewriting it.
+        let live_packs: BTreeSet<_> = locations
+            .iter()
+            .filter(|(hash, _)| objects.contains(*hash))
+            .map(|(_, location)| &location.pack)
+            .collect();
+        for (pack, size) in reader.pack_sizes() {
+            if !live_packs.contains(&pack) {
+                reclaimable_bytes += size;
+            }
+        }
+        Ok(GcPlan { dry_run: true, generation: state.generation, unreachable_objects, unreachable_revisions, orphan_workspaces, reclaimable_bytes, note: "No files deleted. All heads, workspace bases, projection lowers, trash, parents and state backups are protected. Packed bytes count as reclaimable only when their entire pack is unreachable; index and temporary/orphan files are retained. No permanent purge API is provided.".to_owned() })
     }
 
     pub fn stats(&self) -> Result<Stats> {
         let _lock = self.lock()?;
         let state = self.state()?;
         let revisions = self.ancestors(&self.protected_roots(&state)?)?;
-        let objects: Vec<_> = names(&self.objects())?
-            .into_iter()
-            .filter(|name| valid_hash(name))
-            .collect();
-        let mut object_bytes = 0;
-        for hash in &objects {
-            object_bytes += platform::symlink_metadata(self.objects().join(hash))?.len();
+        let reader = packed::Reader::open(&self.objects())?;
+        let objects = object_catalog(&self.objects(), &reader)?;
+        let object_bytes = objects.values().sum();
+        let mut object_storage_bytes = 0_u64;
+        #[cfg(unix)]
+        let mut object_allocated_bytes = 0_u64;
+        // Include the index, lock, orphan payloads and temporary files. This is
+        // referenced allocation, not exclusive physical space on CoW volumes.
+        for entry in fs::read_dir(self.objects())? {
+            let path = entry?.path();
+            let metadata = platform::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(failure("unexpected non-regular object store entry"));
+            }
+            object_storage_bytes = object_storage_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| failure("object storage size overflow"))?;
+            #[cfg(unix)]
+            {
+                object_allocated_bytes += metadata.blocks() * 512;
+            }
         }
         let mut reachable_logical_bytes = 0;
         for id in &revisions {
@@ -1665,6 +1696,17 @@ impl Store {
             revisions: revisions.len(),
             objects: objects.len(),
             object_bytes,
+            object_storage_bytes,
+            object_allocated_bytes: {
+                #[cfg(unix)]
+                {
+                    Some(object_allocated_bytes)
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
             reachable_logical_bytes,
             workspaces: state.workspaces.len(),
             branches: state.branches.len(),
@@ -1693,14 +1735,10 @@ impl Store {
                 "read requires a regular file; symbolic links are not followed",
             ));
         };
+        let mut reader = packed::PointReader::open(&self.objects())?;
         let mut written = 0u64;
         for hash in chunks {
-            let object = self.objects().join(hash);
-            require_file(&object)?;
-            let bytes = fs::read(object)?;
-            if blake3::hash(&bytes).to_hex().as_str() != hash {
-                return Err(failure("content hash mismatch"));
-            }
+            let bytes = reader.read(hash)?;
             written = written
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| failure("file size overflow"))?;
@@ -1769,11 +1807,12 @@ impl Store {
         let _lock = self.lock()?;
         let state = self.state()?;
         let manifest = self.revision(&self.resolve(&state, reference)?)?.manifest;
+        let reader = packed::Reader::open(&self.objects())?;
         let mut matches = Vec::new();
         for (path, entry) in manifest {
             if matches!(entry.kind, EntryKind::File { size, .. } if size <= content::MAX_READ_FILE)
             {
-                let bytes = content::read_file(&entry, &self.objects())?;
+                let bytes = content::read_file_from(&entry, &reader)?;
                 if let Ok(text) = std::str::from_utf8(&bytes) {
                     if text.contains('\0') {
                         continue;
@@ -2580,4 +2619,16 @@ fn sync_overlay_upper(path: &Path) -> Result<()> {
         return Err(failure("unsupported special file in projection upper"));
     }
     Ok(())
+}
+
+// Catalog unique logical chunks; never interpret pack/index names as hashes.
+fn object_catalog(path: &Path, reader: &packed::Reader) -> Result<BTreeMap<String, u64>> {
+    let mut catalog = reader.object_sizes();
+    for name in names(path)? {
+        if valid_hash(&name) {
+            let file = platform::open_regular(&path.join(&name))?;
+            catalog.entry(name).or_insert(file.metadata()?.len());
+        }
+    }
+    Ok(catalog)
 }

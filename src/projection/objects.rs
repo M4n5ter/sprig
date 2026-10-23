@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -11,6 +11,7 @@ use std::path::{Component, Path};
 
 pub(crate) type Result<T> = crate::content::Result<T>;
 
+#[cfg(test)]
 pub(crate) const MAX_CHUNK_BYTES: usize = 256 * 1024;
 pub(crate) const CACHE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -19,6 +20,7 @@ pub(crate) const CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// contain only bytes already verified against their content address.
 pub(crate) struct ObjectStore {
     objects: File,
+    snapshot: crate::packed::Snapshot,
 }
 
 impl ObjectStore {
@@ -45,35 +47,26 @@ impl ObjectStore {
                 }
             }
         }
-        Ok(Self { objects: directory })
+        let snapshot =
+            crate::packed::Snapshot::load_with(|name| open_at(&directory, OsStr::new(name), false))
+                .map_err(io::Error::other)?;
+        Ok(Self {
+            objects: directory,
+            snapshot,
+        })
     }
 
     pub fn chunk_length(&self, hash: &str) -> io::Result<usize> {
-        let length = self.open_chunk(hash)?.metadata()?.len();
-        if length == 0 || length > MAX_CHUNK_BYTES as u64 {
-            return Err(invalid("chunk length is outside 1..=256 KiB"));
-        }
-        Ok(length as usize)
-    }
-
-    fn open_chunk(&self, hash: &str) -> io::Result<File> {
-        validate_hash(hash)?;
-        open_at(&self.objects, OsStr::new(hash), false)
+        self.snapshot
+            .length_with(hash, |name| open_at(&self.objects, OsStr::new(name), false))
+            .map(|length| length as usize)
+            .map_err(io::Error::other)
     }
 
     fn verified_chunk(&self, hash: &str) -> io::Result<Vec<u8>> {
-        let file = self.open_chunk(hash)?;
-        let length = file.metadata()?.len();
-        if length == 0 || length > MAX_CHUNK_BYTES as u64 {
-            return Err(invalid("invalid chunk length"));
-        }
-        let mut bytes = Vec::with_capacity(length as usize);
-        file.take(MAX_CHUNK_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != length || blake3::hash(&bytes).to_hex().as_str() != hash {
-            return Err(invalid(format!("corrupt content-addressed object: {hash}")));
-        }
-        Ok(bytes)
+        self.snapshot
+            .read_with(hash, |name| open_at(&self.objects, OsStr::new(name), false))
+            .map_err(io::Error::other)
     }
 }
 

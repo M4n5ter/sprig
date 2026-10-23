@@ -129,6 +129,7 @@ pub struct DoctorReport {
     pub orphan_revisions: Vec<String>,
     pub orphan_workspaces: Vec<String>,
     pub staging_entries: Vec<String>,
+    pub object_store_entries: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +148,8 @@ pub struct Stats {
     pub revisions: usize,
     pub objects: usize,
     pub object_bytes: u64,
+    pub object_storage_bytes: u64,
+    pub object_allocated_bytes: Option<u64>,
     pub reachable_logical_bytes: u64,
     pub workspaces: usize,
     pub branches: usize,

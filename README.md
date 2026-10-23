@@ -529,7 +529,7 @@ normal content rollback: keep an independent backup, choose a generation from
 STORE/
   state.json          # Branches, workspaces, trash and a schema marker
   lock                # Advisory metadata lock
-  objects/HASH        # Immutable content chunks
+  objects/            # Immutable payload packs, address index and object-writer lock
   revisions/HASH.json.zst # Compressed immutable manifests and parents
   native/GENERATION/  # Native trees or projection lower/upper/work/tree, and leases
   staging/            # Unpublished data and retained recovery records
@@ -539,19 +539,46 @@ STORE/
 Revision manifests and metadata backups use lossless, checksummed Zstandard
 compression. Revision IDs still hash the original JSON bytes; reads validate the
 frame and revision hash. No history or recovery roots are discarded to save space.
-The current `state.json` stays uncompressed. Chunk files are synced individually,
-and their directory entries are synced before a capture can return references.
+The current `state.json` stays uncompressed. A batch with exactly one new chunk
+publishes a loose object; two or more new chunks share an immutable payload pack.
+Content addresses and CDC boundaries do not change. The pack is synced and its directory entry made durable before an atomic,
+checksummed index replacement, which is durable before any revision/head can
+reference it. Reads still verify every chunk hash. A separate object-writer lock
+also serializes low-level `ObjectBatch` users; concurrent writers receive an error.
+An interrupted batch can leave an unreferenced pack, never a valid partial chunk.
+No published pack is deleted automatically.
+
+The current index is rewritten when a pack is added and is limited to 64 MiB
+on disk. Ordinary file reads pin one index generation and binary-search bounded
+records, then verify the requested chunk hashes and whole-file size. They do not
+validate the global index checksum or all records: unrelated corruption can be
+detected later, and damaged ordering can produce a missing-object error. A loose
+fallback must independently verify the requested hash; it is not proof that an
+unused packed alias is healthy. Writers, doctor, GC, bulk readers and projection
+metadata planning still validate the full index. Bulk operations share a validated
+snapshot; catalog metadata is expanded only when needed. These are explicit
+capacity and growth costs, not constant-time update claims. Single-new-chunk
+batches do not rewrite the index.
+Loose chunks remain readable within this layout, but that does not make older
+store schemas compatible. GC counts packed bytes as reclaimable only when the
+whole pack is unreachable; it does not pretend dead slices can be freed in place.
 Native capture reuses one 256 KiB I/O buffer across files, not their contents:
 every file is still read and every existing chunk verified, even when size and
 mtime match. Projected capture uses the lower-provenance checks described above.
 
-`stats.object_bytes` totals stored chunk bytes, including unreferenced objects.
+`stats.object_bytes` totals unique indexed/loose payload bytes, including
+unreferenced objects. `object_storage_bytes` includes all object-directory files,
+including index, lock, orphan packs and temporary files. On Unix,
+`object_allocated_bytes` sums their reported allocated blocks; it is not exclusive
+physical usage on shared/CoW storage. Windows reports that field as null.
 `reachable_logical_bytes` sums file lengths across protected revisions; repeated
-content counts in each revision. Neither value is total physical disk usage.
-Retained trees and backups intentionally consume space.
+content counts in each revision. None is whole-store physical usage: retained
+trees, revision records and backups also consume space. `doctor` lists all object
+store entries so retained orphan/temporary files are visible.
 
-The current storage schema is **4**. Earlier or otherwise unsupported schemas are
-rejected without migration or modification. Use a fresh store for this version;
+The current storage schema is **5**. Earlier or otherwise unsupported schemas are
+rejected without migration or modification, including schema 4 stores created by
+the previous binary. Use a fresh store for this version;
 there is no storage-format or API compatibility guarantee. Keep independent backups.
 
 ## Guarantees and boundaries

@@ -849,17 +849,33 @@ fn transactional_sdk_exec_leases_recovery_and_non_destructive_inspection() -> Re
         revisions_before
     );
     let entry = s.stat("main", "document")?;
-    let object = f.store_path.join("objects").join(&chunks(&entry)[0]);
+    let content = s.read("main", "document")?;
+    assert_eq!(chunks(&entry).len(), 1);
+    let object = fs::read_dir(f.store_path.join("objects"))?
+        .map(|item| item.map(|item| item.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| {
+            fs::read(path)
+                .is_ok_and(|bytes| bytes.windows(content.len()).any(|window| window == content))
+        })
+        .expect("published payload contains the document bytes");
     let saved = fs::read(&object)?;
     fs::set_permissions(&object, fs::Permissions::from_mode(0o644))?;
-    fs::write(&object, b"corrupt")?;
+    let mut corrupt = saved.clone();
+    let offset = corrupt
+        .windows(content.len())
+        .position(|window| window == content)
+        .unwrap();
+    corrupt[offset] ^= 1;
+    fs::write(&object, &corrupt)?;
     let report = s.doctor()?;
     assert!(
         !report.healthy
             && report
                 .errors
                 .iter()
-                .any(|message| message.contains("hash mismatch"))
+                .any(|message| message.contains("hash") || message.contains("corrupt"))
     );
     assert!(
         s.read("main", "document").is_err(),

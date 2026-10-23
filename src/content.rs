@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fastcdc::v2020::FastCDC;
 use serde::{Deserialize, Serialize};
 
+use crate::packed;
 use crate::platform::{self, Metadata};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -74,31 +75,23 @@ pub fn capture(root: &Path, objects: &Path, previous: &Observed) -> Result<(Mani
     let mut manifest = Manifest::new();
     let mut observed = Observed::new();
     // Reuse allocation only, never content: every file is read and verified.
-    let mut buffer = vec![0_u8; MAX_CHUNK];
-    capture_entry(
-        &root,
-        "",
-        objects,
-        &mut manifest,
-        &mut observed,
-        &mut buffer,
-    )?;
+    let mut batch = ObjectBatch::open(objects)?;
+    capture_entry(&root, "", &mut batch, &mut manifest, &mut observed)?;
     assign_ids(&mut manifest, &mut observed, previous);
     validate_manifest(&manifest)?;
     // Flush all publications together before returning a usable manifest. Do
     // this even for dedup-only captures: an earlier failure may have left an
     // existing, fully synced chunk with an unsynced directory entry.
-    platform::sync_directory(objects)?;
+    batch.finish()?;
     Ok((manifest, observed))
 }
 
 fn capture_entry(
     path: &Path,
     relative: &str,
-    objects: &Path,
+    batch: &mut ObjectBatch,
     manifest: &mut Manifest,
     observed: &mut Observed,
-    buffer: &mut [u8],
 ) -> Result<()> {
     validate_path(relative)?;
     let metadata = platform::symlink_metadata(path)?;
@@ -115,7 +108,7 @@ fn capture_entry(
         if !unchanged(&metadata, &before) {
             return invalid(format!("source changed during capture: {}", path.display()));
         }
-        let kind = put_reader(&mut input, objects, buffer)?;
+        let kind = batch.put_reader(&mut input)?;
         let after = platform::file_metadata(&input)?;
         let EntryKind::File { size, .. } = &kind else {
             unreachable!()
@@ -156,14 +149,7 @@ fn capture_entry(
             } else {
                 format!("{relative}/{name}")
             };
-            capture_entry(
-                &child.path(),
-                &child_relative,
-                objects,
-                manifest,
-                observed,
-                buffer,
-            )?;
+            capture_entry(&child.path(), &child_relative, batch, manifest, observed)?;
         }
         if !unchanged(&metadata, &platform::symlink_metadata(path)?) {
             return invalid(format!(
@@ -245,6 +231,7 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     // create_dir, not create_dir_all: an existing target is never modified.
     platform::create_dir(&target, 0o700)?;
     platform::set_path_mode(&target, 0o700)?;
+    let reader = packed::Reader::open(objects)?;
     let mut directories = Vec::new();
     for (relative, entry) in manifest {
         let path = target.join(relative);
@@ -260,7 +247,7 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
                 let mut output = platform::create_new(&path, 0o600)?;
                 let mut written = 0_u64;
                 for hash in chunks {
-                    let bytes = read_chunk(objects, hash)?;
+                    let bytes = reader.read(hash)?;
                     written = written
                         .checked_add(bytes.len() as u64)
                         .ok_or_else(|| io::Error::other("file size overflow"))?;
@@ -302,7 +289,20 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     Ok(())
 }
 
+/// Read requested contents with per-chunk hash and whole-file size checks.
+/// Unvisited index corruption is diagnosed by full-store validation, not this
+/// point-read operation.
 pub fn read_file(entry: &Entry, objects: &Path) -> Result<Vec<u8>> {
+    ensure_directory_chain(objects)?;
+    let mut reader = packed::PointReader::open(objects)?;
+    read_file_with(entry, |hash| reader.read(hash))
+}
+
+pub(crate) fn read_file_from(entry: &Entry, reader: &packed::Reader) -> Result<Vec<u8>> {
+    read_file_with(entry, |hash| reader.read(hash))
+}
+
+fn read_file_with(entry: &Entry, mut read: impl FnMut(&str) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
     let EntryKind::File { size, chunks } = &entry.kind else {
         return invalid("entry is not a regular file");
     };
@@ -311,10 +311,9 @@ pub fn read_file(entry: &Entry, objects: &Path) -> Result<Vec<u8>> {
             "file exceeds the {MAX_READ_FILE}-byte merge read limit"
         ));
     }
-    ensure_directory_chain(objects)?;
     let mut output = Vec::with_capacity(*size as usize);
     for hash in chunks {
-        let bytes = read_chunk(objects, hash)?;
+        let bytes = read(hash)?;
         if output.len() as u64 + bytes.len() as u64 > *size {
             return invalid("chunk lengths exceed file size");
         }
@@ -336,7 +335,7 @@ pub fn read_file(entry: &Entry, objects: &Path) -> Result<Vec<u8>> {
 /// behind; retrying verifies them and `finish` syncs dedup-only batches too.
 #[must_use = "finish the batch before publishing its object references"]
 pub struct ObjectBatch {
-    objects: PathBuf,
+    batch: packed::Batch,
     buffer: Vec<u8>,
 }
 
@@ -344,33 +343,35 @@ impl ObjectBatch {
     pub fn open(objects: &Path) -> Result<Self> {
         prepare_objects(objects)?;
         Ok(Self {
-            objects: objects.to_owned(),
+            batch: packed::Batch::open(objects)?,
             buffer: vec![0_u8; MAX_CHUNK],
         })
     }
 
     pub fn put_reader(&mut self, reader: &mut impl Read) -> Result<EntryKind> {
-        put_reader(reader, &self.objects, &mut self.buffer)
+        put_reader(reader, &mut self.batch, &mut self.buffer)
     }
 
     /// Flush all publications, even if this batch only reused existing chunks.
     pub fn finish(self) -> Result<()> {
-        platform::sync_directory(&self.objects)?;
-        Ok(())
+        self.batch.finish()
     }
 }
 
 pub fn put_bytes(bytes: &[u8], objects: &Path) -> Result<EntryKind> {
-    prepare_objects(objects)?;
-    let kind = put_reader(&mut Cursor::new(bytes), objects, &mut vec![0_u8; MAX_CHUNK])?;
-    // Like capture, sync even when every chunk already existed.
-    platform::sync_directory(objects)?;
+    let mut batch = ObjectBatch::open(objects)?;
+    let kind = batch.put_reader(&mut Cursor::new(bytes))?;
+    batch.finish()?;
     Ok(kind)
 }
 
 // Publishes fully synced chunk inodes; callers must sync the object directory
 // before returning any references to them outside a capture/put_bytes batch.
-fn put_reader(reader: &mut impl Read, objects: &Path, buffer: &mut [u8]) -> Result<EntryKind> {
+fn put_reader(
+    reader: &mut impl Read,
+    batch: &mut packed::Batch,
+    buffer: &mut [u8],
+) -> Result<EntryKind> {
     debug_assert_eq!(buffer.len(), MAX_CHUNK);
     // Each file starts with no valid bytes; stale buffer tails are never chunked.
     // Refill to the maximum chunk length before cutting the first chunk. This
@@ -399,7 +400,7 @@ fn put_reader(reader: &mut impl Read, objects: &Path, buffer: &mut [u8]) -> Resu
         )
         .next()
         .expect("nonempty buffer has a chunk");
-        chunks.push(put_chunk(&buffer[..chunk.length], objects)?);
+        chunks.push(batch.put(&buffer[..chunk.length])?);
         size = size
             .checked_add(chunk.length as u64)
             .ok_or_else(|| io::Error::other("file size overflow"))?;
@@ -407,59 +408,6 @@ fn put_reader(reader: &mut impl Read, objects: &Path, buffer: &mut [u8]) -> Resu
         filled -= chunk.length;
     }
     Ok(EntryKind::File { size, chunks })
-}
-
-fn put_chunk(bytes: &[u8], objects: &Path) -> Result<String> {
-    let hash = blake3::hash(bytes).to_hex().to_string();
-    let destination = objects.join(&hash);
-    match platform::symlink_metadata(&destination) {
-        Ok(_) => {
-            if read_chunk(objects, &hash)? != bytes {
-                return invalid("existing chunk differs from its content address");
-            }
-            return Ok(hash);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let temporary = objects.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        unique_id("chunk", 0, 0)
-    ));
-    let mut file = platform::create_new(&temporary, 0o600)?;
-    let _cleanup = Temporary(temporary.clone());
-    file.write_all(bytes)?;
-    platform::protect_object(&file)?;
-    file.sync_all()?;
-    // Linking publishes a fully synced inode without overwriting an existing
-    // object. Workspace files are never hard-linked to these immutable objects.
-    match fs::hard_link(&temporary, &destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if read_chunk(objects, &hash)? != bytes {
-                return invalid("concurrent object publication has different content");
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    fs::remove_file(&temporary)?;
-    Ok(hash)
-}
-
-fn read_chunk(objects: &Path, hash: &str) -> Result<Vec<u8>> {
-    validate_hash(hash)?;
-    let file = open_regular(&objects.join(hash))?;
-    let length = file.metadata()?.len();
-    if length == 0 || length > MAX_CHUNK as u64 {
-        return invalid(format!("invalid chunk length for {hash}"));
-    }
-    let mut bytes = Vec::with_capacity(length as usize);
-    file.take(MAX_CHUNK as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != length || blake3::hash(&bytes).to_hex().as_str() != hash {
-        return invalid(format!("corrupt object: {hash}"));
-    }
-    Ok(bytes)
 }
 
 pub fn referenced_chunks(manifest: &Manifest) -> BTreeSet<String> {
@@ -719,13 +667,6 @@ fn unique_id(path: &str, device: u64, inode: u64) -> String {
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidData, message.into()).into())
-}
-
-struct Temporary(PathBuf);
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
 }
 
 #[cfg(test)]

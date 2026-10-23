@@ -8,6 +8,7 @@ compile_error!("Sprig supports Linux, macOS and Windows");
 pub mod blame;
 pub mod content;
 pub mod copy_tree;
+mod manifest_pages;
 pub mod merge;
 mod metadata;
 mod model;
@@ -16,6 +17,11 @@ mod platform;
 #[cfg(all(target_os = "linux", feature = "projection"))]
 pub mod projection;
 mod store;
+pub mod writable;
+#[cfg(all(target_os = "linux", feature = "projection"))]
+pub mod writable_fuse;
+#[cfg(all(target_os = "linux", feature = "projection"))]
+pub mod writable_lifecycle;
 
 pub use blame::{BlameLine, LineBlame as Blame};
 pub use copy_tree::CopyMode;

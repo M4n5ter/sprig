@@ -530,15 +530,29 @@ STORE/
   state.json          # Branches, workspaces, trash and a schema marker
   lock                # Advisory metadata lock
   objects/            # Immutable payload packs, address index and object-writer lock
-  revisions/HASH.json.zst # Compressed immutable manifests and parents
-  native/GENERATION/  # Native trees or projection lower/upper/work/tree, and leases
+  revisions/HASH.json.zst # Compressed immutable metadata-page roots and parents
+  native/GENERATION/  # Native/projection trees or owned journals, pins and leases
   staging/            # Unpublished data and retained recovery records
   backups/            # Compressed previous metadata generations
 ```
 
-Revision manifests and metadata backups use lossless, checksummed Zstandard
-compression. Revision IDs still hash the original JSON bytes; reads validate the
-frame and revision hash. No history or recovery roots are discarded to save space.
+Revision manifests are canonical sorted JSON streams split into content-defined
+pages. Each page is independently compressed with checksummed Zstandard and stored
+in the same immutable object packs as file chunks; unchanged pages are shared
+across history. A small revision envelope records parents, clock, message and the
+typed page root. Its canonical JSON hash identifies the revision. Reads verify
+encoded objects, page and root domain-separated hashes, lengths, canonical order,
+unique paths and CDC boundaries before reconstructing the public manifest.
+Metadata backups remain compressed complete Store states. No history or recovery
+roots are discarded to save space.
+
+Current limits are 64 MiB canonical manifest bytes, one million entries and 4,096
+pages. Native capture still scans files; page sharing is a storage representation,
+not a claim of watcher-based change detection or constant-time history reads.
+Complete manifest reads decode pages and may cost more than a single compressed
+document. Ordinary reads pin one point index; graph inspection, doctor and GC
+reuse a fully validated object-index snapshot. GC protects metadata pages as well
+as file chunks. Workspace observations and Store backups are not a shared tree.
 The current `state.json` stays uncompressed. A batch with exactly one new chunk
 publishes a loose object; two or more new chunks share an immutable payload pack.
 Content addresses and CDC boundaries do not change. Publication syncs the pack
@@ -553,8 +567,7 @@ The current index is rewritten when a pack is added and is limited to 64 MiB
 on disk. Ordinary file reads pin one index generation and binary-search bounded
 records, validate the matching pack reference and extent, then verify the requested
 chunk hashes and whole-file size. Nonmatching probes do not validate pack references
-or extents. They do not
-validate the global index checksum or all records: unrelated corruption can be
+or extents. They do not validate the global index checksum or all records: unrelated corruption can be
 detected later, and damaged ordering can produce a missing-object error. A loose
 fallback must independently verify the requested hash; it is not proof that an
 unused packed alias is healthy. Writers, doctor, GC, bulk readers and projection
@@ -579,7 +592,7 @@ content counts in each revision. None is whole-store physical usage: retained
 trees, revision records and backups also consume space. `doctor` lists all object
 store entries so retained orphan/temporary files are visible.
 
-The current storage schema is **5**.
+The current storage schema is **6**.
 
 ## Guarantees and boundaries
 
@@ -686,6 +699,63 @@ path/stream rejection, and inherited execution leases. The same run passed Linux
 and macOS native checks and the rootful Linux projection workflow, including
 busy-handle refusal and normal cleanup. These synthetic checks do not establish
 full platform parity or power-loss durability.
+
+### Owned writable CAS workspaces
+
+`--writable` selects an owned, journaled workspace instead of a materialized tree
+or an OverlayFS upper. It uses the same Store, revisions, merge engine, branch
+CAS, recoverable generations and SDK transactions. Import, fork, checkout and
+restore create it **unmounted**. SDK `write`, `edit`, `apply`, `mkdir`, `rm`, `cp`
+and `mv` work without a mount. Linux builds with `--features projection` can
+explicitly mount it for ordinary programs; no driver or persistent helper is
+installed. Windows and macOS do not expose this writable filesystem adapter.
+
+```sh
+sprig --store "$STORE" --writable import "$SOURCE" owned
+sprig --store "$STORE" write owned note.txt --text 'hello'
+sprig --store "$STORE" writable-status owned
+# Linux, root, and /dev/fuse are required for these mount operations.
+sprig --store "$STORE" mount owned
+sprig --store "$STORE" exec owned -- sh -c 'printf world >> note.txt'
+sprig --store "$STORE" checkpoint owned -m 'ordinary program writes'
+sprig --store "$STORE" unmount owned
+```
+
+The journal records exact owned mutations and stable file identities. Small
+writes append bounded extents over immutable CAS bytes; truncating and extending
+never reveals a discarded tail. Rename and unlink preserve existing open handles.
+Checkpoint hashes **whole changed files** through CDC, not only changed ranges;
+unchanged file chunks are reused. Initial access to a base file verifies its
+chunks to establish the read map. Native and Overlay workspaces still require
+external writers to be quiescent and do not acquire this exact dirty-tracking
+contract.
+
+Writes are buffered until `fsync`, `flush`, or checkpoint. A checkpoint first
+normally unmounts the writable view and acquires its journal lock; open files or
+working directories make it fail busy without publishing. There is no forced or
+lazy detach. Durable objects and revision precede a new clean generation's pin,
+then one Store state replacement publishes the branch and workspace together.
+The old journal is retained in recoverable trash, never reset after an uncertain
+publication. If publication succeeds but remount fails, the result includes the
+committed revision and `mount_error`; do not repeat the commit blindly.
+
+The direct-I/O adapter does not support shared writable `mmap`, hardlinks,
+special nodes, ownership changes, xattrs/ACLs or advanced rename flags. Unsupported
+operations fail explicitly. Read-only mapping and executable-file behavior must
+be checked on the running kernel; this is not a complete POSIX filesystem or a
+sandbox. Each generation has a 256 MiB journal quota, 1 MiB I/O request limit,
+one-million-node limit, and 256 GiB logical-growth allowance above its base.
+Retained unlinked nodes count toward those bounds. A quota error does not mean
+the host disk is full; checkpoint rotates a healthy generation without deleting
+the retained journal.
+
+An incomplete journal tail makes ordinary capture fail. `writable-status` on an
+unmounted workspace reports the verified prefix; `recover-writable SOURCE NEW`
+explicitly recovers that prefix into a separate workspace while preserving the
+original bytes. Complete corrupt records fail closed. Unmount owned workspaces
+before `doctor` for a complete journal inspection. The mounted contract is
+covered by `tests/writable_workflow.py`; local non-mount tests alone do not prove
+kernel support.
 
 ### Development checks
 

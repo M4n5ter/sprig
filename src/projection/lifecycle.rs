@@ -23,9 +23,9 @@ pub enum MountState {
     Mounted,
 }
 
-struct Control(File);
+pub(crate) struct Control(pub(crate) File);
 impl Control {
-    fn acquire(generation: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(generation: &Path) -> io::Result<Self> {
         checked_directory(generation)?;
         if fs::symlink_metadata(generation)?.mode() & 0o077 != 0 {
             return Err(invalid(
@@ -444,7 +444,7 @@ fn verify_origin(generation: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn require_root() -> io::Result<()> {
+pub(crate) fn require_root() -> io::Result<()> {
     // SAFETY: geteuid has no memory preconditions or side effects.
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::new(
@@ -455,7 +455,7 @@ fn require_root() -> io::Result<()> {
     Ok(())
 }
 
-fn checked_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn checked_directory(path: &Path) -> io::Result<()> {
     checked_directory_chain(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -466,7 +466,7 @@ fn checked_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn checked_directory_chain(path: &Path) -> io::Result<()> {
+pub(crate) fn checked_directory_chain(path: &Path) -> io::Result<()> {
     if !path.is_absolute()
         || path
             .as_os_str()
@@ -495,7 +495,7 @@ fn checked_directory_chain(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn wait_ready(child: &mut Child) -> io::Result<()> {
+pub(crate) fn wait_ready(child: &mut Child) -> io::Result<()> {
     let mut pipe = child
         .stdout
         .take()
@@ -540,7 +540,7 @@ fn wait_ready(child: &mut Child) -> io::Result<()> {
     }
 }
 
-fn normal_unmount(path: &Path) -> io::Result<()> {
+pub(crate) fn normal_unmount(path: &Path) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL mount path"))?;
     // SAFETY: a live terminated target; zero flags never force or lazily detach.
     if unsafe { libc::umount2(path.as_ptr(), 0) } != 0 {
@@ -566,7 +566,7 @@ fn cleanup_failed_child(child: &mut Child, generation: &Path) {
     }
 }
 
-fn unique_attempt() -> String {
+pub(crate) fn unique_attempt() -> String {
     format!(
         "{}-{}",
         std::process::id(),
@@ -578,16 +578,16 @@ fn unique_attempt() -> String {
 }
 
 #[derive(Debug)]
-struct Mount {
-    root: PathBuf,
-    point: PathBuf,
-    options: BTreeSet<String>,
-    filesystem: String,
-    source: String,
-    super_options: BTreeMap<String, String>,
+pub(crate) struct Mount {
+    pub(crate) root: PathBuf,
+    pub(crate) point: PathBuf,
+    pub(crate) options: BTreeSet<String>,
+    pub(crate) filesystem: String,
+    pub(crate) source: String,
+    pub(crate) super_options: BTreeMap<String, String>,
 }
 
-fn read_mounts() -> io::Result<Vec<Mount>> {
+pub(crate) fn read_mounts() -> io::Result<Vec<Mount>> {
     parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo")?)
 }
 

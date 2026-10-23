@@ -23,6 +23,10 @@ pub enum WorkspaceBackend {
     Projection {
         revision: String,
     },
+    /// Owned journaled CAS writes; Linux may expose this through direct FUSE.
+    Writable {
+        revision: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +70,22 @@ pub struct WorkspaceResult {
     pub path: PathBuf,
     pub pending_conflicts: Vec<MergeConflict>,
     pub copy_stats: Option<crate::copy_tree::CopyStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WritableStatus {
+    pub dirty_paths: Vec<String>,
+    pub read_only: bool,
+    pub incomplete_tail: bool,
+    pub verified_journal_bytes: u64,
+    pub journal_bytes: u64,
+    pub journal_limit: u64,
+    pub logical_bytes: u64,
+    pub logical_limit: u64,
+    pub nodes: u64,
+    pub node_limit: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +94,9 @@ pub struct CommitResult {
     pub revision: String,
     pub branch: String,
     pub previous_head: Option<String>,
+    /// Publication succeeded even if reopening the ordinary-tool view failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

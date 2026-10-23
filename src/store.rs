@@ -1,5 +1,7 @@
 //! One atomic state file publishes branch heads and workspace generations together.
 
+mod writable;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -11,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::content::{self, EntryKind, Manifest, Observed};
 use crate::copy_tree::{self, CopyMode};
+use crate::manifest_pages;
 use crate::merge::{self, MergeStrategy};
 use crate::metadata;
 use crate::model::{
@@ -21,10 +24,20 @@ use crate::model::{
 use crate::packed;
 use crate::platform;
 use crate::{Blame, Result};
+use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 5;
+const STORAGE_SCHEMA: u32 = 6;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRevision {
+    parents: Vec<String>,
+    clock: u64,
+    message: String,
+    manifest: manifest_pages::StoredManifest,
+}
 
 /// Handle to a local, single-user store. Methods acquire their own metadata lock;
 /// callers may clone handles, while branch-head checks prevent stale commits.
@@ -93,15 +106,26 @@ impl Store {
         let _state = self.state()?;
         let path = self.root.join("native").join(generation);
         require_directory(&path)?;
-        let pin = path.join("projection-base");
+        let owned = path.join("writable-base").try_exists()?;
+        let pin = path.join(if owned {
+            "writable-base"
+        } else {
+            "projection-base"
+        });
         require_file(&pin)?;
         let revision = fs::read_to_string(pin)?;
         if !valid_hash(&revision) {
             return Err(failure("invalid projection pin"));
         }
         let workspace = Workspace {
-            backend: WorkspaceBackend::Projection {
-                revision: revision.clone(),
+            backend: if owned {
+                WorkspaceBackend::Writable {
+                    revision: revision.clone(),
+                }
+            } else {
+                WorkspaceBackend::Projection {
+                    revision: revision.clone(),
+                }
             },
             branch: "retained".into(),
             base_revision: revision,
@@ -115,6 +139,9 @@ impl Store {
     }
 
     fn mount_state(&self, workspace: &Workspace) -> String {
+        if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            return self.writable_mount_state(workspace);
+        }
         if matches!(workspace.backend, WorkspaceBackend::Native) {
             return "native".into();
         }
@@ -138,6 +165,9 @@ impl Store {
     }
 
     fn ensure_mounted_inner(&self, workspace: &Workspace, initialize: bool) -> Result<()> {
+        if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            return self.mount_writable(workspace, initialize);
+        }
         let WorkspaceBackend::Projection { revision } = &workspace.backend else {
             return require_directory(&self.tree(&workspace.directory));
         };
@@ -183,6 +213,9 @@ impl Store {
     }
 
     fn stop_projection(&self, workspace: &Workspace) -> Result<()> {
+        if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            return self.stop_writable(workspace);
+        }
         if matches!(workspace.backend, WorkspaceBackend::Native) {
             return Ok(());
         }
@@ -207,8 +240,20 @@ impl Store {
     }
 
     fn capture_workspace(&self, workspace: &Workspace) -> Result<(Manifest, Observed)> {
+        if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            self.stop_writable(workspace)?;
+            let core = self.writable_core(workspace)?;
+            if core.recovery_info()?.read_only {
+                return Err(failure(
+                    "writable journal has an incomplete tail; normal capture refused; inspect writable-status and explicitly recover-writable into a new workspace",
+                ));
+            }
+            core.sync()?;
+            return Ok((core.snapshot()?, Observed::new()));
+        }
         self.ensure_mounted(workspace)?;
         match &workspace.backend {
+            WorkspaceBackend::Writable { .. } => unreachable!("handled above"),
             WorkspaceBackend::Native => content::capture(
                 &self.tree(&workspace.directory),
                 &self.objects(),
@@ -248,7 +293,10 @@ impl Store {
     }
 
     fn observation_epoch(&self, workspace: &Workspace) -> Result<Option<String>> {
-        if matches!(workspace.backend, WorkspaceBackend::Native) {
+        if matches!(
+            workspace.backend,
+            WorkspaceBackend::Native | WorkspaceBackend::Writable { .. }
+        ) {
             return Ok(None);
         }
         #[cfg(all(target_os = "linux", feature = "projection"))]
@@ -265,6 +313,11 @@ impl Store {
 
     fn sync_workspace(&self, workspace: &Workspace) -> Result<()> {
         match workspace.backend {
+            WorkspaceBackend::Writable { .. } => {
+                self.stop_writable(workspace)?;
+                self.writable_core(workspace)?.sync()?;
+                Ok(())
+            }
             WorkspaceBackend::Native => sync_native_tree(&self.tree(&workspace.directory)),
             WorkspaceBackend::Projection { .. } => {
                 self.ensure_mounted(workspace)?;
@@ -474,7 +527,9 @@ impl Store {
             let roots = store.protected_roots(&restored)?;
             let reader = packed::Reader::open(&store.objects())?;
             for id in store.ancestors(&roots)? {
-                for hash in content::referenced_chunks(&store.revision(&id)?.manifest) {
+                for hash in
+                    content::referenced_chunks(&store.revision_with_reader(&id, &reader)?.manifest)
+                {
                     reader.read(&hash)?;
                 }
             }
@@ -616,6 +671,14 @@ impl Store {
         fresh_name(&state, name, true)?;
         let source = workspace(&state, source)?.clone();
         let _lease = self.lease(&source)?;
+        if matches!(source.backend, WorkspaceBackend::Writable { .. }) && mode != CopyMode::Auto {
+            return Err(failure(
+                "native copy policy does not apply to a writable CAS fork",
+            ));
+        }
+        if matches!(source.backend, WorkspaceBackend::Writable { .. }) {
+            return self.fork_writable_source(&mut state, &source, name);
+        }
         // Capture identities first so a pending native rename stays identifiable.
         // The objects are deduplicated and remain unpublished until checkpoint.
         let (manifest, _) = self.capture_workspace(&source)?;
@@ -752,8 +815,13 @@ impl Store {
         let workspace = workspace(&state, name)?.clone();
         let _lease = self.lease(&workspace)?;
         branch_head(&state, &workspace.branch, expected)?;
-        let (manifest, observed) = self.capture_workspace(&workspace)?;
-        self.commit_workspace(&mut state, name, workspace, manifest, observed, message)
+        let remount = matches!(workspace.backend, WorkspaceBackend::Writable { .. })
+            && self.mount_state(&workspace) == "mounted";
+        let result = (|| {
+            let (manifest, observed) = self.capture_workspace(&workspace)?;
+            self.commit_workspace(&mut state, name, workspace, manifest, observed, message)
+        })();
+        self.finish_writable_commit(&state, name, result, remount)
     }
 
     fn commit_workspace(
@@ -774,7 +842,7 @@ impl Store {
                 "unresolved_conflicts: inspect show, edit the conflict generation, then explicitly resolve every path before checkpoint",
             ));
         }
-        if workspace.pending.is_some() && tree_has_markers(&self.tree(&workspace.directory))? {
+        if workspace.pending.is_some() && self.workspace_has_markers(&workspace, &manifest)? {
             return Err(failure(
                 "unresolved_markers: conflict marker lines remain in the workspace",
             ));
@@ -804,7 +872,9 @@ impl Store {
                 &[],
             )?;
             let (directory, observed, backend) =
-                if matches!(workspace.backend, WorkspaceBackend::Projection { .. }) {
+                if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+                    self.detached_writable(&merged.manifest)?
+                } else if matches!(workspace.backend, WorkspaceBackend::Projection { .. }) {
                     self.detached_projection(&merged.manifest)?
                 } else {
                     let directory = self.new_native()?;
@@ -832,11 +902,7 @@ impl Store {
             workspace.base_revision = previous.clone();
             workspace.observed = observed.clone();
             if !merged.conflicts.is_empty() {
-                self.write_conflict_markers(
-                    &self.tree(&workspace.directory),
-                    &merged.manifest,
-                    &merged.conflicts,
-                )?;
+                self.write_workspace_markers(&workspace, &merged.manifest, &merged.conflicts)?;
                 workspace.pending = Some(crate::PendingMerge {
                     candidate_revision: candidate,
                     conflicts: merged.conflicts,
@@ -869,6 +935,13 @@ impl Store {
                 manifest: final_manifest,
             })?
         };
+        if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            self.retain_generation(state, name, &workspace)?;
+            let (directory, observed, backend) = self.writable_generation(&revision)?;
+            workspace.directory = directory;
+            workspace.backend = backend;
+            final_observed = observed;
+        }
         workspace.base_revision = revision.clone();
         workspace.observed = final_observed;
         workspace.pending = None;
@@ -883,6 +956,7 @@ impl Store {
             revision,
             branch,
             previous_head: Some(previous),
+            mount_error: None,
         })
     }
 
@@ -953,6 +1027,9 @@ impl Store {
         let mut state = self.state()?;
         let mut workspace = workspace(&state, name)?.clone();
         let _lease = self.lease(&workspace)?;
+        if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            return self.resolve_writable_locked(&mut state, name, workspace, paths);
+        }
         self.ensure_mounted(&workspace)?;
         let Some(pending) = &mut workspace.pending else {
             return Err(failure("workspace has no pending merge"));
@@ -1110,6 +1187,7 @@ impl Store {
             revision,
             branch: branch.to_owned(),
             previous_head: Some(old),
+            mount_error: None,
         })
     }
 
@@ -1127,6 +1205,11 @@ impl Store {
         let original = workspace(&state, name)?.clone();
         let _lease = self.lease(&original)?;
         branch_head(&state, &original.branch, expected)?;
+        if matches!(original.backend, WorkspaceBackend::Writable { .. }) {
+            let remount = self.mount_state(&original) == "mounted";
+            let result = self.apply_writable_locked(&mut state, name, original, mutations, message);
+            return self.finish_writable_commit(&state, name, result, remount);
+        }
         let (original_manifest, _) = self.capture_workspace(&original)?;
         let directory = self.new_native()?;
         let tree = self.tree(&directory);
@@ -1174,6 +1257,7 @@ impl Store {
                 revision: replacement.base_revision.clone(),
                 branch: replacement.branch.clone(),
                 previous_head: Some(branch_head(&state, &replacement.branch, expected)?),
+                mount_error: None,
             };
             self.sync_workspace(&replacement)?;
             replacement.observation_epoch = self.observation_epoch(&replacement)?;
@@ -1287,6 +1371,14 @@ impl Store {
             None => self.restore_locked(&mut state, &item.revision, name, name, true),
             Some(old) => {
                 let _lease = self.lease(&old)?;
+                if matches!(old.backend, WorkspaceBackend::Writable { .. }) {
+                    if mode != CopyMode::Auto {
+                        return Err(failure(
+                            "native copy policy does not apply to writable recovery",
+                        ));
+                    }
+                    return self.fork_writable_source(&mut state, &old, name);
+                }
                 let previously_mounted = self.mount_state(&old) == "mounted";
                 let (manifest, _) = self.capture_workspace(&old)?;
                 if matches!(old.backend, WorkspaceBackend::Projection { .. }) {
@@ -1372,8 +1464,9 @@ impl Store {
             None => state.branches.values().cloned().collect(),
         };
         let mut result = Vec::new();
+        let reader = packed::Reader::open(&self.objects())?;
         for id in self.ancestors(&roots)? {
-            let revision = self.revision(&id)?;
+            let revision = self.revision_with_reader(&id, &reader)?;
             result.push(RevisionSummary {
                 revision: id,
                 parents: revision.parents,
@@ -1520,7 +1613,10 @@ impl Store {
         let _lock = self.lock()?;
         let state = self.state()?;
         let revision = self.resolve(&state, reference)?;
-        crate::blame::attribute(&revision, path, &self.objects(), |id| self.revision(id))
+        let reader = packed::Reader::open(&self.objects())?;
+        crate::blame::attribute(&revision, path, &self.objects(), |id| {
+            self.revision_with_reader(id, &reader)
+        })
     }
 
     pub fn doctor(&self) -> Result<DoctorReport> {
@@ -1536,15 +1632,22 @@ impl Store {
             }
         };
         let mut referenced = BTreeSet::new();
+        let reader = packed::Reader::open(&self.objects());
         for id in &reachable {
-            match self.revision(id) {
+            match reader
+                .as_ref()
+                .map_err(|error| failure(&error.to_string()))
+                .and_then(|reader| self.revision_with_reader(id, reader))
+            {
                 Ok(revision) => {
                     referenced.extend(content::referenced_chunks(&revision.manifest));
+                    referenced.extend(manifest_pages::referenced_chunks(
+                        &self.stored_revision(id)?.manifest,
+                    ));
                 }
                 Err(error) => errors.push(format!("revision {id}: {error}")),
             }
         }
-        let reader = packed::Reader::open(&self.objects());
         match &reader {
             Ok(reader) => {
                 for hash in referenced {
@@ -1558,6 +1661,19 @@ impl Store {
         for (name, workspace) in &state.workspaces {
             if let Err(error) = require_directory(&self.tree(&workspace.directory)) {
                 errors.push(format!("workspace {name}: {error}"));
+            }
+            if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+                match self.writable_core(workspace) {
+                    Ok(core) => match core.recovery_info() {
+                        Ok(info) if info.read_only => errors.push(format!("workspace {name}: incomplete writable journal; explicit prefix recovery required")),
+                        Ok(_) => {},
+                        Err(error) => errors.push(format!("workspace {name}: {error}")),
+                    },
+                    Err(error) if error.downcast_ref::<io::Error>().is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock) => {
+                        errors.push(format!("workspace {name}: writable journal is busy; unmount for a complete doctor inspection"));
+                    },
+                    Err(error) => errors.push(format!("workspace {name}: {error}")),
+                }
             }
             if let WorkspaceBackend::Projection { revision } = &workspace.backend {
                 let generation = self.root.join("native").join(&workspace.directory);
@@ -1617,10 +1733,15 @@ impl Store {
         let state = self.state()?;
         let reachable = self.ancestors(&self.protected_roots(&state)?)?;
         let mut objects = BTreeSet::new();
-        for id in &reachable {
-            objects.extend(content::referenced_chunks(&self.revision(id)?.manifest));
-        }
         let reader = packed::Reader::open(&self.objects())?;
+        for id in &reachable {
+            objects.extend(content::referenced_chunks(
+                &self.revision_with_reader(id, &reader)?.manifest,
+            ));
+            objects.extend(manifest_pages::referenced_chunks(
+                &self.stored_revision(id)?.manifest,
+            ));
+        }
         let catalog = object_catalog(&self.objects(), &reader)?;
         let unreachable_objects: Vec<_> = catalog
             .keys()
@@ -1686,7 +1807,7 @@ impl Store {
         }
         let mut reachable_logical_bytes = 0;
         for id in &revisions {
-            for entry in self.revision(id)?.manifest.values() {
+            for entry in self.revision_with_reader(id, &reader)?.manifest.values() {
                 if let EntryKind::File { size, .. } = entry.kind {
                     reachable_logical_bytes += size;
                 }
@@ -1870,6 +1991,7 @@ impl Store {
                 .map(|pending| pending.conflicts.clone())
                 .unwrap_or_default(),
             copy_stats: None,
+            mount_error: None,
         }
     }
 
@@ -1945,7 +2067,13 @@ impl Store {
                 return Err(failure("invalid revision parent"));
             }
         }
-        let bytes = serde_json::to_vec(revision)?;
+        let stored = StoredRevision {
+            parents: revision.parents.clone(),
+            clock: revision.clock,
+            message: revision.message.clone(),
+            manifest: manifest_pages::write(&revision.manifest, &self.objects())?,
+        };
+        let bytes = serde_json::to_vec(&stored)?;
         let id = blake3::hash(&bytes).to_hex().to_string();
         write_immutable(
             &self.root.join("revisions").join(format!("{id}.json.zst")),
@@ -1954,21 +2082,43 @@ impl Store {
         Ok(id)
     }
 
-    fn revision(&self, id: &str) -> Result<Revision> {
+    fn stored_revision(&self, id: &str) -> Result<StoredRevision> {
         if !valid_hash(id) {
             return Err(failure("invalid revision hash"));
         }
         let path = self.root.join("revisions").join(format!("{id}.json.zst"));
         require_file(&path)?;
-        let (revision, hash): (Revision, _) = metadata::read(&path)?;
+        let (revision, hash): (StoredRevision, _) = metadata::read(&path)?;
         if hash.to_hex().as_str() != id {
             return Err(failure("revision hash mismatch"));
         }
         if revision.clock == 0 || revision.parents.iter().any(|parent| !valid_hash(parent)) {
             return Err(failure("invalid revision metadata"));
         }
-        content::validate_manifest(&revision.manifest)?;
         Ok(revision)
+    }
+
+    fn revision_with_reader(&self, id: &str, reader: &packed::Reader) -> Result<Revision> {
+        let stored = self.stored_revision(id)?;
+        let manifest = manifest_pages::read(&stored.manifest, reader)?;
+        Ok(Revision {
+            parents: stored.parents,
+            clock: stored.clock,
+            message: stored.message,
+            manifest,
+        })
+    }
+
+    fn revision(&self, id: &str) -> Result<Revision> {
+        let stored = self.stored_revision(id)?;
+        let mut reader = packed::PointReader::open(&self.objects())?;
+        let manifest = manifest_pages::read_point(&stored.manifest, &mut reader)?;
+        Ok(Revision {
+            parents: stored.parents,
+            clock: stored.clock,
+            message: stored.message,
+            manifest,
+        })
     }
 
     fn resolve(&self, state: &State, reference: &str) -> Result<String> {
@@ -2007,9 +2157,10 @@ impl Store {
     fn ancestors(&self, roots: &[String]) -> Result<BTreeSet<String>> {
         let mut queue: VecDeque<_> = roots.iter().cloned().collect();
         let mut seen = BTreeSet::new();
+        let reader = packed::Reader::open(&self.objects())?;
         while let Some(id) = queue.pop_front() {
             if seen.insert(id.clone()) {
-                queue.extend(self.revision(&id)?.parents);
+                queue.extend(self.revision_with_reader(&id, &reader)?.parents);
             }
         }
         Ok(seen)
@@ -2055,7 +2206,9 @@ impl Store {
         for state in states {
             roots.extend(state.branches.into_values());
             for workspace in state.workspaces.into_values() {
-                if let WorkspaceBackend::Projection { revision } = workspace.backend {
+                if let WorkspaceBackend::Projection { revision }
+                | WorkspaceBackend::Writable { revision } = workspace.backend
+                {
                     roots.insert(revision);
                 }
                 roots.insert(workspace.base_revision);
@@ -2066,7 +2219,9 @@ impl Store {
             for item in state.trash.into_values() {
                 roots.insert(item.revision);
                 if let Some(workspace) = item.workspace {
-                    if let WorkspaceBackend::Projection { revision } = workspace.backend {
+                    if let WorkspaceBackend::Projection { revision }
+                    | WorkspaceBackend::Writable { revision } = workspace.backend
+                    {
                         roots.insert(revision);
                     }
                     roots.insert(workspace.base_revision);
@@ -2079,17 +2234,19 @@ impl Store {
         // Immutable generation pins also cover a mount prepared before a
         // metadata publication that failed or whose outcome is unknown.
         for name in names(&self.root.join("native"))? {
-            let pin = self.root.join("native").join(name).join("projection-base");
-            match platform::symlink_metadata(&pin) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-                Ok(_) => require_file(&pin)?,
+            for pin_name in ["projection-base", "writable-base"] {
+                let pin = self.root.join("native").join(&name).join(pin_name);
+                match platform::symlink_metadata(&pin) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => require_file(&pin)?,
+                }
+                let revision = fs::read_to_string(pin)?;
+                if !valid_hash(&revision) {
+                    return Err(failure("invalid retained projection pin"));
+                }
+                roots.insert(revision);
             }
-            let revision = fs::read_to_string(pin)?;
-            if !valid_hash(&revision) {
-                return Err(failure("invalid retained projection pin"));
-            }
-            roots.insert(revision);
         }
         Ok(roots.into_iter().collect())
     }
@@ -2207,7 +2364,8 @@ fn validate_workspace(workspace: &Workspace) -> Result<()> {
     {
         return Err(failure("invalid observation session"));
     }
-    if let WorkspaceBackend::Projection { revision } = &workspace.backend
+    if let WorkspaceBackend::Projection { revision } | WorkspaceBackend::Writable { revision } =
+        &workspace.backend
         && !valid_hash(revision)
     {
         return Err(failure("invalid projection revision"));

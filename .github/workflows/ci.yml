@@ -58,9 +58,16 @@ jobs:
           test -c /dev/fuse
           set -o pipefail
           sudo python3 tests/projection_workflow.py --binary "$PWD/target/debug/sprig" | tee projection-result.json
+      - name: Verify owned writable CAS lifecycle on synthetic data
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo python3 tests/writable_workflow.py --binary "$PWD/target/debug/sprig" | tee writable-result.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: projection-result
-          path: projection-result.json
+          path: |
+            projection-result.json
+            writable-result.json
           if-no-files-found: ignore

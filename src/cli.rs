@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long, global = true)]
     projected: bool,
 
+    /// Create an owned writable CAS journal. Use mount explicitly for Linux tools.
+    #[arg(long, global = true, conflicts_with = "projected")]
+    writable: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -104,6 +108,13 @@ struct CommitOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__writable-serve", hide = true)]
+    WritableServe {
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        generation: String,
+    },
     #[command(name = "__projection-serve", hide = true)]
     ProjectionServe {
         #[arg(long)]
@@ -113,6 +124,10 @@ enum Command {
     },
     /// Mount a retained projection generation without changing its contents.
     Mount { workspace: String },
+    /// Inspect an unmounted owned CAS journal and its exact dirty paths.
+    WritableStatus { workspace: String },
+    /// Recover a verified journal prefix into a new workspace, retaining the source.
+    RecoverWritable { workspace: String, name: String },
     /// Normally unmount a projection; busy views are retained, never forced.
     Unmount { workspace: String },
     /// Normally unmount an orphan generation reported by doctor; retain its data.
@@ -368,6 +383,24 @@ pub(crate) fn run() -> i32 {
 }
 
 fn execute(cli: &Cli) -> Result<Output, CliError> {
+    if let Command::WritableServe {
+        revision,
+        generation,
+    } = &cli.command
+    {
+        #[cfg(all(target_os = "linux", feature = "projection"))]
+        {
+            Store::serve_writable(&cli.store, revision, generation)?;
+            return Ok(Output::Exit(0));
+        }
+        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        {
+            let _ = (revision, generation);
+            return Err(CliError::arguments(
+                "writable mount requires Linux and the projection feature",
+            ));
+        }
+    }
     if let Command::ProjectionServe {
         revision,
         generation,
@@ -375,7 +408,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     {
         return serve_projection(&cli.store, revision, generation);
     }
-    if cli.projected
+    if (cli.projected || cli.writable)
         && !matches!(
             cli.command,
             Command::Import { .. }
@@ -388,7 +421,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             "--projected applies only to import, fork, checkout and restore",
         ));
     }
-    if cli.projected && (cli.copy || !matches!(cli.copy_mode, CopyOption::Auto)) {
+    if (cli.projected || cli.writable) && (cli.copy || !matches!(cli.copy_mode, CopyOption::Auto)) {
         return Err(CliError::arguments(
             "--projected cannot be combined with a native copy policy",
         ));
@@ -417,14 +450,22 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         Command::Init | Command::RecoverState { .. } => {
             unreachable!("initialization and state recovery are handled before opening the store")
         }
-        Command::ProjectionServe { .. } => unreachable!("FUSE worker was handled first"),
+        Command::ProjectionServe { .. } | Command::WritableServe { .. } => {
+            unreachable!("FUSE worker was handled first")
+        }
         Command::Mount { workspace } => result(store.mount_workspace(workspace)?),
+        Command::WritableStatus { workspace } => result(store.writable_status(workspace)?),
+        Command::RecoverWritable { workspace, name } => {
+            result(store.recover_writable(workspace, name)?)
+        }
         Command::Unmount { workspace } => result(store.unmount_workspace(workspace)?),
         Command::UnmountGeneration { generation } => {
             store.unmount_generation(generation)?;
             result(json!({"generation": generation, "retained": true}))
         }
-        Command::Import { source, name } => result(if cli.projected {
+        Command::Import { source, name } => result(if cli.writable {
+            store.import_writable(source, name)?
+        } else if cli.projected {
             store.import_projected(source, name)?
         } else {
             store.import(source, name, mode)?
@@ -432,17 +473,23 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         Command::Fork {
             workspace,
             new_name,
-        } => result(if cli.projected {
+        } => result(if cli.writable {
+            store.fork_writable(workspace, new_name)?
+        } else if cli.projected {
             store.fork_projected(workspace, new_name)?
         } else {
             store.fork(workspace, new_name, mode)?
         }),
-        Command::Checkout { branch, name } => result(if cli.projected {
+        Command::Checkout { branch, name } => result(if cli.writable {
+            store.checkout_writable(branch, name)?
+        } else if cli.projected {
             store.checkout_projected(branch, name)?
         } else {
             store.checkout(branch, name)?
         }),
-        Command::Restore { revision, name } => result(if cli.projected {
+        Command::Restore { revision, name } => result(if cli.writable {
+            store.restore_writable(revision, name)?
+        } else if cli.projected {
             store.restore_projected(revision, name)?
         } else {
             store.restore(revision, name)?

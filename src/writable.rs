@@ -1521,6 +1521,7 @@ mod tests {
             now_ns()
         ));
         fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
         let objects = root.join("objects");
         fs::create_dir(&objects).unwrap();
         let generation = root.join("generation");

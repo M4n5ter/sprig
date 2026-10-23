@@ -555,7 +555,7 @@ mod tests {
             NONCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
-        let temp = TestDir(path);
+        let temp = TestDir(fs::canonicalize(path).unwrap());
         let objects = temp.0.join("objects");
         let original = fixture();
         let root = write(&original, &objects).unwrap();

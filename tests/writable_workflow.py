@@ -147,10 +147,10 @@ def run(binary):
                                     prot=mmap.PROT_READ | mmap.PROT_WRITE)
             except OSError as error:
                 assert error.errno in {errno.ENODEV, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL}, error
+                capabilities["writable_shared_mmap"] = {"supported": False, "errno": error.errno}
             else:
                 mapping.close()
                 raise AssertionError("writable shared mmap unexpectedly succeeded")
-            capabilities["writable_shared_mmap"] = {"supported": False}
             busy_checkpoint()
         for label, flags in [("read_only_private_mmap", mmap.MAP_PRIVATE),
                              ("read_only_shared_mmap", mmap.MAP_SHARED)]:
@@ -278,6 +278,11 @@ def run(binary):
         path("restored", mounted=False)
         invoke("mount", "restored")
         assert (path("restored") / "a.txt").read_text() == "alpha\nbeta\n"
+        invoke("--projected", "fork", "writer-a", "projected-fork")
+        assert (path("writer-a") / "a.txt").read_text() == "resolved\n"
+        invoke("mount", "projected-fork")
+        assert (Path(invoke("show", "projected-fork")["path"]) / "a.txt").read_text() == "resolved\n"
+        invoke("unmount", "projected-fork")
         invoke("--writable", "fork", "writer-a", "forked")
         path("forked", mounted=False)
         invoke("mount", "forked")
@@ -285,6 +290,49 @@ def run(binary):
         fork_revision = invoke("checkpoint", "forked")["revision"]
         assert read(fork_revision, "a.txt") == "fork only\n"
         assert read("main", "a.txt") == "resolved\n"
+        # Real Cargo output and incremental caches stay inside the owned view.
+        # Record unsupported compiler operations rather than silently disabling
+        # incremental compilation or replacing this with a native build.
+        cargo = shutil.which("cargo")
+        assert cargo, "host Cargo is required for the actual Rust capability check"
+        for incremental in ("0", "1"):
+            name = "cargo-" + incremental
+            invoke("--writable", "restore", initial, name)
+            invoke("mount", name)
+            cargo_tree = path(name)
+            (cargo_tree / "src").mkdir()
+            (cargo_tree / "Cargo.toml").write_text(
+                '[package]\nname="owned-cargo-check"\nversion="0.1.0"\nedition="2021"\n')
+            source_file = cargo_tree / "src" / "main.rs"
+            source_file.write_text('fn main() { println!("before"); }\n')
+            environment = dict(os.environ, CARGO_INCREMENTAL=incremental,
+                               CARGO_TARGET_DIR=str(cargo_tree / "target"))
+            stages = []
+            for stage in ("clean", "noop", "edit", "restored"):
+                if stage == "edit":
+                    source_file.write_text('fn main() { println!("after"); }\n')
+                if stage == "restored":
+                    revision = invoke("checkpoint", name)["revision"]
+                    restored = name + "-restored"
+                    invoke("--writable", "restore", revision, restored)
+                    invoke("mount", restored)
+                    cargo_tree = path(restored)
+                    environment["CARGO_TARGET_DIR"] = str(cargo_tree / "target")
+                built = subprocess.run([cargo, "build", "--offline", "--verbose"],
+                                       cwd=cargo_tree, env=environment,
+                                       capture_output=True, text=True, timeout=120)
+                item = {"stage": stage, "returncode": built.returncode,
+                        "stdout": built.stdout, "stderr": built.stderr}
+                stages.append(item)
+                if built.returncode:
+                    break
+                output = subprocess.run([str(cargo_tree / "target/debug/owned-cargo-check")],
+                                        cwd=cargo_tree, capture_output=True, text=True, timeout=15)
+                assert output.returncode == 0 and output.stdout == (
+                    "after\n" if stage in {"edit", "restored"} else "before\n"), output
+            capabilities["cargo_incremental_" + incremental] = {
+                "supported": len(stages) == 4 and all(item["returncode"] == 0 for item in stages),
+                "stages": stages}
         invoke("unmount-generation", retained.name)
         assert (retained / "writable.journal").read_bytes() == journal
         for pin in sorted((store / "native").glob("*/writable-base")):
@@ -299,7 +347,8 @@ def run(binary):
         # Include unpublished generations and all retained journals, not just
         # active workspace names. Never force/lazy unmount or kill a daemon.
         if store.exists():
-            for pin in sorted((store / "native").glob("*/writable-base"), reverse=True):
+            for pin in sorted(list((store / "native").glob("*/writable-base")) +
+                              list((store / "native").glob("*/projection-base")), reverse=True):
                 try:
                     proc = subprocess.run(
                         [str(binary), "--store", str(store), "--json",

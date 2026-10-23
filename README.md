@@ -786,3 +786,9 @@ sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 The CLI is a thin adapter over the Rust library. Tests cover history, concurrent
 workspaces, merges, line attribution, transactions, recovery, storage integrity,
 native backends and CLI parsing. No project license has been selected.
+
+The Linux CI lifecycle run on Ubuntu 24.04 has verified compiling a small C
+program inside an owned writable workspace and executing its output, running an
+existing ELF, and read-only private mappings. Shared mappings, including
+read-only shared mappings, are unsupported on that tested kernel. These are
+capability checks, not a claim of complete compiler or POSIX compatibility.

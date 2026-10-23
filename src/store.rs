@@ -770,8 +770,13 @@ impl Store {
         fresh_name(&state, name, true)?;
         let source = workspace(&state, source)?.clone();
         let _lease = self.lease(&source)?;
-        let (manifest, _) = self.capture_workspace(&source)?;
-        self.fork_projected_locked(&mut state, &source, &manifest, name, false)
+        let remount = matches!(source.backend, WorkspaceBackend::Writable { .. })
+            && self.mount_state(&source) == "mounted";
+        let result = (|| {
+            let (manifest, _) = self.capture_workspace(&source)?;
+            self.fork_projected_locked(&mut state, &source, &manifest, name, false)
+        })();
+        self.finish_writable_view(&source, result, remount)
     }
 
     fn fork_projected_locked(

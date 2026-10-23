@@ -487,3 +487,7 @@ sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 ```
 
 CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。项目尚未选择许可证。
+
+Ubuntu 24.04 的 Linux CI 生命周期测试已验证：在自有可写工作区内编译小型 C 程序
+并执行产物、运行现有 ELF，以及只读私有映射。该实测内核不支持共享映射，包括
+只读共享映射。这些是具体能力检查，不代表完整编译器或 POSIX 兼容性。

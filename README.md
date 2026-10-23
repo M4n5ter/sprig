@@ -811,13 +811,14 @@ The CLI is a thin adapter over the Rust library. Tests cover history, concurrent
 workspaces, merges, line attribution, transactions, recovery, storage integrity,
 native backends and CLI parsing. No project license has been selected.
 
-The Linux CI lifecycle run on Ubuntu 24.04 has verified compiling a small C
-program inside an owned writable workspace and executing its output, running an
-existing ELF, and read-only private mappings. Shared-mapping lifecycle and
-failure handling are covered by the mounted test, not by local unit tests. These
-are capability checks, not a claim of complete compiler or POSIX compatibility.
+The [Linux mapped-workspace check](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
+on Ubuntu 24.04 verified C compilation/execution, existing ELF execution, private
+and shared mappings, alias/process coherence, `msync`, mapping-pinned busy
+checkpoints and truncation `SIGBUS`. A quota-induced background-write failure
+blocked publication after unmount and preserved the journal for explicit
+recovery. These are capability checks, not complete POSIX or performance claims.
 
-The [Linux hardlink lifecycle check](https://github.com/M4n5ter/sprig/actions/runs/40000224621)
+The [Linux hardlink lifecycle check](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
 ran a small, dependency-free Cargo crate with incremental compilation both off
 and on: clean build, no-op build, source edit, checkpoint, restore, and build,
 with executed-output checks. No-op and restored builds were `Fresh`; incremental

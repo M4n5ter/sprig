@@ -500,11 +500,12 @@ sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 
 CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。项目尚未选择许可证。
 
-Ubuntu 24.04 的 Linux CI 生命周期测试已验证：在自有可写工作区内编译小型 C 程序
-并执行产物、运行现有 ELF，以及只读私有映射。共享映射的生命周期与失败处理由实际
-挂载测试验证，本地单元测试不能替代。这些不代表完整编译器或 POSIX 兼容性。
+Ubuntu 24.04 的 [Linux 映射工作区检查](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
+已验证 C 编译与执行、现有 ELF 执行、私有和共享映射、别名与进程间一致性、`msync`、
+映射占用时拒绝检查点以及截断后的 `SIGBUS`。额度耗尽导致后台回写失败后，卸载后的
+普通发布仍被阻止，日志保留且可显式恢复。这些是能力检查，不代表完整 POSIX 兼容性或性能提升。
 
-[Linux 硬链接生命周期检查](https://github.com/M4n5ter/sprig/actions/runs/40000224621)
+[Linux 硬链接生命周期检查](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
 对无外部依赖的小型 Cargo crate 分别开启、关闭增量编译，实际完成首次构建、
 无修改构建、源码修改、checkpoint、restore、再次构建，并核对执行产物输出。
 无修改与恢复后的构建均为 `Fresh`；增量缓存硬链接成功，未出现 rustc 的复制回退警告。

@@ -191,7 +191,7 @@ impl Store {
             if crate::projection::lifecycle::inspect(&generation)?
                 == crate::projection::lifecycle::MountState::Mounted
             {
-                sync_overlay_upper(&generation.join("upper"))?;
+                sync_overlay_upper(&generation.join("upper"), false)?;
                 sync_directory(&generation.join("work"))?;
                 sync_directory(&generation)?;
             }
@@ -263,12 +263,15 @@ impl Store {
     }
 
     fn sync_workspace(&self, workspace: &Workspace) -> Result<()> {
+        let parallel = workspace.observed.len() >= 16;
         match workspace.backend {
-            WorkspaceBackend::Native => sync_native_tree(&self.tree(&workspace.directory)),
+            WorkspaceBackend::Native => {
+                sync_native_tree(&self.tree(&workspace.directory), parallel)
+            }
             WorkspaceBackend::Projection { .. } => {
                 self.ensure_mounted(workspace)?;
                 let generation = self.root.join("native").join(&workspace.directory);
-                sync_overlay_upper(&generation.join("upper"))?;
+                sync_overlay_upper(&generation.join("upper"), parallel)?;
                 sync_directory(&generation.join("work"))?;
                 sync_directory(&generation)
             }
@@ -2540,11 +2543,16 @@ fn resolution_path(tree: &Path, relative: &str) -> Result<PathBuf> {
     Ok(current)
 }
 
-fn sync_native_tree(path: &Path) -> Result<()> {
+fn sync_native_tree(path: &Path, parallel: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if parallel {
+        return Ok(crate::sync_tree::sync(path, false)?);
+    }
+    let _ = parallel;
     let metadata = platform::symlink_metadata(path)?;
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            sync_native_tree(&entry?.path())?;
+            sync_native_tree(&entry?.path(), false)?;
         }
         sync_directory(path)?;
     } else if metadata.is_file() {
@@ -2559,17 +2567,22 @@ fn sync_native_tree(path: &Path) -> Result<()> {
 
 /// Overlay whiteouts are namespace metadata, never device contents to open.
 #[cfg(windows)]
-fn sync_overlay_upper(_path: &Path) -> Result<()> {
+fn sync_overlay_upper(_path: &Path, _parallel: bool) -> Result<()> {
     Err(failure("projection requires Linux"))
 }
 
 #[cfg(unix)]
-fn sync_overlay_upper(path: &Path) -> Result<()> {
+fn sync_overlay_upper(path: &Path, parallel: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if parallel {
+        return Ok(crate::sync_tree::sync(path, true)?);
+    }
+    let _ = parallel;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = platform::symlink_metadata(path)?;
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            sync_overlay_upper(&entry?.path())?;
+            sync_overlay_upper(&entry?.path(), false)?;
         }
         sync_directory(path)?;
     } else if metadata.is_file() {

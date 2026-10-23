@@ -53,7 +53,10 @@ def run(binary):
         call("--projected", "checkout", "main", "writer-a")
         call("--projected", "checkout", "main", "writer-b")
         (path("writer-a") / "a.txt").write_text("changed alpha\nbeta\n")
+        for index in range(16):
+            (path("writer-a") / f"batch-{index}").write_text(f"batch {index}\n")
         first = call("checkpoint", "writer-a")["revision"]
+        assert all(read(first, f"batch-{index}") == f"batch {index}\n" for index in range(16))
         old_b = path("writer-b")
         (old_b / "b.txt").write_text("changed b\n")
         second = call("checkpoint", "writer-b")["revision"]

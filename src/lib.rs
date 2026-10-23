@@ -15,6 +15,8 @@ mod platform;
 #[cfg(all(target_os = "linux", feature = "projection"))]
 pub mod projection;
 mod store;
+#[cfg(target_os = "linux")]
+mod sync_tree;
 
 pub use blame::{BlameLine, LineBlame as Blame};
 pub use copy_tree::CopyMode;

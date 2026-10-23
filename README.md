@@ -576,6 +576,11 @@ there is no storage-format or API compatibility guarantee. Keep independent back
   guarantee survival of every filesystem, kernel, hardware or power-loss failure.
   An error after publication can mean the change already took effect. Inspect
   `status`, `list` and `doctor` before retrying.
+- Linux synchronizes workspace files with at most four workers, then synchronizes
+  directories from children to parents before publishing metadata. Small batches
+  remain serial. This retains all file barriers without requesting a filesystem-wide
+  flush; the temporary synchronization inventory uses memory proportional
+  to the workspace entry count. macOS and Windows retain serial synchronization.
 - Failed attempts may retain unpublished objects or workspace generations. Nothing
   is automatically purged. Keep storage private and unmodified: immutability is
   a tool contract, not protection against the operating-system owner editing it.

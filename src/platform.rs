@@ -162,6 +162,40 @@ pub(crate) fn create_new(path: &Path, mode: u32) -> io::Result<File> {
     Ok(file)
 }
 
+/// Creates a new name for a regular file in a trusted, quiescent tree. Callers
+/// must choose a source within the fresh destination, never another workspace.
+pub(crate) fn hard_link(source: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let before = symlink_metadata(source)?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hard-link source must be a regular file",
+        ));
+    }
+    validate_capture_metadata(source, &before)?;
+    #[cfg(windows)]
+    windows::validate_ancestors(target)?;
+    // std::fs::hard_link requires a new destination name. Neither platform is
+    // allowed to follow a reparse/symbolic-link source in this checked flow.
+    fs::hard_link(source, target)?;
+    let linked = symlink_metadata(target)?;
+    if !linked.is_file()
+        || linked.file_type().is_symlink()
+        || linked.dev() != before.dev()
+        || linked.ino() != before.ino()
+        || linked.len() != before.len()
+        || linked.mode() != before.mode()
+        || linked.mtime() != before.mtime()
+        || linked.mtime_nsec() != before.mtime_nsec()
+    {
+        return Err(io::Error::other("source changed while creating hard link"));
+    }
+    Ok(())
+}
+
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     let file = File::open(path)?;

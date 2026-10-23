@@ -154,6 +154,12 @@ impl CaptureResult {
                 current.id.clone_from(&entry.id);
             }
         }
+        reconcile_link_groups(
+            &mut self.manifest,
+            &mut self.observed,
+            previous,
+            previous_observed,
+        )?;
         content::validate_manifest(&self.manifest)
     }
 }
@@ -223,9 +229,10 @@ pub fn capture(
     let finalize_started = Instant::now();
     // Certificate reuse skips payloads and merged enumeration, not production
     // inode observations. Gather metadata only, and never follow leaf links.
-    let observed = observe_manifest(&merged, &context.manifest)?;
+    let mut observed = observe_manifest(&merged, &context.manifest)?;
     context.validate_inventories()?;
     assign_ids(&mut context.manifest, base, &context.origins);
+    reconcile_link_groups(&mut context.manifest, &mut observed, base, &Observed::new())?;
     content::validate_manifest(&context.manifest)?;
     context.batch.finish()?;
     // Topology changes during traversal invalidate all reuse evidence.
@@ -235,7 +242,6 @@ pub fn capture(
         return Err(store::invalid("mount or lower origin changed during capture").into());
     }
     context.stats.timings.finalize_seconds = finalize_started.elapsed().as_secs_f64();
-    let mut observed = observed;
     for (path, observation) in &mut observed {
         observation.id.clone_from(&context.manifest[path].id);
     }
@@ -244,6 +250,65 @@ pub fn capture(
         manifest: context.manifest,
         stats: context.stats,
     })
+}
+
+// A remount invalidates device/inode observations, not logical directory-entry
+// identity. Reuse a group token only through a bijection of captured inode sets
+// and prior logical groups. This never authorizes skipping payload reads.
+fn reconcile_link_groups(
+    manifest: &mut Manifest,
+    observed: &mut Observed,
+    previous: &Manifest,
+    physical_previous: &Observed,
+) -> Result<()> {
+    if observed.len() != manifest.len() || manifest.keys().any(|path| !observed.contains_key(path))
+    {
+        return Err(store::invalid("link topology requires complete inode observations").into());
+    }
+    for (path, entry) in manifest.iter_mut() {
+        entry.link_group = None;
+        if let Some(observation) = observed.get_mut(path) {
+            observation.id.clone_from(&entry.id);
+            observation.link_group = None;
+        }
+    }
+    if !physical_previous.is_empty() {
+        return content::assign_link_groups(manifest, observed, physical_previous);
+    }
+    let old_by_id: BTreeMap<_, _> = previous
+        .values()
+        .filter(|entry| matches!(entry.kind, EntryKind::File { .. }))
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+    let mut group_inodes: BTreeMap<String, BTreeSet<(u64, u64)>> = BTreeMap::new();
+    let mut inode_groups: BTreeMap<(u64, u64), BTreeSet<String>> = BTreeMap::new();
+    for (path, entry) in manifest.iter() {
+        if !matches!(entry.kind, EntryKind::File { .. }) {
+            continue;
+        }
+        if let Some(old) = old_by_id.get(entry.id.as_str()) {
+            let group = old.link_group.as_ref().unwrap_or(&old.id).clone();
+            let current = &observed[path];
+            let inode = (current.device, current.inode);
+            group_inodes.entry(group.clone()).or_default().insert(inode);
+            inode_groups.entry(inode).or_default().insert(group);
+        }
+    }
+    let mut hints = Observed::new();
+    for (path, entry) in manifest.iter() {
+        let Some(old) = old_by_id.get(entry.id.as_str()) else {
+            continue;
+        };
+        let group = old.link_group.as_ref().unwrap_or(&old.id);
+        let current = &observed[path];
+        let inode = (current.device, current.inode);
+        if group_inodes[group].len() == 1 && inode_groups[&inode].len() == 1 {
+            let mut hint = current.clone();
+            hint.link_group.clone_from(&old.link_group);
+            hints.insert(path.clone(), hint);
+        }
+    }
+    content::assign_link_groups(manifest, observed, &hints)
 }
 
 fn observe_manifest(merged: &Path, manifest: &Manifest) -> Result<Observed> {
@@ -268,6 +333,7 @@ fn observe_manifest(merged: &Path, manifest: &Manifest) -> Result<Observed> {
             path.clone(),
             Observation {
                 id: entry.id.clone(),
+                link_group: entry.link_group.clone(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
             },
@@ -411,6 +477,7 @@ impl Capture<'_> {
             relative.to_owned(),
             Entry {
                 id: String::new(),
+                link_group: None,
                 mode: before.mode() & 0o777,
                 modified_ns: modified_ns(&before),
                 kind,
@@ -1277,6 +1344,7 @@ mod tests {
     fn entry(id: &str, kind: EntryKind) -> Entry {
         Entry {
             id: id.into(),
+            link_group: None,
             mode: 0o644,
             modified_ns: 0,
             kind,
@@ -1606,7 +1674,7 @@ mod tests {
             assert_eq!(certified_manifest[path].id, base[path].id);
         }
         let mut result = CaptureResult {
-            observed: Observed::new(),
+            observed: test_observations(&certified_manifest),
             manifest: certified_manifest,
             stats: CaptureStats::default(),
         };
@@ -1980,9 +2048,28 @@ mod tests {
         )
     }
 
+    fn test_observations(manifest: &Manifest) -> Observed {
+        manifest
+            .iter()
+            .enumerate()
+            .map(|(index, (path, entry))| {
+                (
+                    path.clone(),
+                    Observation {
+                        id: entry.id.clone(),
+                        link_group: entry.link_group.clone(),
+                        device: 1,
+                        inode: index as u64 + 1,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn observation(id: &str, device: u64, inode: u64) -> Observation {
         Observation {
             id: id.into(),
+            link_group: None,
             device,
             inode,
         }
@@ -2023,7 +2110,7 @@ mod tests {
         previous.remove("new");
         previous.get_mut("a").unwrap().id = "rename-id".into();
         let mut captured = CaptureResult {
-            observed: Observed::new(),
+            observed: test_observations(&fresh),
             manifest: fresh,
             stats: CaptureStats::default(),
         };

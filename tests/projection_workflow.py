@@ -19,6 +19,8 @@ def run(binary):
     (source / "b.txt").write_text("original\n")
     (source / "directory").mkdir()
     (source / "directory" / "child").write_text("retained child\n")
+    (source / "linked.txt").write_text("linked original\n")
+    os.link(source / "linked.txt", source / "directory" / "linked-alias.txt")
     (source / "outside-link").symlink_to("/etc/passwd")
     store = root / "store"
     checks = []
@@ -50,6 +52,24 @@ def run(binary):
         assert path("main").joinpath("a.txt").read_text() == "alpha\nbeta\n"
         assert os.readlink(path("main") / "outside-link") == "/etc/passwd"
         assert call("checkpoint", "main")["revision"] == initial
+        # index=off must not split links on copy-up: grouped payloads start in
+        # the private upper, and remount must never resurrect removed aliases.
+        call("--projected", "fork", "main", "link-check")
+        linked = path("link-check")
+        assert (linked / "linked.txt").stat().st_ino == (linked / "directory/linked-alias.txt").stat().st_ino
+        (linked / "directory/linked-alias.txt").write_text("upper group edit\n")
+        assert (linked / "linked.txt").read_text() == "upper group edit\n"
+        os.link(linked / "linked.txt", linked / "new-alias")
+        (linked / "linked.txt").unlink()
+        call("unmount", "link-check")
+        call("mount", "link-check")
+        assert not (linked / "linked.txt").exists()
+        assert (linked / "new-alias").read_text() == "upper group edit\n"
+        link_revision = call("checkpoint", "link-check")["revision"]
+        assert read(link_revision, "directory/linked-alias.txt") == "upper group edit\n"
+        assert call("checkpoint", "link-check")["revision"] == link_revision
+        assert path("main").joinpath("linked.txt").read_text() == "linked original\n"
+
         call("--projected", "checkout", "main", "writer-a")
         call("--projected", "checkout", "main", "writer-b")
         (path("writer-a") / "a.txt").write_text("changed alpha\nbeta\n")

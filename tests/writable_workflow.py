@@ -27,6 +27,8 @@ def run(binary):
     (source / "b.txt").write_text("original\n")
     (source / "directory").mkdir()
     (source / "directory" / "child").write_text("retained child\n")
+    (source / "linked.txt").write_text("linked original\n")
+    os.link(source / "linked.txt", source / "directory" / "linked-alias.txt")
     # An actual host ELF tests execution/mapping capability; a shell script
     # would only test its interpreter's ordinary reads and give a false signal.
     shutil.copyfile("/bin/true", source / "native-tool")
@@ -85,6 +87,14 @@ def run(binary):
         invoke("mount", "main")
         tree = path("main")
         assert (tree / "a.txt").read_text() == "alpha\nbeta\n"
+        assert (tree / "linked.txt").stat().st_ino == (tree / "directory/linked-alias.txt").stat().st_ino
+        os.link(tree / "linked.txt", tree / "third-link.txt")
+        assert (tree / "linked.txt").stat().st_nlink == 3
+        (tree / "third-link.txt").write_text("all aliases\n")
+        assert (tree / "directory/linked-alias.txt").read_text() == "all aliases\n"
+        (tree / "third-link.txt").unlink()
+        assert (tree / "linked.txt").stat().st_nlink == 2
+
 
         invoke("exec", "main", "--", "sh", "-eu", "-c",
                "printf 'atomic\nbeta\n' > .save; mv .save a.txt; "
@@ -282,6 +292,14 @@ def run(binary):
         assert (path("writer-a") / "a.txt").read_text() == "resolved\n"
         invoke("mount", "projected-fork")
         assert (Path(invoke("show", "projected-fork")["path"]) / "a.txt").read_text() == "resolved\n"
+        projected = Path(invoke("show", "projected-fork")["path"])
+        assert (projected / "linked.txt").stat().st_ino == (projected / "moved/linked-alias.txt").stat().st_ino
+        (projected / "linked.txt").write_text("projected aliases\n")
+        assert (projected / "moved/linked-alias.txt").read_text() == "projected aliases\n"
+        invoke("unmount", "projected-fork")
+        invoke("mount", "projected-fork")
+        assert (projected / "moved/linked-alias.txt").read_text() == "projected aliases\n"
+        invoke("checkpoint", "projected-fork")
         invoke("unmount", "projected-fork")
         invoke("--writable", "fork", "writer-a", "forked")
         path("forked", mounted=False)
@@ -324,6 +342,7 @@ def run(binary):
                 item = {"stage": stage, "returncode": built.returncode,
                         "stdout": built.stdout, "stderr": built.stderr}
                 stages.append(item)
+                assert "hard linking files" not in built.stderr, built.stderr
                 if built.returncode:
                     break
                 output = subprocess.run([str(cargo_tree / "target/debug/owned-cargo-check")],

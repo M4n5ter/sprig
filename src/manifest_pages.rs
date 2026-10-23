@@ -493,6 +493,7 @@ mod tests {
             "".into(),
             Entry {
                 id: "root".into(),
+                link_group: None,
                 mode: 0o755,
                 modified_ns: -1,
                 kind: EntryKind::Directory,
@@ -503,6 +504,7 @@ mod tests {
                 format!("file-{number:04}"),
                 Entry {
                     id: format!("stable-{number:04}"),
+                    link_group: None,
                     mode: 0o644,
                     modified_ns: i64::MAX as i128 + 1,
                     kind: EntryKind::File {
@@ -520,6 +522,7 @@ mod tests {
             "symlink".into(),
             Entry {
                 id: "link".into(),
+                link_group: None,
                 mode: 0o777,
                 modified_ns: 0,
                 kind: EntryKind::Symlink {

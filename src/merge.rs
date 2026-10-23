@@ -131,19 +131,28 @@ pub fn merge(
             ]
         })
         .collect();
+    // Namespace identities remain distinct; inode payloads are merged once for
+    // every connected hardlink component, including aliases removed on a side.
+    let link_components = hardlink_components(&nodes, &mut groups);
+    let linked: BTreeSet<_> = link_components.iter().flatten().copied().collect();
+    for node in &mut nodes {
+        let version = node.versions[1]
+            .as_ref()
+            .or(node.versions[2].as_ref())
+            .or(node.versions[0].as_ref())
+            .ok_or("empty identity")?;
+        node.automatic = rule_matches(
+            &rules,
+            &version.path,
+            matches!(version.value.entry.kind, EntryKind::Directory),
+        );
+    }
     add_units(&mut nodes, &mut groups, units, &timestamps);
+    for component in &link_components {
+        merge_hardlinks(&mut nodes, component, &mut content, &timestamps)?;
+    }
     for (i, node) in nodes.iter_mut().enumerate() {
-        if node.choice.is_none() {
-            let version = node.versions[1]
-                .as_ref()
-                .or(node.versions[2].as_ref())
-                .or(node.versions[0].as_ref())
-                .ok_or("empty identity")?;
-            node.automatic = rule_matches(
-                &rules,
-                &version.path,
-                matches!(version.value.entry.kind, EntryKind::Directory),
-            );
+        if node.choice.is_none() && !linked.contains(&i) {
             let same = |a: usize, b: usize| {
                 node.versions[a].as_ref().map(|v| &v.value)
                     == node.versions[b].as_ref().map(|v| &v.value)
@@ -292,7 +301,11 @@ fn align_additions(base: &Manifest, ours: &Manifest, theirs: &Manifest) -> (Mani
             (&left.kind, &right.kind),
             (EntryKind::Directory, EntryKind::Directory)
         );
-        if directories || (left.mode == right.mode && left.kind == right.kind) {
+        if directories
+            || (left.mode == right.mode
+                && left.kind == right.kind
+                && left.link_group == right.link_group)
+        {
             let canonical = left.id.clone().min(right.id.clone());
             aliases.insert(left.id.clone(), canonical.clone());
             aliases.insert(right.id.clone(), canonical);
@@ -311,6 +324,181 @@ fn align_additions(base: &Manifest, ours: &Manifest, theirs: &Manifest) -> (Mani
             .collect()
     };
     (apply(ours), apply(theirs))
+}
+
+// A singleton's entry ID is also its initial inode identity. On first link,
+// capture/writable persist that identity as link_group; later path replacement
+// must assign a fresh group when retaining the entry ID would alias another inode.
+fn inode_key(entry: &Entry) -> Option<&str> {
+    matches!(entry.kind, EntryKind::File { .. })
+        .then(|| entry.link_group.as_deref().unwrap_or(&entry.id))
+}
+
+fn hardlink_components(nodes: &[Node], groups: &mut Groups) -> Vec<Vec<usize>> {
+    let mut owners = BTreeMap::new();
+    let mut linked = BTreeSet::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for version in node.versions.iter().flatten() {
+            if let Some(key) = inode_key(&version.value.entry) {
+                if let Some(&previous) = owners.get(key) {
+                    groups.join(previous, i);
+                } else {
+                    owners.insert(key.to_owned(), i);
+                }
+                if version.value.entry.link_group.is_some() {
+                    linked.insert(i);
+                }
+            }
+        }
+    }
+    let roots: BTreeSet<_> = linked.into_iter().map(|i| groups.root(i)).collect();
+    let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..nodes.len() {
+        let root = groups.root(i);
+        if roots.contains(&root) {
+            components.entry(root).or_default().push(i);
+        }
+    }
+    components.into_values().collect()
+}
+
+fn payload_version(entry: &Entry, key: &str) -> Version {
+    let mut entry = entry.clone();
+    entry.id = key.to_owned();
+    entry.link_group = None;
+    Version {
+        path: String::new(),
+        value: Value {
+            parent: None,
+            name: String::new(),
+            entry,
+        },
+    }
+}
+
+fn merge_hardlinks(
+    nodes: &mut [Node],
+    members: &[usize],
+    objects: &mut MergeContent<'_>,
+    timestamps: &[[i128; 2]],
+) -> Result<()> {
+    if members.iter().any(|&i| nodes[i].choice.is_some()) {
+        // add_units expands every selection to complete hardlink components.
+        return Ok(());
+    }
+    let same = |a: usize, b: usize| {
+        members
+            .iter()
+            .all(|&i| nodes[i].versions[a] == nodes[i].versions[b])
+    };
+    if members.iter().all(|&i| nodes[i].automatic) && !same(0, 1) && !same(0, 2) && !same(1, 2) {
+        let winner = newer_side(members, timestamps);
+        for &i in members {
+            nodes[i].choice = Some(winner);
+        }
+        return Ok(());
+    }
+
+    let mut payloads: BTreeMap<String, [Option<Entry>; 3]> = BTreeMap::new();
+    let mut persistent = BTreeSet::new();
+    for &i in members {
+        for (side, version) in nodes[i].versions.iter().enumerate() {
+            let Some(version) = version else { continue };
+            let entry = &version.value.entry;
+            let Some(key) = inode_key(entry) else {
+                continue;
+            };
+            let versions = payloads.entry(key.to_owned()).or_default();
+            // Input validation guarantees every alias in one version agrees.
+            versions[side].get_or_insert_with(|| entry.clone());
+            if entry.link_group.is_some() {
+                persistent.insert(key.to_owned());
+            }
+        }
+    }
+    // First merge only names, parent bindings and inode references. An unlink
+    // removes a directory entry, not the shared payload still used by an alias.
+    for &i in members {
+        let mut namespace = Node {
+            versions: nodes[i].versions.clone(),
+            value: None,
+            issues: BTreeSet::new(),
+            automatic: false,
+            choice: None,
+        };
+        for version in namespace.versions.iter_mut().flatten() {
+            let entry = &mut version.value.entry;
+            if let Some(key) = inode_key(entry).map(str::to_owned) {
+                entry.link_group = Some(key);
+                entry.kind = EntryKind::File {
+                    size: 0,
+                    chunks: Vec::new(),
+                };
+                entry.mode = 0;
+                entry.modified_ns = 0;
+            }
+        }
+        merge_node(&mut namespace, objects)?;
+        nodes[i].value = namespace.value;
+        nodes[i].issues.extend(namespace.issues);
+    }
+    let surviving: BTreeSet<String> = members
+        .iter()
+        .filter_map(|&i| nodes[i].value.as_ref())
+        .filter_map(|value| inode_key(&value.entry).map(str::to_owned))
+        .collect();
+    let mut merged_payloads = BTreeMap::new();
+    for (key, versions) in payloads {
+        let mut payload = Node {
+            versions: std::array::from_fn(|side| {
+                versions[side]
+                    .as_ref()
+                    .map(|entry| payload_version(entry, &key))
+            }),
+            value: None,
+            issues: BTreeSet::new(),
+            automatic: false,
+            choice: None,
+        };
+        // If a newly added or surviving alias retains this inode, deleting all
+        // names on the other side does not discard the inode's concurrent edit.
+        // Without a surviving name, retain ordinary delete/modify conflicts.
+        if surviving.contains(&key)
+            && versions[0].is_some()
+            && (versions[1].is_none() || versions[2].is_none())
+        {
+            payload.value = payload.versions[1]
+                .as_ref()
+                .or(payload.versions[2].as_ref())
+                .map(|v| v.value.clone());
+        } else {
+            merge_node(&mut payload, objects)?;
+        }
+        // A side can delete the final original alias while the other adds a
+        // new alias without changing bytes. The namespace merge retains the
+        // addition; the unchanged base payload supplies its contents.
+        let entry = payload
+            .value
+            .map(|value| value.entry)
+            .or_else(|| versions.iter().flatten().next().cloned())
+            .ok_or("missing hardlink payload")?;
+        merged_payloads.insert(key, entry);
+        nodes[members[0]].issues.extend(payload.issues);
+    }
+    for &i in members {
+        if let Some(value) = &mut nodes[i].value
+            && let Some(key) = inode_key(&value.entry).map(str::to_owned)
+        {
+            let payload = merged_payloads
+                .get(&key)
+                .ok_or("missing merged inode payload")?;
+            value.entry.kind = payload.kind.clone();
+            value.entry.mode = payload.mode;
+            value.entry.modified_ns = payload.modified_ns;
+            value.entry.link_group = persistent.contains(&key).then_some(key);
+        }
+    }
+    Ok(())
 }
 
 fn merge_node(node: &mut Node, objects: &mut MergeContent<'_>) -> Result<()> {
@@ -338,6 +526,15 @@ fn merge_node(node: &mut Node, objects: &mut MergeContent<'_>) -> Result<()> {
         result.name = name.clone();
     } else {
         node.issues.insert("rename");
+    }
+    if let Some(group) = merge_field(
+        base.as_ref().map(|v| &v.entry.link_group),
+        &ours.entry.link_group,
+        &theirs.entry.link_group,
+    ) {
+        result.entry.link_group = group;
+    } else {
+        node.issues.insert("hardlink_topology");
     }
     if let Some(mode) = merge_field(
         base.as_ref().map(|v| &v.entry.mode),
@@ -479,7 +676,7 @@ fn add_units(
     timestamps: &[[i128; 2]],
 ) {
     for unit in units {
-        let members: Vec<_> = nodes
+        let selected: BTreeSet<_> = nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| {
@@ -490,7 +687,12 @@ fn add_units(
                         .flatten()
                         .any(|v| unit.iter().any(|path| within(&v.path, path)))
             })
-            .map(|(i, _)| i)
+            .map(|(i, _)| groups.root(i))
+            .collect();
+        // An atomic unit containing one alias owns its complete inode component.
+        // Otherwise two units could choose conflicting bytes for the same inode.
+        let members: Vec<_> = (0..nodes.len())
+            .filter(|&i| nodes[i].choice.is_none() && selected.contains(&groups.root(i)))
             .collect();
         let Some(&first) = members.first() else {
             continue;
@@ -821,6 +1023,7 @@ mod tests {
             id: id.to_owned(),
             mode: 0o755,
             modified_ns: 0,
+            link_group: None,
             kind,
         };
         let file = |text: &[u8]| content::put_bytes(text, &directory);
@@ -963,6 +1166,246 @@ mod tests {
         assert_eq!(renamed.conflicts[0].kind, "content");
         assert_eq!(renamed.manifest["f"], rename_ours["f"]);
         assert_eq!(renamed.manifest["g"].id, "original");
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hardlink_payload_namespace_and_conflict_closure() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "sprig-merge-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory)?;
+        let directory = directory.canonicalize()?;
+        let make = |id: &str, kind, group: Option<&str>| Entry {
+            id: id.into(),
+            mode: 0o644,
+            modified_ns: 1,
+            link_group: group.map(str::to_owned),
+            kind,
+        };
+        let bytes = |text: &[u8]| content::put_bytes(text, &directory);
+        let base = Manifest::from([
+            ("".into(), make("root", EntryKind::Directory, None)),
+            (
+                "a".into(),
+                make("a", bytes(b"one\ntwo\nthree\nfour\nfive\n")?, Some("a")),
+            ),
+            (
+                "b".into(),
+                make("b", bytes(b"one\ntwo\nthree\nfour\nfive\n")?, Some("a")),
+            ),
+        ]);
+        let run = |base: &Manifest,
+                   ours: &Manifest,
+                   theirs: &Manifest,
+                   strategy,
+                   units: &[Vec<String>]| {
+            merge(
+                base,
+                ours,
+                theirs,
+                &directory,
+                strategy,
+                (0, "ours"),
+                (0, "theirs"),
+                units,
+            )
+        };
+        let edit = |tree: &mut Manifest, text: &[u8], time| -> Result<()> {
+            let kind = bytes(text)?;
+            for entry in tree
+                .values_mut()
+                .filter(|entry| entry.link_group.as_deref() == Some("a"))
+            {
+                entry.kind = kind.clone();
+                entry.modified_ns = time;
+            }
+            Ok(())
+        };
+        let mut ours = base.clone();
+        let mut alias = ours["a"].clone();
+        alias.id = "c".into();
+        ours.insert("c".into(), alias);
+        let mut theirs = base.clone();
+        edit(&mut theirs, b"ONE\ntwo\nthree\nfour\nfive\n", 2)?;
+        let added = run(&base, &ours, &theirs, MergeStrategy::Conflict, &[])?;
+        assert!(added.conflicts.is_empty());
+        for path in ["a", "b", "c"] {
+            assert_eq!(added.manifest[path].kind, theirs["a"].kind);
+            assert_eq!(added.manifest[path].link_group.as_deref(), Some("a"));
+        }
+        assert_ne!(added.manifest["a"].id, added.manifest["c"].id);
+        let mut removed = base.clone();
+        removed.remove("b");
+        let unlinked = run(&base, &removed, &theirs, MergeStrategy::Conflict, &[])?;
+        assert!(unlinked.conflicts.is_empty());
+        assert!(!unlinked.manifest.contains_key("b"));
+        assert_eq!(unlinked.manifest["a"].kind, theirs["a"].kind);
+        // Each inode text merge runs once and applies to every retained alias.
+        edit(&mut ours, b"one\ntwo\nthree\nfour\nFIVE\n", 3)?;
+        let text = run(&base, &ours, &theirs, MergeStrategy::Conflict, &[])?;
+        assert!(text.conflicts.is_empty());
+        for path in ["a", "b", "c"] {
+            assert_eq!(
+                content::read_file(&text.manifest[path], &directory)?,
+                b"ONE\ntwo\nthree\nfour\nFIVE\n"
+            );
+        }
+        // Initial singleton -> group uses its existing entry/inode identity.
+        let mut singleton = base.clone();
+        singleton.remove("b");
+        singleton.get_mut("a").unwrap().link_group = None;
+        let mut singleton_edit = singleton.clone();
+        singleton_edit.get_mut("a").unwrap().kind = bytes(b"singleton edited\n")?;
+        let promoted = run(
+            &singleton,
+            &base,
+            &singleton_edit,
+            MergeStrategy::Conflict,
+            &[],
+        )?;
+        assert!(promoted.conflicts.is_empty());
+        assert_eq!(promoted.manifest["a"].kind, singleton_edit["a"].kind);
+        assert_eq!(promoted.manifest["b"].kind, singleton_edit["a"].kind);
+        // Different replacements for the same alias are a topology conflict.
+        let mut left = base.clone();
+        let mut right = base.clone();
+        left.get_mut("a").unwrap().link_group = Some("left-inode".into());
+        left.get_mut("a").unwrap().kind = bytes(b"left\n")?;
+        right.get_mut("a").unwrap().link_group = Some("right-inode".into());
+        right.get_mut("a").unwrap().kind = bytes(b"right\n")?;
+        right.get_mut("a").unwrap().modified_ns = 5;
+        let conflict = run(&base, &left, &right, MergeStrategy::Conflict, &[])?;
+        assert!(
+            conflict
+                .conflicts
+                .iter()
+                .any(|c| c.kind == "hardlink_topology")
+        );
+        assert_eq!(conflict.manifest, left);
+        content::validate_manifest(&conflict.manifest)?;
+        let lww = run(&base, &left, &right, MergeStrategy::Lww, &[])?;
+        assert!(lww.conflicts.is_empty());
+        assert_eq!(lww.manifest, right);
+        // A unit selecting one alias includes its entire inode component.
+        let units = vec![vec!["b".into()]];
+        let atomic = run(&base, &left, &right, MergeStrategy::Conflict, &units)?;
+        assert!(atomic.conflicts.is_empty());
+        assert_eq!(atomic.manifest, right);
+        // Deleting the last alias still conflicts with a concurrent inode edit.
+        let deleted = Manifest::from([("".into(), singleton[""].clone())]);
+        let deleted_group = Manifest::from([("".into(), base[""].clone())]);
+        assert!(
+            !run(&base, &deleted_group, &theirs, MergeStrategy::Conflict, &[])?
+                .conflicts
+                .is_empty()
+        );
+        assert!(
+            !run(
+                &singleton,
+                &deleted,
+                &singleton_edit,
+                MergeStrategy::Conflict,
+                &[]
+            )?
+            .conflicts
+            .is_empty()
+        );
+        // Partial .lww coverage cannot choose inconsistent per-alias payloads.
+        let mut policy_left = base.clone();
+        let mut policy_right = base.clone();
+        edit(&mut policy_left, b"left\n", 2)?;
+        edit(&mut policy_right, b"right\n", 4)?;
+        policy_left.insert(".lww".into(), make("policy", bytes(b"a\n")?, None));
+        let partial = run(
+            &base,
+            &policy_left,
+            &policy_right,
+            MergeStrategy::Conflict,
+            &[],
+        )?;
+        assert!(!partial.conflicts.is_empty());
+        assert_eq!(partial.manifest["a"].kind, partial.manifest["b"].kind);
+        policy_left.get_mut(".lww").unwrap().kind = bytes(b"a\nb\n")?;
+        let covered = run(
+            &base,
+            &policy_left,
+            &policy_right,
+            MergeStrategy::Conflict,
+            &[],
+        )?;
+        assert!(covered.conflicts.is_empty());
+        assert_eq!(covered.manifest["a"].kind, policy_right["a"].kind);
+        assert_eq!(covered.manifest["b"].kind, policy_right["b"].kind);
+        // A replaced directory entry keeps its ID but points to a new inode.
+        // Concurrent writes through the old inode must update only its survivors.
+        let mut split = base.clone();
+        split.get_mut("a").unwrap().link_group = Some("replacement-inode".into());
+        split.get_mut("a").unwrap().kind = bytes(b"replacement bytes\n")?;
+        split.get_mut("a").unwrap().modified_ns = 6;
+        let split_merged = run(&base, &split, &theirs, MergeStrategy::Conflict, &[])?;
+        assert!(split_merged.conflicts.is_empty());
+        assert_eq!(split_merged.manifest["a"].id, base["a"].id);
+        assert_eq!(
+            split_merged.manifest["a"].link_group.as_deref(),
+            Some("replacement-inode")
+        );
+        assert_eq!(split_merged.manifest["a"].kind, split["a"].kind);
+        assert_eq!(split_merged.manifest["b"].link_group.as_deref(), Some("a"));
+        assert_eq!(split_merged.manifest["b"].kind, theirs["b"].kind);
+        // The first/original alias may already be gone: inode identity comes
+        // from the persistent group, never the surviving entry's distinct ID.
+        let mut survivor_base = base.clone();
+        survivor_base.remove("a");
+        let mut survivor_ours = survivor_base.clone();
+        let mut added_alias = survivor_ours["b"].clone();
+        added_alias.id = "survivor-c".into();
+        survivor_ours.insert("c".into(), added_alias);
+        let mut survivor_theirs = survivor_base.clone();
+        edit(&mut survivor_theirs, b"survivor edited\n", 7)?;
+        let survivor = run(
+            &survivor_base,
+            &survivor_ours,
+            &survivor_theirs,
+            MergeStrategy::Conflict,
+            &[],
+        )?;
+        assert!(survivor.conflicts.is_empty());
+        for path in ["b", "c"] {
+            assert_eq!(survivor.manifest[path].link_group.as_deref(), Some("a"));
+            assert_eq!(survivor.manifest[path].kind, survivor_theirs["b"].kind);
+            assert_ne!(survivor.manifest[path].id, "a");
+        }
+        // The first matching unit owns every alias. A later unit overlapping
+        // another alias cannot reverse that choice using an unrelated timestamp.
+        let mut unit_base = base.clone();
+        unit_base.insert("other".into(), make("other", bytes(b"base other\n")?, None));
+        let mut unit_left = unit_base.clone();
+        let mut unit_right = unit_base.clone();
+        edit(&mut unit_left, b"unit left\n", 2)?;
+        edit(&mut unit_right, b"unit right\n", 4)?;
+        unit_left.get_mut("other").unwrap().kind = bytes(b"left other\n")?;
+        unit_left.get_mut("other").unwrap().modified_ns = 100;
+        unit_right.get_mut("other").unwrap().kind = bytes(b"right other\n")?;
+        unit_right.get_mut("other").unwrap().modified_ns = 3;
+        let overlapping = vec![vec!["a".into()], vec!["b".into(), "other".into()]];
+        let selected_units = run(
+            &unit_base,
+            &unit_left,
+            &unit_right,
+            MergeStrategy::Conflict,
+            &overlapping,
+        )?;
+        assert!(selected_units.conflicts.is_empty());
+        for path in ["a", "b"] {
+            assert_eq!(selected_units.manifest[path], unit_right[path]);
+        }
+        assert_eq!(selected_units.manifest["other"], unit_left["other"]);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }

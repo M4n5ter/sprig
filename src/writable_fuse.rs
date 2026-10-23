@@ -521,7 +521,7 @@ impl Filesystem for WritableFuse {
                 return;
             }
         };
-        // Cookies are positions in the core's stable-inode-ordered listing. As on an
+        // Cookies are positions in the core's path-ordered listing. As on an
         // ordinary directory, mutation while enumerating has unspecified order;
         // no stale namespace snapshot becomes authoritative in this adapter.
         let dots = [
@@ -800,12 +800,22 @@ impl Filesystem for WritableFuse {
     fn link(
         &mut self,
         _request: &Request<'_>,
-        _inode: u64,
-        _parent: u64,
-        _name: &OsStr,
+        inode: u64,
+        parent: u64,
+        child: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(libc::EOPNOTSUPP);
+        let result = (|| {
+            let node = self.core.link(inode, parent, name(child)?)?;
+            self.attr(&node)
+        })();
+        match result {
+            Ok(attr) => {
+                self.remember(attr.ino);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
     }
 
     fn getxattr(

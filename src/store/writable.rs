@@ -588,6 +588,12 @@ fn writable_mutation(core: &WritableCas, mutation: &Mutation) -> Result<()> {
             }
             writable_write(core, path, text.replacen(old, new, 1).as_bytes())
         }
+        Mutation::Link { from, to } => {
+            let source = core.lookup_path(from)?;
+            let (parent, name) = writable_parent(core, to)?;
+            core.link(source.inode, parent, &name)?;
+            Ok(())
+        }
         Mutation::Copy { from, to } => writable_copy(core, from, to),
     }
 }
@@ -608,6 +614,7 @@ fn writable_copy(core: &WritableCas, from: &str, to: &str) -> Result<()> {
             .filter(|(path, _)| path.starts_with(&prefix)),
     );
     let mut finalize = Vec::new();
+    let mut copied_inodes = BTreeMap::new();
     for (path, node) in entries {
         let target = format!("{to}{}", &path[from.len()..]);
         let (parent, name) = writable_parent(core, &target)?;
@@ -615,7 +622,12 @@ fn writable_copy(core: &WritableCas, from: &str, to: &str) -> Result<()> {
             EntryKind::Directory => core.mkdir(parent, &name, node.entry.mode)?,
             EntryKind::Symlink { target } => core.symlink(parent, &name, &target)?,
             EntryKind::File { size, .. } => {
+                if let Some(inode) = copied_inodes.get(&node.inode) {
+                    core.link(*inode, parent, &name)?;
+                    continue;
+                }
                 let created = core.create_file(parent, &name, node.entry.mode)?;
+                copied_inodes.insert(node.inode, created.inode);
                 let handle = core.open_handle(created.inode, true)?;
                 let mut offset = 0;
                 while offset < size {

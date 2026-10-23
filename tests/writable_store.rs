@@ -193,6 +193,119 @@ fn owned_workspaces_share_publication_merge_and_recovery() {
         b"ONE\nresolved\nTHREE\n"
     );
     assert_ne!(prefix.path, view.path);
+    // Both portable owned mutations and native materialization preserve aliases
+    // across publication while forks never share mutable host inodes.
+    for owned in [false, true] {
+        let name = if owned { "links-owned" } else { "links-native" };
+        if owned {
+            reopened.import_writable(&source, name).unwrap();
+        } else {
+            reopened
+                .import(&source, name, sprig::CopyMode::Copy)
+                .unwrap();
+        }
+        let linked = reopened
+            .apply(
+                name,
+                &[Mutation::Link {
+                    from: "text".into(),
+                    to: "alias".into(),
+                }],
+                "link",
+                None,
+            )
+            .unwrap();
+        let a = reopened.stat(&linked.revision, "text").unwrap();
+        let b = reopened.stat(&linked.revision, "alias").unwrap();
+        assert_ne!(a.id, b.id);
+        assert!(a.link_group.is_some());
+        assert_eq!(a.link_group, b.link_group);
+        reopened
+            .apply(
+                name,
+                &[Mutation::Write {
+                    path: "alias".into(),
+                    content: b"linked content".to_vec(),
+                }],
+                "write alias",
+                None,
+            )
+            .unwrap();
+        assert_eq!(reopened.read(name, "text").unwrap(), b"linked content");
+        let fork = format!("{name}-fork");
+        reopened.fork(name, &fork, sprig::CopyMode::Auto).unwrap();
+        reopened
+            .apply(
+                &fork,
+                &[Mutation::Write {
+                    path: "text".into(),
+                    content: b"fork only".to_vec(),
+                }],
+                "isolated",
+                None,
+            )
+            .unwrap();
+        assert_eq!(reopened.read(&fork, "alias").unwrap(), b"fork only");
+        assert_eq!(reopened.read(name, "alias").unwrap(), b"linked content");
+        let restored = format!("{name}-restored");
+        let view = reopened.restore(&linked.revision, &restored).unwrap();
+        fs::write(view.path.join("alias"), b"restored alias").unwrap();
+        assert_eq!(fs::read(view.path.join("text")).unwrap(), b"restored alias");
+        assert_eq!(
+            reopened.read(&linked.revision, "text").unwrap(),
+            b"one\ntwo\nthree\n"
+        );
+        reopened
+            .apply(
+                name,
+                &[
+                    Mutation::Mkdir { path: "dir".into() },
+                    Mutation::Copy {
+                        from: "text".into(),
+                        to: "dir/first".into(),
+                    },
+                    Mutation::Link {
+                        from: "dir/first".into(),
+                        to: "dir/second".into(),
+                    },
+                    Mutation::Copy {
+                        from: "dir".into(),
+                        to: "copied".into(),
+                    },
+                    Mutation::Write {
+                        path: "copied/first".into(),
+                        content: b"copy only".to_vec(),
+                    },
+                ],
+                "independent copied link group",
+                None,
+            )
+            .unwrap();
+        assert_eq!(reopened.read(name, "copied/second").unwrap(), b"copy only");
+        assert_eq!(reopened.read(name, "dir/first").unwrap(), b"linked content");
+        let before = reopened.show(name).unwrap().base_revision;
+        assert!(
+            reopened
+                .apply(
+                    name,
+                    &[Mutation::Link {
+                        from: "".into(),
+                        to: "bad-dir-link".into()
+                    }],
+                    "reject",
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(reopened.show(name).unwrap().base_revision, before);
+    }
+    let report = reopened.doctor().unwrap();
+    assert_eq!(
+        report.errors,
+        ["workspace c: incomplete writable journal; explicit prefix recovery required"]
+    );
+    assert!(!report.healthy);
+    assert!(reopened.gc().unwrap().dry_run);
     drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }

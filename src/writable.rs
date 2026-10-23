@@ -4,8 +4,9 @@
 //! visible. A successful write is NOT a durability promise: like an ordinary
 //! buffered filesystem, callers must fsync (or checkpoint) for that promise.
 //! The journal has a hard 256 MiB limit and writes are at most 1 MiB. There are
-//! at most one million nodes and 256 GiB logical growth above the pinned base;
-//! detached tombstones count toward those quotas until generation rotation.
+//! at most one million lifetime namespace entries and 256 GiB logical growth
+//! above the pinned base; detached tombstones count toward those quotas until
+//! generation rotation. Hardlink aliases count file content only once.
 //! Checkpoint streams each content-dirty file through whole-file CDC; it does not
 //! hash only dirty ranges. It never edits or clears this generation. Publication belongs
 //! to Store, which must durably publish a new clean generation and retain this
@@ -108,6 +109,8 @@ struct Inner {
     binding: String,
     nodes: BTreeMap<u64, Node>,
     paths: BTreeMap<String, u64>,
+    // Retain retired entry IDs so aliases cannot evade the metadata quota.
+    entry_ids: BTreeSet<String>,
     handles: BTreeMap<u64, Handle>,
     next_inode: u64,
     next_handle: u64,
@@ -125,7 +128,8 @@ struct Node {
     entry: Entry,
     accessed_ns: i128,
     parent: u64,
-    path: Option<String>,
+    // Each directory entry keeps its own identity; inode state is shared.
+    links: BTreeMap<String, String>,
     file: Option<FileData>,
 }
 
@@ -173,6 +177,13 @@ enum Operation {
         name: String,
         inode: u64,
         entry: Entry,
+    },
+    Link {
+        inode: u64,
+        parent: u64,
+        name: String,
+        entry_id: String,
+        now_ns: i128,
     },
     Write {
         inode: u64,
@@ -270,7 +281,7 @@ impl WritableCas {
             journal_limit: MAX_JOURNAL_BYTES,
             logical_bytes: i.logical_bytes,
             logical_limit: i.logical_limit,
-            nodes: i.nodes.len() as u64,
+            nodes: i.entry_ids.len() as u64,
             node_limit: MAX_NODES,
         })
     }
@@ -294,29 +305,25 @@ impl WritableCas {
     pub(crate) fn lookup(&self, parent: u64, name: &str) -> io::Result<NodeAttr> {
         let inner = self.lock()?;
         let node = inner.directory(parent, false)?;
-        let inode = match name {
-            "." => parent,
-            ".." => node.parent,
-            _ => {
-                let path = inner.child_path(parent, name)?;
-                *inner.paths.get(&path).ok_or_else(not_found)?
-            }
-        };
-        inner.attr(inode)
+        match name {
+            "." => inner.attr(parent),
+            ".." => inner.attr(node.parent),
+            _ => inner.attr_path(&inner.child_path(parent, name)?),
+        }
     }
 
     pub(crate) fn lookup_path(&self, path: &str) -> io::Result<NodeAttr> {
         validate_path(path)?;
         let inner = self.lock()?;
-        inner.attr(*inner.paths.get(path).ok_or_else(not_found)?)
+        inner.attr_path(path)
     }
 
     pub(crate) fn paths(&self) -> io::Result<Vec<(String, NodeAttr)>> {
         let inner = self.lock()?;
         inner
             .paths
-            .iter()
-            .map(|(p, i)| Ok((p.clone(), inner.attr(*i)?)))
+            .keys()
+            .map(|p| Ok((p.clone(), inner.attr_path(p)?)))
             .collect()
     }
 
@@ -326,19 +333,15 @@ impl WritableCas {
     )]
     pub(crate) fn readdir(&self, inode: u64) -> io::Result<Vec<(String, NodeAttr)>> {
         let inner = self.lock()?;
-        inner.directory(inode, false)?;
+        let directory = inner.directory(inode, false)?;
+        let Some(path) = directory.links.keys().next() else {
+            return Ok(vec![]);
+        };
         inner
-            .nodes
-            .iter()
-            .filter_map(|(id, n)| {
-                if *id != ROOT_INODE && n.parent == inode {
-                    n.path
-                        .as_ref()
-                        .map(|p| inner.attr(*id).map(|a| (leaf(p).to_owned(), a)))
-                } else {
-                    None
-                }
-            })
+            .paths
+            .keys()
+            .filter(|p| !p.is_empty() && parent_path(p) == path)
+            .map(|p| Ok((leaf(p).to_owned(), inner.attr_path(p)?)))
             .collect()
     }
 
@@ -480,6 +483,7 @@ impl WritableCas {
         let inode = inner.next_inode;
         let entry = Entry {
             id: new_id(&inner.binding, inode),
+            link_group: None,
             mode,
             modified_ns: now_ns(),
             kind,
@@ -494,6 +498,28 @@ impl WritableCas {
             &[],
         )?;
         inner.attr(inode)
+    }
+
+    /// Link a live regular inode within this namespace. Symlink and directory
+    /// hardlinks are deliberately unsupported; no backing filesystem path escapes.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "projection")),
+        allow(dead_code)
+    )]
+    pub(crate) fn link(&self, inode: u64, parent: u64, name: &str) -> io::Result<NodeAttr> {
+        let mut inner = self.lock()?;
+        let entry_id = new_link_id(&inner.binding, inner.next_sequence);
+        inner.mutate(
+            Operation::Link {
+                inode,
+                parent,
+                name: name.into(),
+                entry_id,
+                now_ns: now_ns(),
+            },
+            &[],
+        )?;
+        inner.attr_path(&inner.child_path(parent, name)?)
     }
 
     pub(crate) fn unlink(&self, parent: u64, name: &str) -> io::Result<()> {
@@ -566,16 +592,23 @@ impl WritableCas {
         let mut manifest = Manifest::new();
         let paths: Vec<_> = inner.paths.iter().map(|(p, i)| (p.clone(), *i)).collect();
         let mut batch = ObjectBatch::open(&self.objects).map_err(content_error)?;
+        let mut published: BTreeMap<u64, EntryKind> = BTreeMap::new();
         for (path, inode) in paths {
-            let mut entry = inner.nodes[&inode].entry.clone();
+            let mut entry = inner.attr_path(&path)?.entry;
             if inner.content_dirty.contains(&inode) && matches!(entry.kind, EntryKind::File { .. })
             {
-                let mut reader = NodeReader {
-                    inner: &mut inner,
-                    inode,
-                    offset: 0,
-                };
-                entry.kind = batch.put_reader(&mut reader).map_err(content_error)?;
+                // Aliases share one byte stream and one CDC pass per checkpoint.
+                if let Some(kind) = published.get(&inode) {
+                    entry.kind = kind.clone();
+                } else {
+                    let mut reader = NodeReader {
+                        inner: &mut inner,
+                        inode,
+                        offset: 0,
+                    };
+                    entry.kind = batch.put_reader(&mut reader).map_err(content_error)?;
+                    published.insert(inode, entry.kind.clone());
+                }
             }
             manifest.insert(path, entry);
         }
@@ -633,12 +666,30 @@ impl Inner {
         )
         .to_hex()
         .to_string();
-        let mut nodes = BTreeMap::new();
+        let mut nodes: BTreeMap<u64, Node> = BTreeMap::new();
         let mut paths = BTreeMap::new();
+        let mut groups = BTreeMap::new();
+        let mut entry_ids = BTreeSet::new();
         let mut logical_bytes = 0_u64;
         for (index, (path, entry)) in base.iter().enumerate() {
             validate_path(path)?;
+            entry_ids.insert(entry.id.clone());
+            if let Some(group) = &entry.link_group
+                && let Some(inode) = groups.get(group)
+            {
+                // validate_manifest already verified group type and equality.
+                nodes
+                    .get_mut(inode)
+                    .expect("existing link group")
+                    .links
+                    .insert(path.clone(), entry.id.clone());
+                paths.insert(path.clone(), *inode);
+                continue;
+            }
             let inode = index as u64 + ROOT_INODE;
+            if let Some(group) = &entry.link_group {
+                groups.insert(group.clone(), inode);
+            }
             let parent = if path.is_empty() {
                 ROOT_INODE
             } else {
@@ -666,7 +717,7 @@ impl Inner {
                     entry: entry.clone(),
                     accessed_ns: entry.modified_ns,
                     parent,
-                    path: Some(path.clone()),
+                    links: BTreeMap::from([(path.clone(), entry.id.clone())]),
                     file,
                 },
             );
@@ -679,6 +730,7 @@ impl Inner {
             binding,
             nodes,
             paths,
+            entry_ids,
             handles: BTreeMap::new(),
             next_inode: base.len() as u64 + 1,
             next_handle: 1,
@@ -709,7 +761,7 @@ impl Inner {
 
     fn attr(&self, inode: u64) -> io::Result<NodeAttr> {
         let node = self.nodes.get(&inode).ok_or_else(not_found)?;
-        let nlink = if node.path.is_none() {
+        let nlink = if node.links.is_empty() {
             0
         } else if matches!(node.entry.kind, EntryKind::Directory) {
             2 + self
@@ -718,12 +770,12 @@ impl Inner {
                 .filter(|(i, n)| {
                     **i != ROOT_INODE
                         && n.parent == inode
-                        && n.path.is_some()
+                        && !n.links.is_empty()
                         && matches!(n.entry.kind, EntryKind::Directory)
                 })
                 .count() as u32
         } else {
-            1
+            node.links.len() as u32
         };
         Ok(NodeAttr {
             inode,
@@ -733,12 +785,19 @@ impl Inner {
         })
     }
 
+    fn attr_path(&self, path: &str) -> io::Result<NodeAttr> {
+        let inode = *self.paths.get(path).ok_or_else(not_found)?;
+        let mut attr = self.attr(inode)?;
+        attr.entry.id = self.nodes[&inode].links[path].clone();
+        Ok(attr)
+    }
+
     fn directory(&self, inode: u64, linked: bool) -> io::Result<&Node> {
         let node = self.nodes.get(&inode).ok_or_else(not_found)?;
         if !matches!(node.entry.kind, EntryKind::Directory) {
             return Err(not_directory());
         }
-        if linked && node.path.is_none() {
+        if linked && node.links.is_empty() {
             return Err(not_found());
         }
         Ok(node)
@@ -747,7 +806,7 @@ impl Inner {
     fn child_path(&self, parent: u64, name: &str) -> io::Result<String> {
         validate_name(name)?;
         let dir = self.directory(parent, true)?;
-        let parent_path = dir.path.as_ref().expect("linked directory");
+        let parent_path = dir.links.keys().next().expect("linked directory");
         let path = if parent_path.is_empty() {
             name.to_owned()
         } else {
@@ -798,11 +857,16 @@ impl Inner {
                 if self.paths.contains_key(&path) {
                     return Err(already_exists());
                 }
-                if *inode != self.next_inode || self.nodes.len() as u64 >= MAX_NODES {
+                if *inode != self.next_inode || self.entry_ids.len() as u64 >= MAX_NODES {
                     return Err(no_space());
                 }
                 if entry.id != new_id(&self.binding, *inode)
-                    || self.nodes.values().any(|n| n.entry.id == entry.id)
+                    || self.entry_ids.contains(&entry.id)
+                    || self
+                        .nodes
+                        .values()
+                        .any(|node| node.entry.link_group.as_ref() == Some(&entry.id))
+                    || entry.link_group.is_some()
                     || entry.mode & !0o777 != 0
                 {
                     return Err(invalid("invalid new node identity or permissions"));
@@ -817,6 +881,46 @@ impl Inner {
                             && !target.contains(&0) => {}
                     _ => return Err(invalid("unsupported new node type or invalid symlink")),
                 }
+            }
+            Operation::Link {
+                inode,
+                parent,
+                name,
+                entry_id,
+                now_ns,
+            } => {
+                let node = self.nodes.get(inode).ok_or_else(not_found)?;
+                if node.links.is_empty() {
+                    return Err(not_found());
+                }
+                match node.entry.kind {
+                    EntryKind::File { .. } => {}
+                    EntryKind::Directory => return Err(is_directory()),
+                    EntryKind::Symlink { .. } => return Err(unsupported_link()),
+                }
+                let path = self.child_path(*parent, name)?;
+                if self.paths.contains_key(&path) {
+                    return Err(already_exists());
+                }
+                if self.entry_ids.len() as u64 >= MAX_NODES {
+                    return Err(no_space());
+                }
+                if *entry_id != new_link_id(&self.binding, self.next_sequence)
+                    || self.entry_ids.contains(entry_id)
+                {
+                    return Err(invalid("invalid hardlink entry identity"));
+                }
+                if node.entry.link_group.is_none() {
+                    let group = &node.entry.id;
+                    if self
+                        .nodes
+                        .values()
+                        .any(|n| n.entry.link_group.as_ref() == Some(group))
+                    {
+                        return Err(invalid("hardlink group identity collision"));
+                    }
+                }
+                validate_time(*now_ns)?;
             }
             Operation::Write {
                 inode,
@@ -886,7 +990,7 @@ impl Inner {
                 let new = self.child_path(*new_parent, new_name)?;
                 let inode = *self.paths.get(&old).ok_or_else(not_found)?;
                 let source_is_dir = matches!(self.nodes[&inode].entry.kind, EntryKind::Directory);
-                if old == new {
+                if old == new || self.paths.get(&new) == Some(&inode) {
                     return Ok(());
                 }
                 if source_is_dir && new.starts_with(&format!("{old}/")) {
@@ -919,9 +1023,15 @@ impl Inner {
     }
 
     fn has_children(&self, inode: u64) -> bool {
-        self.nodes
-            .iter()
-            .any(|(id, n)| *id != ROOT_INODE && n.parent == inode && n.path.is_some())
+        self.nodes[&inode]
+            .links
+            .keys()
+            .next()
+            .is_some_and(|directory| {
+                self.paths
+                    .keys()
+                    .any(|path| !path.is_empty() && parent_path(path) == directory)
+            })
     }
 
     fn mutate(&mut self, op: Operation, payload: &[u8]) -> io::Result<()> {
@@ -1078,13 +1188,14 @@ impl Inner {
                 if file.is_some() {
                     self.content_dirty.insert(inode);
                 }
+                self.entry_ids.insert(entry.id.clone());
                 self.nodes.insert(
                     inode,
                     Node {
                         accessed_ns: now,
+                        links: BTreeMap::from([(path.clone(), entry.id.clone())]),
                         entry,
                         parent,
-                        path: Some(path.clone()),
                         file,
                     },
                 );
@@ -1092,6 +1203,27 @@ impl Inner {
                 self.next_inode += 1;
                 self.mark_path(&path);
                 self.touch_parent(parent, now);
+            }
+            Operation::Link {
+                inode,
+                parent,
+                name,
+                entry_id,
+                now_ns,
+            } => {
+                let path = self
+                    .child_path(parent, &name)
+                    .expect("validated child path");
+                let node = self.nodes.get_mut(&inode).expect("validated regular inode");
+                if node.entry.link_group.is_none() {
+                    node.entry.link_group = Some(node.entry.id.clone());
+                }
+                node.links.insert(path.clone(), entry_id.clone());
+                self.entry_ids.insert(entry_id);
+                self.paths.insert(path, inode);
+                // The first link adds group identity to every existing alias.
+                self.mark_inode(inode);
+                self.touch_parent(parent, now_ns);
             }
             Operation::Write {
                 inode,
@@ -1162,7 +1294,7 @@ impl Inner {
             } => {
                 let path = self.child_path(parent, &name).expect("validated child");
                 let inode = self.paths.remove(&path).expect("validated target");
-                self.nodes.get_mut(&inode).unwrap().path = None;
+                self.nodes.get_mut(&inode).unwrap().links.remove(&path);
                 self.mark_path(&path);
                 self.touch_parent(parent, now_ns);
             }
@@ -1177,12 +1309,13 @@ impl Inner {
                 let new = self
                     .child_path(new_parent, &new_name)
                     .expect("validated target");
-                if old == new {
+                let source = self.paths[&old];
+                // POSIX rename of two names for the same inode leaves both names.
+                if old == new || self.paths.get(&new) == Some(&source) {
                     return;
                 }
-                let source = self.paths[&old];
                 if let Some(victim) = self.paths.remove(&new) {
-                    self.nodes.get_mut(&victim).unwrap().path = None;
+                    self.nodes.get_mut(&victim).unwrap().links.remove(&new);
                 }
                 let moved: Vec<_> = self
                     .paths
@@ -1194,7 +1327,9 @@ impl Inner {
                     let renamed = format!("{new}{}", &path[old.len()..]);
                     self.paths.remove(&path);
                     self.paths.insert(renamed.clone(), inode);
-                    self.nodes.get_mut(&inode).unwrap().path = Some(renamed.clone());
+                    let node = self.nodes.get_mut(&inode).unwrap();
+                    let entry_id = node.links.remove(&path).expect("moved directory entry");
+                    node.links.insert(renamed.clone(), entry_id);
                     self.mark_path(&path);
                     self.mark_path(&renamed);
                 }
@@ -1217,7 +1352,8 @@ impl Inner {
     }
 
     fn mark_inode(&mut self, inode: u64) {
-        if let Some(path) = self.nodes[&inode].path.clone() {
+        let paths: Vec<_> = self.nodes[&inode].links.keys().cloned().collect();
+        for path in paths {
             self.mark_path(&path);
         }
     }
@@ -1434,6 +1570,14 @@ fn new_id(binding: &str, inode: u64) -> String {
     hash.update(&inode.to_le_bytes());
     hash.finalize().to_hex().to_string()
 }
+fn new_link_id(binding: &str, sequence: u64) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"sprig-hardlink-entry\0");
+    hash.update(binding.as_bytes());
+    hash.update(&sequence.to_le_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
 fn content_error(error: content::Error) -> io::Error {
     match error.downcast::<io::Error>() {
         Ok(error) => *error,
@@ -1499,6 +1643,12 @@ namespace_error!(
     ReadOnlyFilesystem,
     "recovered incomplete journal is read-only"
 );
+namespace_error!(
+    unsupported_link,
+    EOPNOTSUPP,
+    Unsupported,
+    "only regular-file hardlinks are supported"
+);
 namespace_error!(not_directory, ENOTDIR, NotADirectory, "not a directory");
 namespace_error!(is_directory, EISDIR, IsADirectory, "is a directory");
 namespace_error!(
@@ -1528,6 +1678,7 @@ mod tests {
         fs::create_dir(&generation).unwrap();
         let make_entry = |id: &str, kind| Entry {
             id: id.into(),
+            link_group: None,
             mode: 0o644,
             modified_ns: 123,
             kind,
@@ -1537,6 +1688,7 @@ mod tests {
             "".into(),
             Entry {
                 id: "root".into(),
+                link_group: None,
                 mode: 0o755,
                 modified_ns: 10,
                 kind: EntryKind::Directory,
@@ -1546,6 +1698,7 @@ mod tests {
             "dir".into(),
             Entry {
                 id: "dir".into(),
+                link_group: None,
                 mode: 0o755,
                 modified_ns: 11,
                 kind: EntryKind::Directory,
@@ -1845,6 +1998,182 @@ mod tests {
         assert_eq!(recovered.snapshot().unwrap(), snapshot);
         assert_eq!(fs::read(&journal_path).unwrap(), partial_body);
         drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_hardlinks_share_inodes_and_replay_namespace_topology() {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-writable-hardlinks-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(&generation).unwrap();
+        let mut base = Manifest::new();
+        for path in ["", "d", "e"] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: format!("dir:{path}"),
+                    link_group: None,
+                    mode: 0o755,
+                    modified_ns: 1,
+                    kind: EntryKind::Directory,
+                },
+            );
+        }
+        let kind = content::put_bytes(b"hello", &objects).unwrap();
+        for (path, group) in [
+            ("d/a", Some("shared")),
+            ("e/b", Some("shared")),
+            ("copy", None),
+        ] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: path.into(),
+                    link_group: group.map(String::from),
+                    mode: 0o644,
+                    modified_ns: 2,
+                    kind: kind.clone(),
+                },
+            );
+        }
+        let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
+        assert_eq!(engine.snapshot().unwrap(), base);
+        assert_eq!(engine.stats().unwrap().logical_bytes, 10);
+        let d = engine.lookup_path("d").unwrap().inode;
+        let e = engine.lookup_path("e").unwrap().inode;
+        let a = engine.lookup_path("d/a").unwrap();
+        let b = engine.lookup_path("e/b").unwrap();
+        let copy = engine.lookup_path("copy").unwrap();
+        assert_eq!(a.inode, b.inode);
+        assert_ne!(a.entry.id, b.entry.id);
+        assert_eq!(a.nlink, 2);
+        assert_ne!(a.inode, copy.inode, "equal bytes are not hardlinks");
+        let handle = engine.open_handle(a.inode, true).unwrap();
+        engine.write(handle, 0, b"H").unwrap();
+        assert_eq!(engine.read_inode(b.inode, 0, 99).unwrap(), b"Hello");
+        assert_eq!(engine.read_inode(copy.inode, 0, 99).unwrap(), b"hello");
+        assert!(engine.dirty_paths().unwrap().contains("e/b"));
+        engine
+            .setattr(
+                b.inode,
+                SetAttr {
+                    mode: Some(0o600),
+                    size: Some(3),
+                    modified_ns: Some(42),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(engine.lookup_path("d/a").unwrap().entry.mode, 0o600);
+        assert_eq!(engine.read(handle, 0, 99).unwrap(), b"Hel");
+        assert_eq!(engine.stats().unwrap().logical_bytes, 8);
+        let alias = engine.link(a.inode, ROOT_INODE, "alias").unwrap();
+        assert_eq!(alias.inode, a.inode);
+        assert_eq!(alias.nlink, 3);
+        assert_ne!(alias.entry.id, a.entry.id);
+        assert_eq!(engine.stats().unwrap().logical_bytes, 8);
+        assert_eq!(engine.readdir(d).unwrap().len(), 1);
+        assert_eq!(engine.readdir(e).unwrap().len(), 1);
+        let symlink = engine.symlink(ROOT_INODE, "symbolic", b"alias").unwrap();
+        let journal_before = engine.stats().unwrap().journal_bytes;
+        for (inode, parent, name) in [
+            (d, ROOT_INODE, "bad-directory"),
+            (symlink.inode, ROOT_INODE, "bad-symlink"),
+            (a.inode, ROOT_INODE, "alias"),
+            (a.inode, d, "../escape"),
+            (a.inode, copy.inode, "bad-parent"),
+        ] {
+            assert!(engine.link(inode, parent, name).is_err());
+        }
+        assert_eq!(engine.stats().unwrap().journal_bytes, journal_before);
+        let before_noop = engine.snapshot().unwrap();
+        engine.rename(d, "a", e, "b").unwrap();
+        assert_eq!(engine.snapshot().unwrap(), before_noop);
+        assert_eq!(engine.getattr(a.inode).unwrap().nlink, 3);
+        engine.rename(ROOT_INODE, "d", ROOT_INODE, "moved").unwrap();
+        assert_eq!(engine.lookup_path("moved/a").unwrap().entry.id, a.entry.id);
+        assert_eq!(engine.lookup_path("alias").unwrap().inode, a.inode);
+        engine.write(handle, 3, b"!").unwrap();
+        assert!(engine.dirty_paths().unwrap().contains("moved/a"));
+        assert_eq!(
+            engine.lookup_path("e/b").unwrap().entry.modified_ns,
+            engine.lookup_path("moved/a").unwrap().entry.modified_ns
+        );
+        // Replacing one alias of a different inode leaves its other alias alive.
+        let victim_alias = engine.link(copy.inode, ROOT_INODE, "copy-alias").unwrap();
+        assert_eq!(
+            victim_alias.entry.link_group.as_deref(),
+            Some(copy.entry.id.as_str())
+        );
+        let victim_handle = engine.open_handle(copy.inode, true).unwrap();
+        engine
+            .rename(ROOT_INODE, "alias", ROOT_INODE, "copy")
+            .unwrap();
+        assert_eq!(engine.getattr(copy.inode).unwrap().nlink, 1);
+        assert_eq!(
+            engine.lookup_path("copy-alias").unwrap().entry.id,
+            victim_alias.entry.id
+        );
+        assert_eq!(engine.lookup_path("copy").unwrap().entry.id, alias.entry.id);
+        engine.unlink(d, "a").unwrap();
+        engine.unlink(e, "b").unwrap();
+        assert_eq!(engine.getattr(a.inode).unwrap().nlink, 1);
+        let singleton = engine.snapshot().unwrap();
+        assert_eq!(singleton["copy"].link_group.as_deref(), Some("shared"));
+        assert_eq!(singleton["copy"].id, alias.entry.id);
+        assert_eq!(
+            content::read_file(&singleton["copy"], &objects).unwrap(),
+            b"Hel!"
+        );
+        assert!(singleton["copy-alias"].link_group.is_some());
+        engine.sync().unwrap();
+        let dirty = engine.dirty_paths().unwrap();
+        drop(engine);
+        let engine = WritableCas::open(&objects, &generation, &base, "r", "g").unwrap();
+        assert_eq!(engine.snapshot().unwrap(), singleton);
+        assert_eq!(engine.dirty_paths().unwrap(), dirty);
+        assert_eq!(engine.getattr(a.inode).unwrap().nlink, 1);
+        let handle = engine.open_handle(a.inode, true).unwrap();
+        engine.unlink(ROOT_INODE, "copy").unwrap();
+        assert_eq!(engine.getattr(a.inode).unwrap().nlink, 0);
+        engine.write(handle, 0, b"J").unwrap();
+        assert_eq!(engine.read(handle, 0, 99).unwrap(), b"Jel!");
+        assert!(engine.link(a.inode, ROOT_INODE, "resurrect").is_err());
+        assert!(
+            !engine
+                .snapshot()
+                .unwrap()
+                .values()
+                .any(|entry| entry.link_group.as_deref() == Some("shared"))
+        );
+        engine.release(handle).unwrap();
+        assert!(
+            engine.release(victim_handle).is_err(),
+            "handles never replay"
+        );
+        drop(engine);
+        // A clean generation reconstructs aliases from group identity, preserving
+        // a surviving singleton group rather than splitting the inode lineage.
+        let clean = root.join("clean");
+        fs::create_dir(&clean).unwrap();
+        let clean = WritableCas::create(&objects, &clean, &singleton, "r2", "g2").unwrap();
+        let restored = clean.lookup_path("copy").unwrap();
+        assert_eq!(restored.nlink, 1);
+        assert_eq!(restored.entry.link_group.as_deref(), Some("shared"));
+        let added = clean
+            .link(restored.inode, ROOT_INODE, "restored-alias")
+            .unwrap();
+        assert_eq!(added.nlink, 2);
+        assert_eq!(added.entry.link_group, restored.entry.link_group);
+        drop(clean);
         fs::remove_dir_all(root).unwrap();
     }
 }

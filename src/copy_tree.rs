@@ -3,6 +3,7 @@
 //! Native acceleration clones individual files, not an atomic filesystem tree.
 //! Ancestor replacement by hostile concurrent writers is outside this contract.
 
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::fs::{self, File, FileTimes};
@@ -28,7 +29,14 @@ pub enum CopyMode {
 pub struct CopyStats {
     pub cloned: u64,
     pub copied: u64,
+    #[serde(default)]
+    pub hardlinks: u64,
     pub symlinks: u64,
+}
+
+struct CopiedFile {
+    metadata: Metadata,
+    target: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,7 +81,8 @@ pub fn copy_tree(source: &Path, target: &Path, mode: CopyMode) -> io::Result<Cop
         ));
     }
     let mut stats = CopyStats::default();
-    copy_entry(&source, &target, mode, &mut stats)?;
+    let mut files = BTreeMap::new();
+    copy_entry(&source, &target, mode, &mut stats, &mut files)?;
     platform::sync_directory(
         target
             .parent()
@@ -88,6 +97,7 @@ fn copy_entry(
     target: &Path,
     mode: CopyMode,
     stats: &mut CopyStats,
+    files: &mut BTreeMap<(u64, u64), CopiedFile>,
 ) -> io::Result<()> {
     let metadata = platform::symlink_metadata(source)?;
     platform::validate_capture_metadata(source, &metadata)?;
@@ -107,7 +117,13 @@ fn copy_entry(
         let mut children = fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
         children.sort_by_key(|entry| entry.file_name());
         for child in children {
-            copy_entry(&child.path(), &target.join(child.file_name()), mode, stats)?;
+            copy_entry(
+                &child.path(),
+                &target.join(child.file_name()),
+                mode,
+                stats,
+                files,
+            )?;
         }
         if !unchanged(&metadata, &platform::symlink_metadata(source)?) {
             return Err(io::Error::other(format!(
@@ -123,6 +139,22 @@ fn copy_entry(
         let before = platform::file_metadata(&input)?;
         if !before.is_file() || !unchanged(&metadata, &before) {
             return Err(io::Error::other("source changed type while copying"));
+        }
+        let key = (before.dev(), before.ino());
+        if let Some(copied) = files.get(&key) {
+            if !unchanged(&copied.metadata, &before) {
+                return Err(io::Error::other("linked source changed while copying"));
+            }
+            // Link only to our first independent destination copy/clone. A
+            // source inode is never shared with a mutable destination tree.
+            platform::hard_link(&copied.target, target)?;
+            if !unchanged(&before, &platform::file_metadata(&input)?)
+                || !unchanged(&before, &platform::symlink_metadata(source)?)
+            {
+                return Err(io::Error::other("linked source changed while copying"));
+            }
+            stats.hardlinks += 1;
+            return Ok(());
         }
         let cloned = if mode == CopyMode::Copy {
             None
@@ -148,6 +180,7 @@ fn copy_entry(
             output
         };
         if !unchanged(&before, &platform::file_metadata(&input)?)
+            || !unchanged(&before, &platform::symlink_metadata(source)?)
             || output.metadata()?.len() != before.len()
         {
             return Err(io::Error::other("source changed while copying"));
@@ -155,6 +188,13 @@ fn copy_entry(
         platform::set_mode(&output, metadata.mode() & 0o777)?;
         output.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
         output.sync_all()?;
+        files.insert(
+            key,
+            CopiedFile {
+                metadata: before,
+                target: target.to_owned(),
+            },
+        );
     } else {
         return Err(io::Error::other(format!(
             "special file rejected: {}",
@@ -431,6 +471,7 @@ fn same_node(left: &Metadata, right: &Metadata) -> bool {
 
 fn unchanged(left: &Metadata, right: &Metadata) -> bool {
     same_node(left, right)
+        && left.mode() == right.mode()
         && left.len() == right.len()
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()

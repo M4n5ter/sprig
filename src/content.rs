@@ -38,6 +38,10 @@ static NONCE: AtomicU64 = AtomicU64::new(0);
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub id: String,
+    /// A shared regular-file inode identity, distinct from each path's `id`.
+    /// A retained singleton group records continuity after its aliases vanish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_group: Option<String>,
     pub mode: u32,
     /// Signed Unix nanoseconds; access times, ownership and ACLs are not tracked.
     #[serde(default)]
@@ -57,8 +61,15 @@ pub enum EntryKind {
 #[serde(deny_unknown_fields)]
 pub struct Observation {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_group: Option<String>,
     pub device: u64,
     pub inode: u64,
+}
+
+struct CapturedFile {
+    metadata: Metadata,
+    kind: EntryKind,
 }
 
 /// Captures all entries, including the root directory at the empty-string key.
@@ -74,11 +85,20 @@ pub fn capture(root: &Path, objects: &Path, previous: &Observed) -> Result<(Mani
     }
     let mut manifest = Manifest::new();
     let mut observed = Observed::new();
-    // Reuse allocation only, never content: every file is read and verified.
+    // Reuse bytes only for an already verified inode in this capture, never
+    // from an earlier capture or merely matching timestamps/content hashes.
+    let mut files = BTreeMap::new();
     let mut batch = ObjectBatch::open(objects)?;
-    capture_entry(&root, "", &mut batch, &mut manifest, &mut observed)?;
+    capture_entry(
+        &root,
+        "",
+        &mut batch,
+        &mut manifest,
+        &mut observed,
+        &mut files,
+    )?;
     assign_ids(&mut manifest, &mut observed, previous);
-    validate_manifest(&manifest)?;
+    assign_link_groups(&mut manifest, &mut observed, previous)?;
     // Flush all publications together before returning a usable manifest. Do
     // this even for dedup-only captures: an earlier failure may have left an
     // existing, fully synced chunk with an unsynced directory entry.
@@ -92,6 +112,7 @@ fn capture_entry(
     batch: &mut ObjectBatch,
     manifest: &mut Manifest,
     observed: &mut Observed,
+    files: &mut BTreeMap<(u64, u64), CapturedFile>,
 ) -> Result<()> {
     validate_path(relative)?;
     let metadata = platform::symlink_metadata(path)?;
@@ -108,14 +129,32 @@ fn capture_entry(
         if !unchanged(&metadata, &before) {
             return invalid(format!("source changed during capture: {}", path.display()));
         }
-        let kind = batch.put_reader(&mut input)?;
+        let key = (before.dev(), before.ino());
+        let kind = if let Some(captured) = files.get(&key) {
+            if !unchanged(&captured.metadata, &before) {
+                return invalid(format!(
+                    "linked file changed during capture: {}",
+                    path.display()
+                ));
+            }
+            captured.kind.clone()
+        } else {
+            batch.put_reader(&mut input)?
+        };
         let after = platform::file_metadata(&input)?;
         let EntryKind::File { size, .. } = &kind else {
             unreachable!()
         };
-        if *size != before.len() || !unchanged(&before, &after) {
+        if *size != before.len()
+            || !unchanged(&before, &after)
+            || !unchanged(&after, &platform::symlink_metadata(path)?)
+        {
             return invalid(format!("file changed during capture: {}", path.display()));
         }
+        files.entry(key).or_insert_with(|| CapturedFile {
+            metadata: before,
+            kind: kind.clone(),
+        });
         kind
     } else {
         return invalid(format!("special file rejected: {}", path.display()));
@@ -124,6 +163,7 @@ fn capture_entry(
         relative.to_owned(),
         Entry {
             id: String::new(),
+            link_group: None,
             mode: metadata.mode() & 0o777,
             modified_ns: metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
             kind,
@@ -133,6 +173,7 @@ fn capture_entry(
         relative.to_owned(),
         Observation {
             id: String::new(),
+            link_group: None,
             device: metadata.dev(),
             inode: metadata.ino(),
         },
@@ -149,7 +190,14 @@ fn capture_entry(
             } else {
                 format!("{relative}/{name}")
             };
-            capture_entry(&child.path(), &child_relative, batch, manifest, observed)?;
+            capture_entry(
+                &child.path(),
+                &child_relative,
+                batch,
+                manifest,
+                observed,
+                files,
+            )?;
         }
         if !unchanged(&metadata, &platform::symlink_metadata(path)?) {
             return invalid(format!(
@@ -180,22 +228,26 @@ fn assign_ids(manifest: &mut Manifest, observed: &mut Observed, previous: &Obser
             .or_default()
             .push(old);
     }
-    let mut current_counts = BTreeMap::new();
-    for current in observed.values() {
-        *current_counts
+    let mut unmatched_counts = BTreeMap::new();
+    for current in observed.values().filter(|current| current.id.is_empty()) {
+        *unmatched_counts
             .entry((current.device, current.inode))
             .or_insert(0_usize) += 1;
     }
     for (path, current) in observed.iter_mut() {
         if current.id.is_empty() {
             let key = (current.device, current.inode);
-            if current_counts[&key] == 1
+            if unmatched_counts[&key] == 1
                 && let Some(candidates) = old_inodes.get(&key)
-                && candidates.len() == 1
             {
-                let id = &candidates[0].id;
-                if !id.is_empty() && used.insert(id.clone()) {
-                    current.id.clone_from(id);
+                let mut remaining = candidates
+                    .iter()
+                    .filter(|candidate| !candidate.id.is_empty() && !used.contains(&candidate.id));
+                if let Some(candidate) = remaining.next()
+                    && remaining.next().is_none()
+                {
+                    current.id.clone_from(&candidate.id);
+                    used.insert(candidate.id.clone());
                 }
             }
             if current.id.is_empty() {
@@ -216,6 +268,112 @@ fn assign_ids(manifest: &mut Manifest, observed: &mut Observed, previous: &Obser
     }
 }
 
+pub(crate) fn assign_link_groups(
+    manifest: &mut Manifest,
+    observed: &mut Observed,
+    previous: &Observed,
+) -> Result<()> {
+    let mut current_inodes: BTreeMap<(u64, u64), Vec<String>> = BTreeMap::new();
+    for (path, current) in observed.iter() {
+        if matches!(manifest[path].kind, EntryKind::File { .. }) {
+            current_inodes
+                .entry((current.device, current.inode))
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    let mut old_groups: BTreeMap<(u64, u64), BTreeSet<&str>> = BTreeMap::new();
+    let mut old_group_inodes: BTreeMap<&str, BTreeSet<(u64, u64)>> = BTreeMap::new();
+    let mut old_singletons: BTreeMap<(u64, u64), BTreeSet<&str>> = BTreeMap::new();
+    for old in previous.values() {
+        if let Some(group) = old.link_group.as_deref().filter(|group| !group.is_empty()) {
+            let key = (old.device, old.inode);
+            old_groups.entry(key).or_default().insert(group);
+            old_group_inodes.entry(group).or_default().insert(key);
+        } else if old.link_group.is_none() && !old.id.is_empty() {
+            old_singletons
+                .entry((old.device, old.inode))
+                .or_default()
+                .insert(&old.id);
+        }
+    }
+    let mut used = BTreeSet::new();
+    let mut assigned: BTreeMap<(u64, u64), Option<String>> = BTreeMap::new();
+    // Reserve surviving groups before replacements can claim their tokens.
+    // This order must not depend on inode or pathname ordering.
+    for key in current_inodes.keys() {
+        // A path-preserving editor replacement keeps its directory-entry ID,
+        // but must not inherit the replaced inode's group. Only observed inode
+        // continuity can retain a group, including a now-singleton survivor.
+        let prior = old_groups.get(key).and_then(|groups| {
+            let group = *groups.first()?;
+            (groups.len() == 1 && old_group_inodes[group].len() == 1).then_some(group)
+        });
+        if let Some(group) = prior.filter(|group| used.insert((*group).to_owned())) {
+            assigned.insert(*key, Some(group.to_owned()));
+        }
+    }
+    // A singleton gaining aliases keeps its effective inode identity: its
+    // original entry ID. Also preserve that identity if the old path was
+    // replaced while another name still references the old observed inode.
+    for (key, paths) in &current_inodes {
+        if assigned.contains_key(key) {
+            continue;
+        }
+        if let Some(candidates) = old_singletons.get(key) {
+            let candidate = paths
+                .iter()
+                .map(|path| manifest[path].id.as_str())
+                .find(|id| candidates.contains(id))
+                .or_else(|| candidates.first().copied())
+                .expect("nonempty singleton candidates");
+            if !old_group_inodes.contains_key(candidate) && used.insert(candidate.to_owned()) {
+                let explicit = paths.len() > 1 || manifest[&paths[0]].id != candidate;
+                assigned.insert(*key, explicit.then(|| candidate.to_owned()));
+            }
+        }
+    }
+    for (key, paths) in &current_inodes {
+        if assigned.contains_key(key) {
+            continue;
+        }
+        let candidate = &manifest[&paths[0]].id;
+        let group = if !old_group_inodes.contains_key(candidate.as_str())
+            && used.insert(candidate.clone())
+        {
+            (paths.len() > 1).then(|| candidate.clone())
+        } else {
+            // The directory-entry ID still belongs to this path after an
+            // editor replacement, but its effective inode ID is already used
+            // by the surviving original group. Give the replacement a fresh
+            // singleton group instead of silently joining unrelated inodes.
+            Some(loop {
+                let group = unique_id(&format!("link:{}", paths[0]), key.0, key.1);
+                if !old_group_inodes.contains_key(group.as_str()) && used.insert(group.clone()) {
+                    break group;
+                }
+            })
+        };
+        assigned.insert(*key, group);
+    }
+    for (key, paths) in current_inodes {
+        let group = assigned.remove(&key).expect("assigned inode identity");
+        for path in paths {
+            manifest
+                .get_mut(&path)
+                .expect("observed entry")
+                .link_group
+                .clone_from(&group);
+            observed
+                .get_mut(&path)
+                .expect("observed entry")
+                .link_group
+                .clone_from(&group);
+        }
+    }
+    validate_manifest(manifest)
+}
+
 /// Writes a fresh tree only. The caller owns staging and atomic publication.
 pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result<()> {
     validate_manifest(manifest)?;
@@ -233,6 +391,7 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     platform::set_path_mode(&target, 0o700)?;
     let reader = packed::Reader::open(objects)?;
     let mut directories = Vec::new();
+    let mut linked_files: BTreeMap<&str, PathBuf> = BTreeMap::new();
     for (relative, entry) in manifest {
         let path = target.join(relative);
         match &entry.kind {
@@ -244,6 +403,16 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
                 directories.push((path, entry.mode, entry.modified_ns));
             }
             EntryKind::File { size, chunks } => {
+                if let Some(first) = entry
+                    .link_group
+                    .as_deref()
+                    .and_then(|group| linked_files.get(group))
+                {
+                    // The representative is inside this fresh destination, not
+                    // a mutable file in any existing workspace or object store.
+                    platform::hard_link(first, &path)?;
+                    continue;
+                }
                 let mut output = platform::create_new(&path, 0o600)?;
                 let mut written = 0_u64;
                 for hash in chunks {
@@ -263,6 +432,9 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
                 output
                     .set_times(FileTimes::new().set_modified(modified_time(entry.modified_ns)?))?;
                 output.sync_all()?;
+                if let Some(group) = entry.link_group.as_deref() {
+                    linked_files.insert(group, path);
+                }
             }
             EntryKind::Symlink { target: link } => {
                 create_symlink(link, &path)?;
@@ -429,6 +601,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<()> {
         return invalid("manifest must contain a root directory at the empty path");
     }
     let mut identities = BTreeSet::new();
+    let mut link_groups: BTreeMap<&str, &Entry> = BTreeMap::new();
     for (path, entry) in manifest {
         validate_path(path)?;
         if entry.id.is_empty() || !identities.insert(&entry.id) {
@@ -437,6 +610,20 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<()> {
         modified_time(entry.modified_ns)?;
         if entry.mode & !0o777 != 0 {
             return invalid(format!("unsafe permission bits at {path:?}"));
+        }
+        if let Some(group) = entry.link_group.as_deref() {
+            if group.is_empty() || !matches!(entry.kind, EntryKind::File { .. }) {
+                return invalid(format!("invalid regular-file link group at {path:?}"));
+            }
+            if let Some(first) = link_groups.insert(group, entry)
+                && (first.kind != entry.kind
+                    || first.mode != entry.mode
+                    || first.modified_ns != entry.modified_ns)
+            {
+                return invalid(format!(
+                    "inconsistent linked-file contents or metadata at {path:?}"
+                ));
+            }
         }
         if !path.is_empty() {
             let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
@@ -465,6 +652,16 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<()> {
                     return invalid(format!("invalid symbolic link target at {path:?}"));
                 }
             }
+        }
+    }
+    for (path, entry) in manifest {
+        if matches!(entry.kind, EntryKind::File { .. })
+            && entry.link_group.is_none()
+            && link_groups.contains_key(entry.id.as_str())
+        {
+            return invalid(format!(
+                "link group collides with an independent file identity at {path:?}"
+            ));
         }
     }
     Ok(())
@@ -641,6 +838,7 @@ fn same_node(left: &Metadata, right: &Metadata) -> bool {
 
 fn unchanged(left: &Metadata, right: &Metadata) -> bool {
     same_node(left, right)
+        && left.mode() == right.mode()
         && left.len() == right.len()
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()
@@ -688,5 +886,131 @@ mod tests {
             PathBuf::from("link")
         );
         assert!(normalized_root(Path::new("link/../other")).is_err());
+
+        // Old manifests omit link_group and retain their serialized shape.
+        let old: Entry =
+            serde_json::from_str(r#"{"id":"root","mode":493,"kind":{"type":"directory"}}"#)
+                .unwrap();
+        assert_eq!(old.link_group, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("link_group"));
+        let file = Entry {
+            id: "first".to_owned(),
+            link_group: Some("group".to_owned()),
+            mode: 0o644,
+            modified_ns: 0,
+            kind: EntryKind::File {
+                size: 0,
+                chunks: Vec::new(),
+            },
+        };
+        let mut manifest = BTreeMap::from([
+            (String::new(), old),
+            ("a".to_owned(), file.clone()),
+            (
+                "b".to_owned(),
+                Entry {
+                    id: "second".to_owned(),
+                    ..file
+                },
+            ),
+        ]);
+        assert!(validate_manifest(&manifest).is_ok());
+        manifest.get_mut("b").unwrap().modified_ns = 1;
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.get_mut("b").unwrap().modified_ns = 0;
+        manifest.get_mut("b").unwrap().mode = 0o600;
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.get_mut("b").unwrap().mode = 0o644;
+        manifest.get_mut("b").unwrap().kind = EntryKind::File {
+            size: 1,
+            chunks: vec!["f".repeat(64)],
+        };
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.get_mut("b").unwrap().kind = EntryKind::File {
+            size: 0,
+            chunks: Vec::new(),
+        };
+        manifest.get_mut("b").unwrap().link_group = Some(String::new());
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.get_mut("b").unwrap().link_group = None;
+        manifest.get_mut("").unwrap().link_group = Some("directory".to_owned());
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.get_mut("").unwrap().link_group = None;
+        manifest.get_mut("b").unwrap().id = "group".to_owned();
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn preserves_native_link_topology_and_inode_continuity() -> Result<()> {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("sprig-content-links-{}", unique_id("test", 0, 0))),
+        );
+        let source = fixture.0.join("source");
+        let objects = fixture.0.join("objects");
+        fs::create_dir_all(source.join("directory"))?;
+        fs::write(source.join("a"), b"linked contents")?;
+        fs::hard_link(source.join("a"), source.join("directory/b"))?;
+        fs::write(source.join("independent"), b"linked contents")?;
+        // The capture only sees one of these names; an external alias must not
+        // become a phantom in-tree group or a destination's mutable source.
+        fs::hard_link(source.join("independent"), fixture.0.join("outside"))?;
+        let (manifest, observed) = capture(&source, &objects, &Observed::new())?;
+        let group = manifest["a"].link_group.clone();
+        assert!(group.is_some());
+        assert_eq!(group, manifest["directory/b"].link_group);
+        assert_ne!(manifest["a"].id, manifest["directory/b"].id);
+        assert_eq!(manifest["independent"].link_group, None);
+
+        let restored = fixture.0.join("restored");
+        materialize(&manifest, &objects, &restored)?;
+        let copied = fixture.0.join("copied");
+        let stats =
+            crate::copy_tree::copy_tree(&source, &copied, crate::copy_tree::CopyMode::Copy)?;
+        assert_eq!(stats.copied, 2);
+        assert_eq!(stats.hardlinks, 1);
+        for target in [&restored, &copied] {
+            let a = platform::symlink_metadata(target.join("a"))?;
+            let b = platform::symlink_metadata(target.join("directory/b"))?;
+            let original = platform::symlink_metadata(source.join("a"))?;
+            assert!(same_node(&a, &b));
+            assert!(!same_node(&a, &original));
+            fs::write(target.join("a"), b"independent destination")?;
+            assert_eq!(
+                fs::read(target.join("directory/b"))?,
+                b"independent destination"
+            );
+            assert_eq!(fs::read(source.join("a"))?, b"linked contents");
+        }
+
+        fs::rename(source.join("a"), source.join("renamed"))?;
+        let (renamed, observations) = capture(&source, &objects, &observed)?;
+        assert_eq!(renamed["renamed"].id, manifest["a"].id);
+        assert_eq!(renamed["renamed"].link_group, group);
+        fs::write(source.join("replacement"), b"editor replacement")?;
+        platform::rename(&source.join("replacement"), &source.join("renamed"))?;
+        let (split, observations) = capture(&source, &objects, &observations)?;
+        assert_eq!(split["renamed"].id, renamed["renamed"].id);
+        assert_ne!(split["renamed"].link_group, group);
+        assert_eq!(split["directory/b"].link_group, group);
+        fs::remove_file(source.join("renamed"))?;
+        let (singleton, observations) = capture(&source, &objects, &observations)?;
+        assert_eq!(singleton["directory/b"].link_group, group);
+        fs::hard_link(source.join("independent"), source.join("added"))?;
+        let (expanded, _) = capture(&source, &objects, &observations)?;
+        assert_eq!(
+            expanded["added"].link_group.as_ref(),
+            Some(&manifest["independent"].id)
+        );
+        assert_eq!(
+            expanded["added"].link_group,
+            expanded["independent"].link_group
+        );
+        Ok(())
     }
 }

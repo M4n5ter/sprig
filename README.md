@@ -592,13 +592,22 @@ content counts in each revision. None is whole-store physical usage: retained
 trees, revision records and backups also consume space. `doctor` lists all object
 store entries so retained orphan/temporary files are visible.
 
-The current storage schema is **6**.
+The current storage schema is **7**.
 
 ## Guarantees and boundaries
 
-- Workspaces do not share hardlinks. Native clones remain independently writable.
-  Import and fork turn source hardlinks into independent files with distinct
-  logical identities. Identical content can still share historical chunks.
+- Workspaces never share mutable hardlinks. Within one workspace, regular-file
+  hardlinks share content, permissions and modification time while retaining
+  distinct directory-entry identities. Import, fork, copy and restore preserve
+  internal link groups without linking back to the source workspace.
+  `sprig ln WORKSPACE SOURCE DESTINATION` creates an alias through the same
+  transactional mutation engine as other SDK and CLI writes. Directory and
+  symlink hardlinks are rejected.
+- Projected workspaces materialize only multi-path hardlink groups into their
+  private OverlayFS upper before the first mount; other files remain lazy. This
+  avoids OverlayFS copy-up splitting a lower link group with `index=off`, at the
+  cost of initial I/O and private space for those groups. Remount never reseeds
+  deleted entries. Owned writable workspaces share the inode in their CAS view.
 - A store-wide advisory lock coordinates Sprig's metadata publication. It does
   not freeze other programs. Use trusted, quiescent trees for import, fork and
   checkpoint; source-change checks detect some races, not every external write
@@ -739,7 +748,7 @@ The old journal is retained in recoverable trash, never reset after an uncertain
 publication. If publication succeeds but remount fails, the result includes the
 committed revision and `mount_error`; do not repeat the commit blindly.
 
-The direct-I/O adapter does not support shared writable `mmap`, hardlinks,
+The direct-I/O adapter does not support shared writable `mmap`,
 special nodes, ownership changes, xattrs/ACLs or advanced rename flags. Unsupported
 operations fail explicitly. Read-only mapping and executable-file behavior must
 be checked on the running kernel; this is not a complete POSIX filesystem or a
@@ -796,7 +805,7 @@ capability checks, not a claim of complete compiler or POSIX compatibility.
 The same [Linux lifecycle check](https://github.com/M4n5ter/sprig/actions/runs/39985372223)
 ran a small, dependency-free Cargo crate with incremental compilation both off
 and on: clean build, no-op build, source edit, checkpoint, restore, and build,
-with executed-output checks. No-op and restored builds were `Fresh`. With
-incremental compilation enabled, rustc reported unsupported hard links and
-successfully fell back to copying cache files. This fallback has costs; the
-check does not establish compatibility or speed for every Cargo project.
+with executed-output checks. No-op and restored builds were `Fresh`. That earlier run used a copying fallback for incremental-cache hardlinks. The
+current lifecycle test additionally requires successful hardlink creation and
+rejects that fallback warning. This check does not establish compatibility or
+speed for every Cargo project.

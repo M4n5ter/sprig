@@ -3,11 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::fs::{self, DirBuilder, File, FileTimes, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -229,23 +229,32 @@ pub fn start(
         // Publish the initial root metadata atomically. A failed initialization
         // leaves only an unreferenced staging directory, never a partial upper.
         let pending = generation.join(format!("upper-init-{}", unique_attempt()));
-        DirBuilder::new().mode(0o700).create(&pending)?;
-        let root = &manifest[""];
-        if root.modified_ns < 0 {
-            return Err(invalid("pre-1970 projection root mtime unsupported").into());
+        // OverlayFS index=off may split lower hardlinks during copy-up. Seed
+        // complete multi-name groups into this fresh private upper atomically;
+        // all other payloads remain lazy. Never reseed an existing upper.
+        let mut counts = std::collections::BTreeMap::new();
+        for entry in manifest.values() {
+            if let Some(group) = &entry.link_group {
+                *counts.entry(group).or_insert(0usize) += 1;
+            }
         }
-        let seconds = u64::try_from(root.modified_ns / 1_000_000_000)
-            .map_err(|_| invalid("projection root mtime out of range"))?;
-        let modified = UNIX_EPOCH
-            .checked_add(Duration::new(
-                seconds,
-                (root.modified_ns % 1_000_000_000) as u32,
-            ))
-            .ok_or_else(|| invalid("projection root mtime out of range"))?;
-        let upper = File::open(&pending)?;
-        upper.set_permissions(fs::Permissions::from_mode(root.mode))?;
-        upper.set_times(FileTimes::new().set_modified(modified))?;
-        upper.sync_all()?;
+        let mut initial = Manifest::from([(String::new(), manifest[""].clone())]);
+        for (path, entry) in manifest {
+            if !entry
+                .link_group
+                .as_ref()
+                .is_some_and(|group| counts[group] > 1)
+            {
+                continue;
+            }
+            initial.insert(path.clone(), entry.clone());
+            let mut parent = path.as_str();
+            while let Some((prefix, _)) = parent.rsplit_once('/') {
+                initial.insert(prefix.to_owned(), manifest[prefix].clone());
+                parent = prefix;
+            }
+        }
+        content::materialize(&initial, &store_root.join("objects"), &pending)?;
         fs::rename(&pending, &upper_path)?;
         File::open(generation)?.sync_all()?;
     }

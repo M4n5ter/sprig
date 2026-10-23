@@ -27,7 +27,7 @@ use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 6;
+const STORAGE_SCHEMA: u32 = 7;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 #[derive(Serialize, Deserialize)]
@@ -2480,6 +2480,7 @@ fn observe_manifest(tree: &Path, manifest: &Manifest) -> Result<Observed> {
             path.clone(),
             content::Observation {
                 id: entry.id.clone(),
+                link_group: entry.link_group.clone(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
             },
@@ -2592,6 +2593,12 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
             file.write_all(replacement.as_bytes())?;
             file.sync_all()?;
         }
+        Mutation::Link { from, to } => {
+            let source = mutation_path(tree, from, false)?;
+            let target = mutation_path(tree, to, true)?;
+            require_file(&source)?;
+            platform::hard_link(&source, &target)?;
+        }
         Mutation::Copy { from, to } => {
             let source = mutation_path(tree, from, false)?;
             let target = mutation_path(tree, to, true)?;
@@ -2651,7 +2658,7 @@ fn copy_subtree(
     } else if metadata.is_file() {
         let identity = (metadata.dev(), metadata.ino());
         if let Some(previous) = links.get(&identity) {
-            fs::hard_link(previous, target)?;
+            platform::hard_link(previous, target)?;
         } else {
             fs::copy(source, target)?;
             platform::set_path_mode(target, metadata.mode() & 0o777)?;
@@ -2742,15 +2749,58 @@ fn resolution_path(tree: &Path, relative: &str) -> Result<PathBuf> {
     Ok(current)
 }
 
+type SyncedInodes = BTreeMap<(u64, u64), (u64, i64, i64, i64, i64)>;
+
+fn sync_inode_once(
+    path: &Path,
+    metadata: &platform::Metadata,
+    synced: &mut SyncedInodes,
+) -> Result<()> {
+    let key = (metadata.dev(), metadata.ino());
+    let fingerprint = (
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    );
+    if let Some(previous) = synced.get(&key) {
+        if *previous != fingerprint {
+            return Err(failure("linked file changed during synchronization"));
+        }
+        return Ok(());
+    }
+    platform::sync_file(path)?;
+    let after = platform::symlink_metadata(path)?;
+    if !after.is_file()
+        || (after.dev(), after.ino()) != key
+        || (
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+        ) != fingerprint
+    {
+        return Err(failure("file changed during synchronization"));
+    }
+    synced.insert(key, fingerprint);
+    Ok(())
+}
+
 fn sync_native_tree(path: &Path) -> Result<()> {
+    sync_native_entries(path, &mut BTreeMap::new())
+}
+
+fn sync_native_entries(path: &Path, synced: &mut SyncedInodes) -> Result<()> {
     let metadata = platform::symlink_metadata(path)?;
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            sync_native_tree(&entry?.path())?;
+            sync_native_entries(&entry?.path(), synced)?;
         }
         sync_directory(path)?;
     } else if metadata.is_file() {
-        platform::sync_file(path)?;
+        sync_inode_once(path, &metadata, synced)?;
     } else if !metadata.file_type().is_symlink() {
         return Err(failure(
             "special file encountered while syncing native generation",
@@ -2767,15 +2817,20 @@ fn sync_overlay_upper(_path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_overlay_upper(path: &Path) -> Result<()> {
+    sync_overlay_entries(path, &mut BTreeMap::new())
+}
+
+#[cfg(unix)]
+fn sync_overlay_entries(path: &Path, synced: &mut SyncedInodes) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = platform::symlink_metadata(path)?;
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            sync_overlay_upper(&entry?.path())?;
+            sync_overlay_entries(&entry?.path(), synced)?;
         }
         sync_directory(path)?;
     } else if metadata.is_file() {
-        platform::sync_file(path)?;
+        sync_inode_once(path, &metadata, synced)?;
     } else if !(metadata.file_type().is_symlink()
         || metadata.file_type().is_char_device() && metadata.rdev() == 0)
     {

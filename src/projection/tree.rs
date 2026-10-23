@@ -76,11 +76,25 @@ impl Projection {
         let manifest_hash = blake3::hash(&serde_json::to_vec(&manifest)?)
             .to_hex()
             .to_string();
-        let paths: BTreeMap<_, _> = manifest
-            .keys()
-            .enumerate()
-            .map(|(index, path)| (path.clone(), index as u64 + ROOT_INODE))
-            .collect();
+        let mut paths = BTreeMap::new();
+        let mut groups = BTreeMap::new();
+        let mut next_inode = ROOT_INODE;
+        for (path, entry) in &manifest {
+            let inode = entry
+                .link_group
+                .as_ref()
+                .and_then(|group| groups.get(group))
+                .copied()
+                .unwrap_or_else(|| {
+                    let inode = next_inode;
+                    next_inode += 1;
+                    if let Some(group) = &entry.link_group {
+                        groups.insert(group.clone(), inode);
+                    }
+                    inode
+                });
+            paths.insert(path.clone(), inode);
+        }
         let mut lengths = HashMap::new();
         let mut nodes = Vec::with_capacity(manifest.len());
         let mut logical_bytes = 0_u64;
@@ -91,6 +105,29 @@ impl Projection {
             let inode = paths[&path];
             let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
             let parent = paths[parent_path];
+            if (inode - ROOT_INODE) < nodes.len() as u64 {
+                let node: &mut Node = &mut nodes[(inode - ROOT_INODE) as usize];
+                node.attr.nlink = node
+                    .attr
+                    .nlink
+                    .checked_add(1)
+                    .ok_or_else(|| store::invalid("file link count overflow"))?;
+                let kind = node.attr.kind;
+                let size = node.attr.size;
+                logical_bytes = logical_bytes
+                    .checked_add(size)
+                    .ok_or_else(|| store::invalid("logical byte count overflow"))?;
+                let Data::Directory { children } = &mut nodes[(parent - ROOT_INODE) as usize].data
+                else {
+                    unreachable!("manifest parents validated")
+                };
+                children.push(DirectoryEntry {
+                    name: OsString::from(path.rsplit('/').next().expect("alias has a name")),
+                    inode,
+                    kind,
+                });
+                continue;
+            }
             let modified = modified_time(entry.modified_ns)?;
             let (kind, size, data) = match entry.kind {
                 EntryKind::Directory => (
@@ -437,13 +474,21 @@ mod tests {
                 1000,
             )
             .unwrap();
-            for (index, (path, entry)) in manifest.iter().enumerate() {
-                let origin = projection.origin(index as u64 + ROOT_INODE);
+            for (path, entry) in manifest {
+                let mut inode = ROOT_INODE;
+                for name in path.split('/').filter(|name| !name.is_empty()) {
+                    inode = projection.lookup(inode, OsStr::new(name)).unwrap();
+                }
+                let origin = projection.origin(inode);
                 if matches!(entry.kind, EntryKind::Symlink { .. }) {
                     assert_eq!(origin.unwrap_err().raw_os_error(), Some(libc::ENODATA));
                 } else {
                     let actual: (String, String) = serde_json::from_slice(origin.unwrap()).unwrap();
-                    assert_eq!(actual, (digest.clone(), path.clone()));
+                    assert_eq!(actual.0, digest);
+                    if actual.1 != *path {
+                        assert!(entry.link_group.is_some());
+                        assert_eq!(manifest[&actual.1].link_group, entry.link_group);
+                    }
                 }
             }
             projection
@@ -480,6 +525,7 @@ mod tests {
     fn entry(id: &str, kind: EntryKind) -> Entry {
         Entry {
             id: id.into(),
+            link_group: None,
             mode: 0o755,
             modified_ns: 0,
             kind,
@@ -585,11 +631,8 @@ mod tests {
         );
         let attr = projection.getattr(file).expect("file attributes");
         let alias = projection.lookup(ROOT_INODE, OsStr::new("alias")).unwrap();
-        assert_ne!(
-            alias, file,
-            "manifest paths do not preserve hardlink groups"
-        );
-        assert_eq!(projection.getattr(alias).unwrap().nlink, 1);
+        assert_eq!(alias, file, "linked paths share an immutable lower inode");
+        assert_eq!(projection.getattr(alias).unwrap().nlink, 2);
         assert_eq!(attr.kind, FileType::RegularFile);
         assert_eq!(attr.perm, 0o751);
         assert_eq!(attr.mtime, time);

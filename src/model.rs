@@ -211,6 +211,11 @@ pub enum Mutation {
         from: String,
         to: String,
     },
+    /// Another name for a regular file within this workspace only.
+    Link {
+        from: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Serialize)]

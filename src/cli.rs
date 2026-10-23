@@ -269,6 +269,14 @@ enum Command {
         #[command(flatten)]
         commit: CommitOptions,
     },
+    /// Hard-link a regular file to a new name within this workspace and commit.
+    Ln {
+        workspace: String,
+        from: String,
+        to: String,
+        #[command(flatten)]
+        commit: CommitOptions,
+    },
     /// Create a workspace directory and commit the managed transaction.
     Mkdir {
         workspace: String,
@@ -642,6 +650,21 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             },
             commit,
             "copy",
+        ),
+        Command::Ln {
+            workspace,
+            from,
+            to,
+            commit,
+        } => apply(
+            &store,
+            workspace,
+            Mutation::Link {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            commit,
+            "link",
         ),
         Command::Mkdir {
             workspace,

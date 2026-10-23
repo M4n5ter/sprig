@@ -231,13 +231,12 @@ fn windows_native_copy_history_and_leases() -> Result<()> {
     fs::remove_dir(&junction)?;
     let readonly = source.join("readonly");
     fs::write(&readonly, b"readonly")?;
-    let mut permissions = fs::metadata(&readonly)?.permissions();
+    let original_permissions = fs::metadata(&readonly)?.permissions();
+    let mut permissions = original_permissions.clone();
     permissions.set_readonly(true);
     fs::set_permissions(&readonly, permissions)?;
     assert!(content::capture(&source, &objects, &Observed::new()).is_err());
-    let mut permissions = fs::metadata(&readonly)?.permissions();
-    permissions.set_readonly(false);
-    fs::set_permissions(&readonly, permissions)?;
+    fs::set_permissions(&readonly, original_permissions)?;
 
     for entry in [source.join("directory/file.txt"), source.join("directory")] {
         let mut stream = entry.into_os_string();

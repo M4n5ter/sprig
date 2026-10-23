@@ -562,8 +562,8 @@ metadata planning still validate the full index. Bulk operations share a validat
 snapshot; catalog metadata is expanded only when needed. These are explicit
 capacity and growth costs, not constant-time update claims. Single-new-chunk
 batches do not rewrite the index.
-Loose chunks remain readable within this layout, but that does not make older
-store schemas compatible. GC counts packed bytes as reclaimable only when the
+The object store reads both loose chunks and packed payloads. GC counts packed
+bytes as reclaimable only when the
 whole pack is unreachable; it does not pretend dead slices can be freed in place.
 Native capture reuses one 256 KiB I/O buffer across files, not their contents:
 every file is still read and every existing chunk verified, even when size and
@@ -579,10 +579,7 @@ content counts in each revision. None is whole-store physical usage: retained
 trees, revision records and backups also consume space. `doctor` lists all object
 store entries so retained orphan/temporary files are visible.
 
-The current storage schema is **5**. Earlier or otherwise unsupported schemas are
-rejected without migration or modification, including schema 4 stores created by
-the previous binary. Use a fresh store for this version;
-there is no storage-format or API compatibility guarantee. Keep independent backups.
+The current storage schema is **5**.
 
 ## Guarantees and boundaries
 

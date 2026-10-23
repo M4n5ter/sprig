@@ -14,12 +14,26 @@ pub struct Revision {
     pub manifest: Manifest,
 }
 
+/// A projection's immutable lower remains pinned when its logical base advances.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkspaceBackend {
+    #[default]
+    Native,
+    Projection {
+        revision: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
+    pub backend: WorkspaceBackend,
     pub branch: String,
     pub base_revision: String,
     pub directory: String,
     pub observed: Observed,
+    /// Random FUSE-session identity, not a timestamp or reusable mount number.
+    pub observation_epoch: Option<String>,
     #[serde(default)]
     pub pending: Option<PendingMerge>,
 }
@@ -43,6 +57,9 @@ pub(crate) struct State {
 
 #[derive(Debug, Serialize)]
 pub struct WorkspaceResult {
+    pub backend: WorkspaceBackend,
+    /// Native, mounted, unmounted, partial, unsupported, or a diagnostic error.
+    pub mount_state: String,
     pub name: String,
     pub branch: String,
     pub base_revision: String,
@@ -196,4 +213,19 @@ pub struct FileDiff {
     pub kind: String,
     pub patch: Option<String>,
     pub binary: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackendReport {
+    #[serde(flatten)]
+    pub native: crate::copy_tree::NativeBackendInfo,
+    pub projection: ProjectionBackendInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectionBackendInfo {
+    pub compiled: bool,
+    pub requires_root: bool,
+    pub fuse_device_present: bool,
+    pub note: String,
 }

@@ -1,9 +1,10 @@
 //! One atomic state file publishes branch heads and workspace generations together.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,12 +15,14 @@ use crate::merge::{self, MergeStrategy};
 use crate::metadata;
 use crate::model::{
     BranchResult, Change, CommitResult, DoctorReport, GcPlan, Listing, MergeOutcome, Mutation,
-    Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace, WorkspaceResult,
+    Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace, WorkspaceBackend,
+    WorkspaceResult,
 };
+use crate::platform;
 use crate::{Blame, Result};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 3;
+const STORAGE_SCHEMA: u32 = 4;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 /// Handle to a local, single-user store. Methods acquire their own metadata lock;
@@ -27,11 +30,388 @@ const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+    projection_executable: Option<PathBuf>,
 }
 
 impl Store {
+    /// Configure the installed Sprig executable used for foreground FUSE workers.
+    /// Library callers opt in explicitly; no helper or system setting is installed.
+    pub fn with_projection_executable(mut self, executable: PathBuf) -> Self {
+        self.projection_executable = Some(executable);
+        self
+    }
+
+    /// Read only immutable data for a FUSE worker. Does not acquire the metadata
+    /// lock: its parent holds that lock while waiting for mount readiness.
+    #[cfg(all(target_os = "linux", feature = "projection"))]
+    pub fn projection_snapshot(
+        root: &Path,
+        revision: &str,
+        generation: &str,
+    ) -> Result<(PathBuf, Manifest, PathBuf)> {
+        validate_name(generation)?;
+        require_directory(root)?;
+        let store = Self {
+            root: root.canonicalize()?,
+            projection_executable: None,
+        };
+        store.state()?;
+        let path = store.root.join("native").join(generation);
+        require_directory(&path)?;
+        require_file(&path.join("lease"))?;
+        require_file(&path.join("projection-base"))?;
+        if fs::read_to_string(path.join("projection-base"))? != revision {
+            return Err(failure("projection generation pin mismatch"));
+        }
+        let data = store.revision(revision)?;
+        Ok((store.objects(), data.manifest, path))
+    }
+
+    pub fn mount_workspace(&self, name: &str) -> Result<WorkspaceResult> {
+        let _lock = self.lock()?;
+        let state = self.state()?;
+        let workspace = workspace(&state, name)?;
+        let _lease = self.lease(workspace)?;
+        self.ensure_mounted(workspace)?;
+        Ok(self.workspace_result(name, workspace))
+    }
+
+    /// Normal unmount only. A busy external descriptor never forces detachment.
+    pub fn unmount_workspace(&self, name: &str) -> Result<WorkspaceResult> {
+        let _lock = self.lock()?;
+        let state = self.state()?;
+        let workspace = workspace(&state, name)?;
+        let _lease = self.lease(workspace)?;
+        self.stop_projection(workspace)?;
+        Ok(self.workspace_result(name, workspace))
+    }
+
+    pub fn unmount_generation(&self, generation: &str) -> Result<()> {
+        validate_name(generation)?;
+        let _lock = self.lock()?;
+        let _state = self.state()?;
+        let path = self.root.join("native").join(generation);
+        require_directory(&path)?;
+        let pin = path.join("projection-base");
+        require_file(&pin)?;
+        let revision = fs::read_to_string(pin)?;
+        if !valid_hash(&revision) {
+            return Err(failure("invalid projection pin"));
+        }
+        let workspace = Workspace {
+            backend: WorkspaceBackend::Projection {
+                revision: revision.clone(),
+            },
+            branch: "retained".into(),
+            base_revision: revision,
+            directory: generation.into(),
+            observed: Observed::new(),
+            observation_epoch: None,
+            pending: None,
+        };
+        let _lease = self.lease(&workspace)?;
+        self.stop_projection(&workspace)
+    }
+
+    fn mount_state(&self, workspace: &Workspace) -> String {
+        if matches!(workspace.backend, WorkspaceBackend::Native) {
+            return "native".into();
+        }
+        #[cfg(all(target_os = "linux", feature = "projection"))]
+        {
+            match crate::projection::lifecycle::inspect(
+                &self.root.join("native").join(&workspace.directory),
+            ) {
+                Ok(state) => format!("{state:?}").to_ascii_lowercase(),
+                Err(error) => format!("broken: {error}"),
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        {
+            "unsupported".into()
+        }
+    }
+
+    fn ensure_mounted(&self, workspace: &Workspace) -> Result<()> {
+        self.ensure_mounted_inner(workspace, false)
+    }
+
+    fn ensure_mounted_inner(&self, workspace: &Workspace, initialize: bool) -> Result<()> {
+        let WorkspaceBackend::Projection { revision } = &workspace.backend else {
+            return require_directory(&self.tree(&workspace.directory));
+        };
+        let pin = self
+            .root
+            .join("native")
+            .join(&workspace.directory)
+            .join("projection-base");
+        require_file(&pin)?;
+        if fs::read_to_string(pin)? != *revision {
+            return Err(failure("projection generation pin mismatch"));
+        }
+        #[cfg(all(target_os = "linux", feature = "projection"))]
+        {
+            use crate::projection::lifecycle::{self, MountState};
+            let generation = self.root.join("native").join(&workspace.directory);
+            match lifecycle::inspect(&generation)? {
+                MountState::Mounted => {
+                    lifecycle::verify_binding(&generation, &self.revision(revision)?.manifest)
+                }
+                MountState::Partial => Err(failure(
+                    "projection_partial: normal unmount is required before remount",
+                )),
+                MountState::Unmounted => lifecycle::start(
+                    &self.root,
+                    revision,
+                    &generation,
+                    self.projection_executable.as_deref().ok_or_else(|| {
+                        failure("projection requires an explicitly configured Sprig executable")
+                    })?,
+                    &self.revision(revision)?.manifest,
+                    initialize,
+                ),
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        {
+            let _ = (revision, initialize);
+            Err(failure(
+                "projection requires Linux and the projection Cargo feature",
+            ))
+        }
+    }
+
+    fn stop_projection(&self, workspace: &Workspace) -> Result<()> {
+        if matches!(workspace.backend, WorkspaceBackend::Native) {
+            return Ok(());
+        }
+        #[cfg(all(target_os = "linux", feature = "projection"))]
+        {
+            let generation = self.root.join("native").join(&workspace.directory);
+            if crate::projection::lifecycle::inspect(&generation)?
+                == crate::projection::lifecycle::MountState::Mounted
+            {
+                sync_overlay_upper(&generation.join("upper"))?;
+                sync_directory(&generation.join("work"))?;
+                sync_directory(&generation)?;
+            }
+            crate::projection::lifecycle::stop(&generation)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        {
+            Err(failure(
+                "projection requires Linux and the projection Cargo feature",
+            ))
+        }
+    }
+
+    fn capture_workspace(&self, workspace: &Workspace) -> Result<(Manifest, Observed)> {
+        self.ensure_mounted(workspace)?;
+        match &workspace.backend {
+            WorkspaceBackend::Native => content::capture(
+                &self.tree(&workspace.directory),
+                &self.objects(),
+                &workspace.observed,
+            ),
+            WorkspaceBackend::Projection { revision } => {
+                #[cfg(all(target_os = "linux", feature = "projection"))]
+                {
+                    let generation = self.root.join("native").join(&workspace.directory);
+                    let mut captured = crate::projection::capture::capture(
+                        &self.revision(revision)?.manifest,
+                        &self.objects(),
+                        &generation.join("tree"),
+                        &generation.join("upper"),
+                        &generation.join("lower"),
+                    )?;
+                    let empty = Observed::new();
+                    let epoch = self.observation_epoch(workspace)?;
+                    let previous = if epoch == workspace.observation_epoch {
+                        &workspace.observed
+                    } else {
+                        &empty
+                    };
+                    captured.reconcile_identities(
+                        &self.revision(&workspace.base_revision)?.manifest,
+                        previous,
+                    )?;
+                    Ok((captured.manifest, captured.observed))
+                }
+                #[cfg(not(all(target_os = "linux", feature = "projection")))]
+                {
+                    let _ = revision;
+                    Err(failure("projection backend unavailable"))
+                }
+            }
+        }
+    }
+
+    fn observation_epoch(&self, workspace: &Workspace) -> Result<Option<String>> {
+        if matches!(workspace.backend, WorkspaceBackend::Native) {
+            return Ok(None);
+        }
+        #[cfg(all(target_os = "linux", feature = "projection"))]
+        {
+            Ok(Some(crate::projection::lifecycle::incarnation(
+                &self.root.join("native").join(&workspace.directory),
+            )?))
+        }
+        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        {
+            Err(failure("projection backend unavailable"))
+        }
+    }
+
+    fn sync_workspace(&self, workspace: &Workspace) -> Result<()> {
+        match workspace.backend {
+            WorkspaceBackend::Native => sync_native_tree(&self.tree(&workspace.directory)),
+            WorkspaceBackend::Projection { .. } => {
+                self.ensure_mounted(workspace)?;
+                let generation = self.root.join("native").join(&workspace.directory);
+                sync_overlay_upper(&generation.join("upper"))?;
+                sync_directory(&generation.join("work"))?;
+                sync_directory(&generation)
+            }
+        }
+    }
+
+    fn projected_generation(&self, revision: &str) -> Result<(String, Observed, WorkspaceBackend)> {
+        self.require_projection_support()?;
+        let directory = self.new_native()?;
+        let generation = self.root.join("native").join(&directory);
+        write_new(&generation.join("projection-base"), revision.as_bytes())?;
+        sync_directory(&generation)?;
+        let backend = WorkspaceBackend::Projection {
+            revision: revision.to_owned(),
+        };
+        let temporary = Workspace {
+            backend: backend.clone(),
+            branch: "preparing".into(),
+            base_revision: revision.to_owned(),
+            directory: directory.clone(),
+            observed: Observed::new(),
+            observation_epoch: None,
+            pending: None,
+        };
+        self.ensure_mounted_inner(&temporary, true)?;
+        let observed =
+            observe_manifest(&self.tree(&directory), &self.revision(revision)?.manifest)?;
+        self.sync_workspace(&temporary)?;
+        Ok((directory, observed, backend))
+    }
+
+    fn detached_projection(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<(String, Observed, WorkspaceBackend)> {
+        let revision = self.put_revision(&Revision {
+            parents: vec![],
+            clock: 1,
+            message: "retained projection base".into(),
+            manifest: manifest.clone(),
+        })?;
+        self.projected_generation(&revision)
+    }
+
+    fn require_projection_support(&self) -> Result<()> {
+        #[cfg(all(target_os = "linux", feature = "projection"))]
+        {
+            // SAFETY: geteuid only reads the current process credential.
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(failure(
+                    "projection currently requires root; no helper is installed",
+                ));
+            }
+            if self.projection_executable.is_none() {
+                return Err(failure("projection requires a configured Sprig executable"));
+            }
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        {
+            Err(failure(
+                "projection requires Linux and the projection Cargo feature",
+            ))
+        }
+    }
+
+    pub fn import_projected(&self, source: &Path, name: &str) -> Result<WorkspaceResult> {
+        self.require_projection_support()?;
+        let _lock = self.lock()?;
+        let mut state = self.state()?;
+        fresh_name(&state, name, true)?;
+        require_directory(source)?;
+        let source = source.canonicalize()?;
+        if source.starts_with(&self.root) || self.root.starts_with(&source) {
+            return Err(failure("source and store must not contain one another"));
+        }
+        let (manifest, _) = content::capture(&source, &self.objects(), &Observed::new())?;
+        let revision = self.put_revision(&Revision {
+            parents: vec![],
+            clock: 1,
+            message: format!("import {name}"),
+            manifest,
+        })?;
+        let (directory, observed, backend) = self.projected_generation(&revision)?;
+        let mut workspace = Workspace {
+            backend,
+            branch: name.into(),
+            base_revision: revision.clone(),
+            directory,
+            observed,
+            observation_epoch: None,
+            pending: None,
+        };
+        state.branches.insert(name.into(), revision);
+        workspace.observation_epoch = self.observation_epoch(&workspace)?;
+        state.workspaces.insert(name.into(), workspace.clone());
+        self.save(&mut state)?;
+        Ok(self.workspace_result(name, &workspace))
+    }
+
+    pub fn checkout_projected(&self, branch: &str, name: &str) -> Result<WorkspaceResult> {
+        self.restore_projected_inner(branch, name, false)
+    }
+
+    pub fn restore_projected(&self, reference: &str, name: &str) -> Result<WorkspaceResult> {
+        self.restore_projected_inner(reference, name, true)
+    }
+
+    fn restore_projected_inner(
+        &self,
+        reference: &str,
+        name: &str,
+        new_branch: bool,
+    ) -> Result<WorkspaceResult> {
+        let _lock = self.lock()?;
+        let mut state = self.state()?;
+        fresh_name(&state, name, new_branch)?;
+        if !new_branch && !state.branches.contains_key(reference) {
+            return Err(failure("branch not found"));
+        }
+        let revision = self.resolve(&state, reference)?;
+        let (directory, observed, backend) = self.projected_generation(&revision)?;
+        let branch = if new_branch { name } else { reference };
+        let mut workspace = Workspace {
+            backend,
+            branch: branch.into(),
+            base_revision: revision.clone(),
+            directory,
+            observed,
+            observation_epoch: None,
+            pending: None,
+        };
+        if new_branch {
+            state.branches.insert(branch.into(), revision);
+        }
+        workspace.observation_epoch = self.observation_epoch(&workspace)?;
+        state.workspaces.insert(name.into(), workspace.clone());
+        self.save(&mut state)?;
+        Ok(self.workspace_result(name, &workspace))
+    }
+
     pub fn init(path: &Path) -> Result<Self> {
-        fs::DirBuilder::new().mode(0o700).create(path)?;
+        platform::create_dir(path, 0o700)?;
         let root = path.canonicalize()?;
         for area in AREAS {
             fs::create_dir(root.join(area))?;
@@ -61,7 +441,10 @@ impl Store {
             require_directory(&root.join(area))?;
         }
         require_file(&root.join("lock"))?;
-        let store = Self { root };
+        let store = Self {
+            root,
+            projection_executable: None,
+        };
         let _lock = store.lock()?;
         store.state()?;
         Ok(store)
@@ -73,6 +456,7 @@ impl Store {
         require_directory(path)?;
         let store = Self {
             root: path.canonicalize()?,
+            projection_executable: None,
         };
         for area in AREAS {
             require_directory(&store.root.join(area))?;
@@ -102,21 +486,24 @@ impl Store {
                 require_directory(&store.tree(directory))?;
             }
             // Active command leases must not be detached by metadata recovery.
+            let mut held_leases = Vec::new();
             for directory in names(&store.root.join("native"))? {
                 let native = store.root.join("native").join(&directory);
                 require_directory(&native)?;
                 let lease_path = native.join("lease");
                 if !protected_directories.contains(&directory)
-                    && fs::symlink_metadata(&lease_path)
+                    && platform::symlink_metadata(&lease_path)
                         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
                 {
                     continue;
                 }
                 require_file(&lease_path)?;
-                let lease = OpenOptions::new().read(true).write(true).open(lease_path)?;
+                let lease = platform::open_lease(&lease_path)
+                    .map_err(|error| failure(&format!("workspace_busy: {error}")))?;
                 lease
                     .try_lock()
                     .map_err(|error| failure(&format!("workspace_busy: {error}")))?;
+                held_leases.push(lease);
             }
             let current_path = store.root.join("state.json");
             require_file(&current_path)?;
@@ -127,13 +514,36 @@ impl Store {
             {
                 return Err(failure("unsupported store schema; store was not modified"));
             }
-            let current =
-                current_json.and_then(|value| serde_json::from_value::<State>(value).ok());
+            let current_generation = current_json
+                .as_ref()
+                .and_then(|value| value.get("generation"))
+                .and_then(serde_json::Value::as_u64);
+            let current = current_json
+                .and_then(|value| serde_json::from_value::<State>(value).ok())
+                .filter(|state| validate_state(state).is_ok());
+            let mut recovery_states = store.historical_states()?;
+            recovery_states.push(restored.clone());
+            if let Some(current) = &current {
+                recovery_states.push(current.clone());
+            }
+            let mut checked = BTreeSet::new();
+            for state in recovery_states {
+                for workspace in state.workspaces.values().chain(
+                    state
+                        .trash
+                        .values()
+                        .filter_map(|item| item.workspace.as_ref()),
+                ) {
+                    if checked.insert(workspace.directory.clone()) {
+                        store.stop_projection(workspace)?;
+                    }
+                }
+            }
             let highest = store
                 .historical_states()?
                 .iter()
                 .map(|state| state.generation)
-                .chain(current.iter().map(|state| state.generation))
+                .chain(current_generation)
                 .max()
                 .unwrap_or(generation);
             restored.generation = highest
@@ -159,7 +569,7 @@ impl Store {
                 .join(format!("recovered-state-{}.json", new_id()?));
             write_new(&staged, &serde_json::to_vec(&restored)?)?;
             sync_directory(&store.root.join("staging"))?;
-            fs::rename(staged, current_path)?;
+            platform::rename(&staged, &current_path)?;
             sync_directory(&store.root)?;
         }
         store.status()
@@ -184,14 +594,17 @@ impl Store {
             message: format!("import {name}"),
             manifest,
         })?;
-        let workspace = Workspace {
+        let mut workspace = Workspace {
+            backend: WorkspaceBackend::Native,
             branch: name.to_owned(),
             base_revision: revision.clone(),
             directory,
             observed,
+            observation_epoch: None,
             pending: None,
         };
         state.branches.insert(name.to_owned(), revision);
+        workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace.clone());
         self.save(&mut state)?;
         let mut result = self.workspace_result(name, &workspace);
@@ -207,23 +620,30 @@ impl Store {
         let _lease = self.lease(&source)?;
         // Capture identities first so a pending native rename stays identifiable.
         // The objects are deduplicated and remain unpublished until checkpoint.
-        let (manifest, _) = content::capture(
-            &self.tree(&source.directory),
-            &self.objects(),
-            &source.observed,
-        )?;
+        let (manifest, _) = self.capture_workspace(&source)?;
+        if matches!(source.backend, WorkspaceBackend::Projection { .. }) {
+            if mode != CopyMode::Auto {
+                return Err(failure(
+                    "native copy policy does not apply to a projected fork",
+                ));
+            }
+            return self.fork_projected_locked(&mut state, &source, &manifest, name, false);
+        }
         let directory = self.new_native()?;
         let copy_stats =
             copy_tree::copy_tree(&self.tree(&source.directory), &self.tree(&directory), mode)?;
         let observed = observe_manifest(&self.tree(&directory), &manifest)?;
-        let fork = Workspace {
+        let mut fork = Workspace {
+            backend: WorkspaceBackend::Native,
             branch: name.to_owned(),
             base_revision: source.base_revision.clone(),
             directory,
             observed,
+            observation_epoch: None,
             pending: source.pending.clone(),
         };
         state.branches.insert(name.to_owned(), source.base_revision);
+        fork.observation_epoch = self.observation_epoch(&fork)?;
         state.workspaces.insert(name.to_owned(), fork.clone());
         self.save(&mut state)?;
         let mut result = self.workspace_result(name, &fork);
@@ -263,11 +683,13 @@ impl Store {
         let directory = self.new_native()?;
         content::materialize(&data.manifest, &self.objects(), &self.tree(&directory))?;
         let observed = observe_manifest(&self.tree(&directory), &data.manifest)?;
-        let workspace = Workspace {
+        let mut workspace = Workspace {
+            backend: WorkspaceBackend::Native,
             branch: branch.to_owned(),
             base_revision: revision.to_owned(),
             directory,
             observed,
+            observation_epoch: None,
             pending: None,
         };
         if new_branch {
@@ -275,9 +697,50 @@ impl Store {
                 .branches
                 .insert(branch.to_owned(), revision.to_owned());
         }
+        workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace.clone());
         self.save(state)?;
         Ok(self.workspace_result(name, &workspace))
+    }
+
+    pub fn fork_projected(&self, source: &str, name: &str) -> Result<WorkspaceResult> {
+        let _lock = self.lock()?;
+        let mut state = self.state()?;
+        fresh_name(&state, name, true)?;
+        let source = workspace(&state, source)?.clone();
+        let _lease = self.lease(&source)?;
+        let (manifest, _) = self.capture_workspace(&source)?;
+        self.fork_projected_locked(&mut state, &source, &manifest, name, false)
+    }
+
+    fn fork_projected_locked(
+        &self,
+        state: &mut State,
+        source: &Workspace,
+        manifest: &Manifest,
+        name: &str,
+        stop_source: bool,
+    ) -> Result<WorkspaceResult> {
+        let (directory, observed, backend) = self.detached_projection(manifest)?;
+        if stop_source {
+            self.stop_projection(source)?;
+        }
+        let mut fork = Workspace {
+            backend,
+            branch: name.into(),
+            base_revision: source.base_revision.clone(),
+            directory,
+            observed,
+            observation_epoch: None,
+            pending: source.pending.clone(),
+        };
+        state
+            .branches
+            .insert(name.into(), source.base_revision.clone());
+        fork.observation_epoch = self.observation_epoch(&fork)?;
+        state.workspaces.insert(name.into(), fork.clone());
+        self.save(state)?;
+        Ok(self.workspace_result(name, &fork))
     }
 
     pub fn checkpoint(
@@ -291,11 +754,7 @@ impl Store {
         let workspace = workspace(&state, name)?.clone();
         let _lease = self.lease(&workspace)?;
         branch_head(&state, &workspace.branch, expected)?;
-        let (manifest, observed) = content::capture(
-            &self.tree(&workspace.directory),
-            &self.objects(),
-            &workspace.observed,
-        )?;
+        let (manifest, observed) = self.capture_workspace(&workspace)?;
         self.commit_workspace(&mut state, name, workspace, manifest, observed, message)
     }
 
@@ -346,9 +805,20 @@ impl Store {
                 (base.clock + 1, &candidate),
                 &[],
             )?;
-            let directory = self.new_native()?;
-            content::materialize(&merged.manifest, &self.objects(), &self.tree(&directory))?;
-            let observed = observe_manifest(&self.tree(&directory), &merged.manifest)?;
+            let (directory, observed, backend) =
+                if matches!(workspace.backend, WorkspaceBackend::Projection { .. }) {
+                    self.detached_projection(&merged.manifest)?
+                } else {
+                    let directory = self.new_native()?;
+                    content::materialize(
+                        &merged.manifest,
+                        &self.objects(),
+                        &self.tree(&directory),
+                    )?;
+                    let observed = observe_manifest(&self.tree(&directory), &merged.manifest)?;
+                    (directory, observed, WorkspaceBackend::Native)
+                };
+            self.stop_projection(&workspace)?;
             let token = new_id()?;
             state.trash.insert(
                 token.clone(),
@@ -360,6 +830,7 @@ impl Store {
                 },
             );
             workspace.directory = directory;
+            workspace.backend = backend;
             workspace.base_revision = previous.clone();
             workspace.observed = observed.clone();
             if !merged.conflicts.is_empty() {
@@ -372,7 +843,8 @@ impl Store {
                     candidate_revision: candidate,
                     conflicts: merged.conflicts,
                 });
-                sync_native_tree(&self.tree(&workspace.directory))?;
+                self.sync_workspace(&workspace)?;
+                workspace.observation_epoch = self.observation_epoch(&workspace)?;
                 state.workspaces.insert(name.to_owned(), workspace);
                 self.save(state)?;
                 return Err(failure(
@@ -404,7 +876,8 @@ impl Store {
         workspace.pending = None;
         let branch = workspace.branch.clone();
         state.branches.insert(branch.clone(), revision.clone());
-        sync_native_tree(&self.tree(&workspace.directory))?;
+        self.sync_workspace(&workspace)?;
+        workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace);
         self.save(state)?;
         Ok(CommitResult {
@@ -470,7 +943,7 @@ impl Store {
                     continue;
                 }
                 fs::write(&target, markers.as_bytes())?;
-                File::open(target)?.sync_all()?;
+                platform::sync_file(&target)?;
             }
         }
         Ok(())
@@ -481,6 +954,7 @@ impl Store {
         let mut state = self.state()?;
         let mut workspace = workspace(&state, name)?.clone();
         let _lease = self.lease(&workspace)?;
+        self.ensure_mounted(&workspace)?;
         let Some(pending) = &mut workspace.pending else {
             return Err(failure("workspace has no pending merge"));
         };
@@ -500,7 +974,7 @@ impl Store {
             } else {
                 resolution_path(&self.tree(&workspace.directory), path)?
             };
-            if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file())
+            if platform::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file())
                 && file_has_markers(&target)?
             {
                 return Err(failure(
@@ -654,11 +1128,7 @@ impl Store {
         let original = workspace(&state, name)?.clone();
         let _lease = self.lease(&original)?;
         branch_head(&state, &original.branch, expected)?;
-        let (original_manifest, _) = content::capture(
-            &self.tree(&original.directory),
-            &self.objects(),
-            &original.observed,
-        )?;
+        let (original_manifest, _) = self.capture_workspace(&original)?;
         let directory = self.new_native()?;
         let tree = self.tree(&directory);
         copy_tree::copy_tree(&self.tree(&original.directory), &tree, CopyMode::Auto)?;
@@ -668,7 +1138,25 @@ impl Store {
         }
         let (manifest, observed) = content::capture(&tree, &self.objects(), &observed)?;
         let mut replacement = original.clone();
-        replacement.directory = directory;
+        if matches!(original.backend, WorkspaceBackend::Projection { .. }) {
+            let (projected, projected_observed, backend) = self.detached_projection(&manifest)?;
+            replacement.directory = projected;
+            replacement.backend = backend;
+            replacement.observed = projected_observed;
+            // This unpublished SDK preparation is reproducible from the retained
+            // original and the already durable projected snapshot. Never remove
+            // user-visible generations or anything after an uncertain save.
+            fs::remove_dir_all(self.root.join("native").join(&directory))?;
+            sync_directory(&self.root.join("native"))?;
+            self.stop_projection(&original)?;
+        } else {
+            replacement.directory = directory;
+        }
+        let observed = if matches!(replacement.backend, WorkspaceBackend::Projection { .. }) {
+            replacement.observed.clone()
+        } else {
+            observed
+        };
         // Retain the entire old working generation, including uncommitted data.
         let token = new_id()?;
         state.trash.insert(
@@ -688,7 +1176,8 @@ impl Store {
                 branch: replacement.branch.clone(),
                 previous_head: Some(branch_head(&state, &replacement.branch, expected)?),
             };
-            sync_native_tree(&self.tree(&replacement.directory))?;
+            self.sync_workspace(&replacement)?;
+            replacement.observation_epoch = self.observation_epoch(&replacement)?;
             state.workspaces.insert(name.to_owned(), replacement);
             self.save(&mut state)?;
             return Ok(result);
@@ -702,12 +1191,16 @@ impl Store {
             let state = self.state()?;
             let workspace = workspace(&state, name)?.clone();
             let lease = self.lease(&workspace)?;
+            self.ensure_mounted(&workspace)?;
             (workspace, lease)
         };
         // This is a coordination lease, NOT a security sandbox. Keep the file
         // alive while waiting, but release the metadata lock for other workspaces.
+        #[cfg(unix)]
         use std::os::fd::AsRawFd;
+        #[cfg(unix)]
         use std::os::unix::process::CommandExt;
+        #[cfg(unix)]
         let descriptor = lease.as_raw_fd();
         let mut command = Command::new(program);
         command
@@ -716,6 +1209,7 @@ impl Store {
         // SAFETY: the child hook performs only async-signal-safe fcntl calls.
         // The live lease fd is inherited across exec so killing this supervising
         // process cannot silently unlock a child that is still writing.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
                 let flags = libc::fcntl(descriptor, libc::F_GETFD);
@@ -727,7 +1221,10 @@ impl Store {
                 Ok(())
             });
         }
+        #[cfg(unix)]
         let status = command.status()?;
+        #[cfg(windows)]
+        let status = platform::spawn_leased(&mut command, &lease)?.wait()?;
         drop(lease);
         Ok(status.code().unwrap_or(128))
     }
@@ -741,6 +1238,7 @@ impl Store {
             "workspace" => {
                 let workspace = workspace(&state, name)?.clone();
                 let _lease = self.lease(&workspace)?;
+                self.stop_projection(&workspace)?;
                 state.workspaces.remove(name);
                 TrashItem {
                     token: token.clone(),
@@ -790,20 +1288,37 @@ impl Store {
             None => self.restore_locked(&mut state, &item.revision, name, name, true),
             Some(old) => {
                 let _lease = self.lease(&old)?;
-                let (manifest, _) =
-                    content::capture(&self.tree(&old.directory), &self.objects(), &old.observed)?;
+                let previously_mounted = self.mount_state(&old) == "mounted";
+                let (manifest, _) = self.capture_workspace(&old)?;
+                if matches!(old.backend, WorkspaceBackend::Projection { .. }) {
+                    if mode != CopyMode::Auto {
+                        return Err(failure(
+                            "native copy policy does not apply to projected recovery",
+                        ));
+                    }
+                    return self.fork_projected_locked(
+                        &mut state,
+                        &old,
+                        &manifest,
+                        name,
+                        !previously_mounted,
+                    );
+                }
                 let directory = self.new_native()?;
                 let copy_stats =
                     copy_tree::copy_tree(&self.tree(&old.directory), &self.tree(&directory), mode)?;
                 let observed = observe_manifest(&self.tree(&directory), &manifest)?;
-                let workspace = Workspace {
+                let mut workspace = Workspace {
+                    backend: WorkspaceBackend::Native,
                     branch: name.to_owned(),
                     base_revision: old.base_revision.clone(),
                     directory,
                     observed,
+                    observation_epoch: None,
                     pending: old.pending.clone(),
                 };
                 state.branches.insert(name.to_owned(), old.base_revision);
+                workspace.observation_epoch = self.observation_epoch(&workspace)?;
                 state.workspaces.insert(name.to_owned(), workspace.clone());
                 self.save(&mut state)?;
                 let mut result = self.workspace_result(name, &workspace);
@@ -1045,6 +1560,36 @@ impl Store {
             if let Err(error) = require_directory(&self.tree(&workspace.directory)) {
                 errors.push(format!("workspace {name}: {error}"));
             }
+            if let WorkspaceBackend::Projection { revision } = &workspace.backend {
+                let generation = self.root.join("native").join(&workspace.directory);
+                for area in ["upper", "work", "lower"] {
+                    if let Err(error) = require_directory(&generation.join(area)) {
+                        errors.push(format!("workspace {name} {area}: {error}"));
+                    }
+                }
+                #[cfg(all(target_os = "linux", feature = "projection"))]
+                {
+                    let check = (|| -> Result<()> {
+                        use crate::projection::lifecycle::{self, MountState};
+                        match lifecycle::inspect(&generation)? {
+                            MountState::Unmounted => Ok(()),
+                            MountState::Partial => Err(failure("partial projection mount")),
+                            MountState::Mounted => lifecycle::verify_binding(
+                                &generation,
+                                &self.revision(revision)?.manifest,
+                            ),
+                        }
+                    })();
+                    if let Err(error) = check {
+                        errors.push(format!("workspace {name}: {error}"));
+                    }
+                }
+                #[cfg(not(all(target_os = "linux", feature = "projection")))]
+                {
+                    let _ = revision;
+                    errors.push(format!("workspace {name}: projection backend unavailable"));
+                }
+            }
         }
         let protected_directories = self.protected_directories(&state)?;
         let orphan_workspaces = names(&self.root.join("native"))?
@@ -1091,9 +1636,9 @@ impl Store {
             .collect();
         let mut reclaimable_bytes = 0;
         for hash in &unreachable_objects {
-            reclaimable_bytes += fs::symlink_metadata(self.objects().join(hash))?.len();
+            reclaimable_bytes += platform::symlink_metadata(self.objects().join(hash))?.len();
         }
-        Ok(GcPlan { dry_run: true, generation: state.generation, unreachable_objects, unreachable_revisions, orphan_workspaces, reclaimable_bytes, note: "No files deleted. All heads, workspace bases, trash, parents and state backups are protected. No permanent purge API is provided.".to_owned() })
+        Ok(GcPlan { dry_run: true, generation: state.generation, unreachable_objects, unreachable_revisions, orphan_workspaces, reclaimable_bytes, note: "No files deleted. All heads, workspace bases, projection lowers, trash, parents and state backups are protected. No permanent purge API is provided.".to_owned() })
     }
 
     pub fn stats(&self) -> Result<Stats> {
@@ -1106,7 +1651,7 @@ impl Store {
             .collect();
         let mut object_bytes = 0;
         for hash in &objects {
-            object_bytes += fs::symlink_metadata(self.objects().join(hash))?.len();
+            object_bytes += platform::symlink_metadata(self.objects().join(hash))?.len();
         }
         let mut reachable_logical_bytes = 0;
         for id in &revisions {
@@ -1248,8 +1793,16 @@ impl Store {
         Ok(matches)
     }
 
-    pub fn backend(&self) -> Result<copy_tree::NativeBackendInfo> {
-        Ok(copy_tree::native_backend_info(&self.root)?)
+    pub fn backend(&self) -> Result<crate::BackendReport> {
+        Ok(crate::BackendReport {
+            native: copy_tree::native_backend_info(&self.root)?,
+            projection: crate::ProjectionBackendInfo {
+                compiled: cfg!(all(target_os = "linux", feature = "projection")),
+                requires_root: true,
+                fuse_device_present: Path::new("/dev/fuse").try_exists()?,
+                note: "Explicit Linux FUSE/OverlayFS mounts only; device presence does not prove mount permission or kernel support. No helper is installed. External writers must be quiescent; this is not a sandbox.".into(),
+            },
+        })
     }
 
     fn listing(&self, state: &State) -> Listing {
@@ -1266,6 +1819,8 @@ impl Store {
 
     fn workspace_result(&self, name: &str, workspace: &Workspace) -> WorkspaceResult {
         WorkspaceResult {
+            backend: workspace.backend.clone(),
+            mount_state: self.mount_state(workspace),
             name: name.to_owned(),
             branch: workspace.branch.clone(),
             base_revision: workspace.base_revision.clone(),
@@ -1282,7 +1837,7 @@ impl Store {
     fn lock(&self) -> Result<File> {
         let path = self.root.join("lock");
         require_file(&path)?;
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = platform::open_read_write(&path)?;
         file.try_lock()
             .map_err(|error| failure(&format!("store_locked: {error}")))?;
         Ok(file)
@@ -1293,8 +1848,8 @@ impl Store {
         require_directory(&directory)?;
         require_directory(&directory.join("tree"))?;
         let path = directory.join("lease");
-        require_file(&path)?;
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = platform::open_lease(&path)
+            .map_err(|error| failure(&format!("workspace_busy: {error}")))?;
         file.try_lock().map_err(|error| {
             failure(&format!(
                 "workspace_busy: active exec lease or lock error: {error}"
@@ -1336,7 +1891,7 @@ impl Store {
             .join("staging")
             .join(format!("state-{}.json", new_id()?));
         write_new(&staged, &serde_json::to_vec(state)?)?;
-        fs::rename(staged, self.root.join("state.json"))?;
+        platform::rename(&staged, &self.root.join("state.json"))?;
         // An error after rename has an uncertain publication outcome. Inspect
         // generation/head before retrying; never blindly repeat a mutation.
         sync_directory(&self.root)?;
@@ -1396,7 +1951,7 @@ impl Store {
     fn new_native(&self) -> Result<String> {
         let id = new_id()?;
         let path = self.root.join("native").join(&id);
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        platform::create_dir(&path, 0o700)?;
         write_new(&path.join("lease"), b"")?;
         sync_directory(&path)?;
         sync_directory(&self.root.join("native"))?;
@@ -1461,6 +2016,9 @@ impl Store {
         for state in states {
             roots.extend(state.branches.into_values());
             for workspace in state.workspaces.into_values() {
+                if let WorkspaceBackend::Projection { revision } = workspace.backend {
+                    roots.insert(revision);
+                }
                 roots.insert(workspace.base_revision);
                 if let Some(pending) = workspace.pending {
                     roots.insert(pending.candidate_revision);
@@ -1469,12 +2027,30 @@ impl Store {
             for item in state.trash.into_values() {
                 roots.insert(item.revision);
                 if let Some(workspace) = item.workspace {
+                    if let WorkspaceBackend::Projection { revision } = workspace.backend {
+                        roots.insert(revision);
+                    }
                     roots.insert(workspace.base_revision);
                     if let Some(pending) = workspace.pending {
                         roots.insert(pending.candidate_revision);
                     }
                 }
             }
+        }
+        // Immutable generation pins also cover a mount prepared before a
+        // metadata publication that failed or whose outcome is unknown.
+        for name in names(&self.root.join("native"))? {
+            let pin = self.root.join("native").join(name).join("projection-base");
+            match platform::symlink_metadata(&pin) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+                Ok(_) => require_file(&pin)?,
+            }
+            let revision = fs::read_to_string(pin)?;
+            if !valid_hash(&revision) {
+                return Err(failure("invalid retained projection pin"));
+            }
+            roots.insert(revision);
         }
         Ok(roots.into_iter().collect())
     }
@@ -1585,6 +2161,18 @@ fn validate_state(state: &State) -> Result<()> {
 }
 
 fn validate_workspace(workspace: &Workspace) -> Result<()> {
+    if workspace
+        .observation_epoch
+        .as_ref()
+        .is_some_and(|epoch| !valid_hash(epoch))
+    {
+        return Err(failure("invalid observation session"));
+    }
+    if let WorkspaceBackend::Projection { revision } = &workspace.backend
+        && !valid_hash(revision)
+    {
+        return Err(failure("invalid projection revision"));
+    }
     validate_name(&workspace.branch)?;
     validate_name(&workspace.directory)?;
     if !valid_hash(&workspace.base_revision) {
@@ -1613,7 +2201,7 @@ fn new_id() -> Result<String> {
 
 fn require_directory(path: &Path) -> Result<()> {
     let path: PathBuf = path.components().collect();
-    if !fs::symlink_metadata(&path)?.is_dir() {
+    if !platform::symlink_metadata(&path)?.is_dir() {
         return Err(failure(&format!(
             "not a real directory: {}",
             path.display()
@@ -1623,26 +2211,25 @@ fn require_directory(path: &Path) -> Result<()> {
 }
 
 fn require_file(path: &Path) -> Result<()> {
-    if !fs::symlink_metadata(path)?.is_file() {
+    if !platform::symlink_metadata(path)?.is_file() {
         return Err(failure(&format!("not a regular file: {}", path.display())));
     }
     Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
+    Ok(platform::sync_directory(path)?)
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut file = platform::create_new(path, 0o600)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
 }
 
 fn write_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
-    match fs::symlink_metadata(path) {
+    match platform::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || fs::read(path)? != bytes {
                 return Err(failure("immutable object collision or corruption"));
@@ -1658,7 +2245,7 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
                 .ok_or_else(|| failure("object has no parent"))?;
             let temporary = parent.join(format!(".tmp-{}", new_id()?));
             write_new(&temporary, bytes)?;
-            fs::rename(temporary, path)?;
+            platform::rename(&temporary, path)?;
             sync_directory(parent)
         }
         Err(error) => Err(error.into()),
@@ -1684,10 +2271,9 @@ fn failure(message: &str) -> crate::Error {
 }
 
 fn observe_manifest(tree: &Path, manifest: &Manifest) -> Result<Observed> {
-    use std::os::unix::fs::MetadataExt;
     let mut observed = Observed::new();
     for (path, entry) in manifest {
-        let metadata = fs::symlink_metadata(tree.join(path))?;
+        let metadata = platform::symlink_metadata(tree.join(path))?;
         observed.insert(
             path.clone(),
             content::Observation {
@@ -1701,6 +2287,7 @@ fn observe_manifest(tree: &Path, manifest: &Manifest) -> Result<Observed> {
 }
 
 fn mutation_path(tree: &Path, relative: &str, allow_missing: bool) -> Result<PathBuf> {
+    platform::validate_relative_path(relative)?;
     if relative.is_empty() || relative.contains('\0') {
         return Err(failure("mutation path must be a nonempty relative path"));
     }
@@ -1721,7 +2308,7 @@ fn mutation_path(tree: &Path, relative: &str, allow_missing: bool) -> Result<Pat
         if index + 1 < count {
             require_directory(&current)?;
         } else {
-            match fs::symlink_metadata(&current) {
+            match platform::symlink_metadata(&current) {
                 Ok(_) => {}
                 Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -1735,18 +2322,23 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
     match mutation {
         Mutation::Write { path, content } => {
             let target = mutation_path(tree, path, true)?;
-            if let Ok(metadata) = fs::symlink_metadata(&target)
+            if let Ok(metadata) = platform::symlink_metadata(&target)
                 && !metadata.is_file()
             {
                 return Err(failure("write refuses symlinks and non-files"));
             }
             // This is already a private generation, so replacing a regular leaf
             // cannot expose partial data through a published workspace.
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(target)?;
+            let mut output = match platform::open_read_write(&target) {
+                Ok(file) => {
+                    file.set_len(0)?;
+                    file
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    platform::create_new(&target, 0o644)?
+                }
+                Err(error) => return Err(error.into()),
+            };
             output.write_all(content)?;
             output.sync_all()?;
         }
@@ -1755,7 +2347,7 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
         }
         Mutation::Remove { path } => {
             let target = mutation_path(tree, path, false)?;
-            if fs::symlink_metadata(&target)?.is_dir() {
+            if platform::symlink_metadata(&target)?.is_dir() {
                 fs::remove_dir_all(target)?;
             } else {
                 fs::remove_file(target)?;
@@ -1765,13 +2357,13 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
         Mutation::Move { from, to } => {
             let source = mutation_path(tree, from, false)?;
             let target = mutation_path(tree, to, true)?;
-            if fs::symlink_metadata(&target).is_ok() {
+            if platform::symlink_metadata(&target).is_ok() {
                 return Err(failure("move target already exists"));
             }
             if to.starts_with(&format!("{from}/")) {
                 return Err(failure("cannot move a directory inside itself"));
             }
-            fs::rename(source, target)?;
+            platform::rename(&source, &target)?;
             let moved: Vec<_> = observed
                 .iter()
                 .filter(|(key, _)| *key == from || key.starts_with(&format!("{from}/")))
@@ -1793,14 +2385,15 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
                 return Err(failure("edit requires exactly one matching occurrence"));
             }
             let replacement = text.replacen(old, new, 1);
-            let mut file = OpenOptions::new().write(true).truncate(true).open(target)?;
+            let mut file = platform::open_read_write(&target)?;
+            file.set_len(0)?;
             file.write_all(replacement.as_bytes())?;
             file.sync_all()?;
         }
         Mutation::Copy { from, to } => {
             let source = mutation_path(tree, from, false)?;
             let target = mutation_path(tree, to, true)?;
-            if fs::symlink_metadata(&target).is_ok() {
+            if platform::symlink_metadata(&target).is_ok() {
                 return Err(failure("copy target already exists"));
             }
             if to.starts_with(&format!("{from}/")) {
@@ -1809,14 +2402,17 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
             copy_subtree(&source, &target, &mut BTreeMap::new())?;
         }
         Mutation::Chmod { path, mode } => {
+            if cfg!(windows) {
+                return Err(failure("POSIX chmod is unsupported on Windows"));
+            }
             let target = mutation_path(tree, path, false)?;
-            if fs::symlink_metadata(&target)?.is_symlink() {
+            if platform::symlink_metadata(&target)?.is_symlink() {
                 return Err(failure("chmod refuses symlinks"));
             }
             if *mode & !0o777 != 0 {
                 return Err(failure("only ordinary permission bits are supported"));
             }
-            fs::set_permissions(target, fs::Permissions::from_mode(*mode))?;
+            platform::set_path_mode(&target, *mode)?;
         }
     }
     Ok(())
@@ -1827,12 +2423,15 @@ fn copy_subtree(
     target: &Path,
     links: &mut BTreeMap<(u64, u64), PathBuf>,
 ) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(source)?;
+    let metadata = platform::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
         std::os::unix::fs::symlink(fs::read_link(source)?, target)?;
+        #[cfg(windows)]
+        return Err(failure("Windows reparse points are unsupported"));
         #[cfg(target_os = "macos")]
         copy_tree::set_symlink_permissions(target, metadata.mode() & 0o777)?;
+        #[cfg(unix)]
         copy_tree::set_symlink_modified(
             target,
             metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
@@ -1843,8 +2442,9 @@ fn copy_subtree(
             let entry = entry?;
             copy_subtree(&entry.path(), &target.join(entry.file_name()), links)?;
         }
-        fs::set_permissions(target, fs::Permissions::from_mode(metadata.mode() & 0o777))?;
-        File::open(target)?.set_times(fs::FileTimes::new().set_modified(metadata.modified()?))?;
+        platform::set_path_mode(target, metadata.mode() & 0o777)?;
+        platform::open_directory(target)?
+            .set_times(fs::FileTimes::new().set_modified(metadata.modified()?))?;
         sync_directory(target)?;
     } else if metadata.is_file() {
         let identity = (metadata.dev(), metadata.ino());
@@ -1852,8 +2452,11 @@ fn copy_subtree(
             fs::hard_link(previous, target)?;
         } else {
             fs::copy(source, target)?;
-            fs::set_permissions(target, fs::Permissions::from_mode(metadata.mode() & 0o777))?;
-            let file = File::open(target)?;
+            platform::set_path_mode(target, metadata.mode() & 0o777)?;
+            #[cfg(unix)]
+            let file = platform::open_regular(target)?;
+            #[cfg(windows)]
+            let file = platform::open_read_write(target)?;
             file.set_times(fs::FileTimes::new().set_modified(metadata.modified()?))?;
             file.sync_all()?;
             links.insert(identity, target.to_owned());
@@ -1866,7 +2469,7 @@ fn copy_subtree(
 
 fn file_has_markers(path: &Path) -> Result<bool> {
     use std::io::Read;
-    let mut file = File::open(path)?;
+    let mut file = platform::open_regular(path)?;
     let mut buffer = [0u8; 65536];
     let mut prefix = [0u8; 7];
     let mut column = 0usize;
@@ -1893,7 +2496,7 @@ fn file_has_markers(path: &Path) -> Result<bool> {
 fn tree_has_markers(tree: &Path) -> Result<bool> {
     for entry in fs::read_dir(tree)? {
         let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let metadata = platform::symlink_metadata(entry.path())?;
         if metadata.is_dir() && tree_has_markers(&entry.path())? {
             return Ok(true);
         }
@@ -1905,6 +2508,7 @@ fn tree_has_markers(tree: &Path) -> Result<bool> {
 }
 
 fn resolution_path(tree: &Path, relative: &str) -> Result<PathBuf> {
+    platform::validate_relative_path(relative)?;
     if relative.is_empty() {
         return Ok(tree.to_owned());
     }
@@ -1923,7 +2527,7 @@ fn resolution_path(tree: &Path, relative: &str) -> Result<PathBuf> {
     for (index, part) in components.iter().enumerate() {
         current.push(part);
         if index + 1 < components.len() {
-            match fs::symlink_metadata(&current) {
+            match platform::symlink_metadata(&current) {
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => return Err(failure("conflict path has non-directory ancestor")),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1937,18 +2541,43 @@ fn resolution_path(tree: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn sync_native_tree(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = platform::symlink_metadata(path)?;
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
             sync_native_tree(&entry?.path())?;
         }
         sync_directory(path)?;
     } else if metadata.is_file() {
-        File::open(path)?.sync_all()?;
+        platform::sync_file(path)?;
     } else if !metadata.file_type().is_symlink() {
         return Err(failure(
             "special file encountered while syncing native generation",
         ));
+    }
+    Ok(())
+}
+
+/// Overlay whiteouts are namespace metadata, never device contents to open.
+#[cfg(windows)]
+fn sync_overlay_upper(_path: &Path) -> Result<()> {
+    Err(failure("projection requires Linux"))
+}
+
+#[cfg(unix)]
+fn sync_overlay_upper(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = platform::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            sync_overlay_upper(&entry?.path())?;
+        }
+        sync_directory(path)?;
+    } else if metadata.is_file() {
+        platform::sync_file(path)?;
+    } else if !(metadata.file_type().is_symlink()
+        || metadata.file_type().is_char_device() && metadata.rdev() == 0)
+    {
+        return Err(failure("unsupported special file in projection upper"));
     }
     Ok(())
 }

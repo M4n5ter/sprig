@@ -35,6 +35,11 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "copy_mode")]
     copy: bool,
 
+    /// Create a Linux CAS projection instead of materializing a native tree.
+    /// Requires the projection Cargo feature, root, FUSE and OverlayFS.
+    #[arg(long, global = true)]
+    projected: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -99,6 +104,19 @@ struct CommitOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__projection-serve", hide = true)]
+    ProjectionServe {
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        generation: String,
+    },
+    /// Mount a retained projection generation without changing its contents.
+    Mount { workspace: String },
+    /// Normally unmount a projection; busy views are retained, never forced.
+    Unmount { workspace: String },
+    /// Normally unmount an orphan generation reported by doctor; retain its data.
+    UnmountGeneration { generation: String },
     /// Initialize a store at a new directory; existing paths are not replaced.
     Init,
     /// Import a source directory into a new workspace and its initial history.
@@ -350,6 +368,31 @@ pub(crate) fn run() -> i32 {
 }
 
 fn execute(cli: &Cli) -> Result<Output, CliError> {
+    if let Command::ProjectionServe {
+        revision,
+        generation,
+    } = &cli.command
+    {
+        return serve_projection(&cli.store, revision, generation);
+    }
+    if cli.projected
+        && !matches!(
+            cli.command,
+            Command::Import { .. }
+                | Command::Fork { .. }
+                | Command::Checkout { .. }
+                | Command::Restore { .. }
+        )
+    {
+        return Err(CliError::arguments(
+            "--projected applies only to import, fork, checkout and restore",
+        ));
+    }
+    if cli.projected && (cli.copy || !matches!(cli.copy_mode, CopyOption::Auto)) {
+        return Err(CliError::arguments(
+            "--projected cannot be combined with a native copy policy",
+        ));
+    }
     if matches!(cli.command, Command::Exec { .. }) && cli.json {
         return Err(CliError::arguments(
             "--json is not supported with exec because the child inherits standard output",
@@ -362,7 +405,9 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     if let Command::RecoverState { generation } = &cli.command {
         return result(Store::recover_state(&cli.store, *generation)?);
     }
-    let store = Store::open(&cli.store)?;
+    let store = Store::open(&cli.store)?.with_projection_executable(
+        std::env::current_exe().map_err(|error| CliError::arguments(error.to_string()))?,
+    );
     let mode = if cli.copy {
         CopyMode::Copy
     } else {
@@ -372,13 +417,36 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         Command::Init | Command::RecoverState { .. } => {
             unreachable!("initialization and state recovery are handled before opening the store")
         }
-        Command::Import { source, name } => result(store.import(source, name, mode)?),
+        Command::ProjectionServe { .. } => unreachable!("FUSE worker was handled first"),
+        Command::Mount { workspace } => result(store.mount_workspace(workspace)?),
+        Command::Unmount { workspace } => result(store.unmount_workspace(workspace)?),
+        Command::UnmountGeneration { generation } => {
+            store.unmount_generation(generation)?;
+            result(json!({"generation": generation, "retained": true}))
+        }
+        Command::Import { source, name } => result(if cli.projected {
+            store.import_projected(source, name)?
+        } else {
+            store.import(source, name, mode)?
+        }),
         Command::Fork {
             workspace,
             new_name,
-        } => result(store.fork(workspace, new_name, mode)?),
-        Command::Checkout { branch, name } => result(store.checkout(branch, name)?),
-        Command::Restore { revision, name } => result(store.restore(revision, name)?),
+        } => result(if cli.projected {
+            store.fork_projected(workspace, new_name)?
+        } else {
+            store.fork(workspace, new_name, mode)?
+        }),
+        Command::Checkout { branch, name } => result(if cli.projected {
+            store.checkout_projected(branch, name)?
+        } else {
+            store.checkout(branch, name)?
+        }),
+        Command::Restore { revision, name } => result(if cli.projected {
+            store.restore_projected(revision, name)?
+        } else {
+            store.restore(revision, name)?
+        }),
         Command::Checkpoint { workspace, commit } => result(store.checkpoint(
             workspace,
             commit.message.as_deref().unwrap_or("checkpoint"),
@@ -639,6 +707,46 @@ fn report_error(machine: bool, error: &CliError) {
         }
     } else {
         eprintln!("sprig: {}", error.message);
+    }
+}
+
+fn serve_projection(
+    store: &std::path::Path,
+    revision: &str,
+    generation: &str,
+) -> Result<Output, CliError> {
+    #[cfg(all(target_os = "linux", feature = "projection"))]
+    {
+        let (objects, manifest, generation) =
+            Store::projection_snapshot(store, revision, generation)?;
+        // SAFETY: these calls have no pointer arguments and only read credentials.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if uid != 0 {
+            return Err(CliError::arguments(
+                "projection mounting currently requires root",
+            ));
+        }
+        let start_lock = sprig::projection::lifecycle::take_start_lock(&generation)?;
+        let projection = sprig::projection::Projection::new(&objects, manifest, uid, gid)?;
+        let ready = Box::new(move || {
+            let result = (|| {
+                let mut output = io::stdout().lock();
+                output.write_all(b"R")?;
+                output.flush()
+            })();
+            drop(start_lock);
+            result
+        });
+        let filesystem = sprig::projection::ReadOnlyFuse::new(projection, Some(ready));
+        sprig::projection::lifecycle::serve(filesystem, &generation)?;
+        Ok(Output::Exit(0))
+    }
+    #[cfg(not(all(target_os = "linux", feature = "projection")))]
+    {
+        let _ = (store, revision, generation);
+        Err(CliError::arguments(
+            "projection requires Linux and the projection Cargo feature",
+        ))
     }
 }
 

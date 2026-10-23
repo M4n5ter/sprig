@@ -4,17 +4,22 @@
 //! symlinks, but this is not a sandbox against concurrent ancestor replacement.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File, FileTimes, Metadata, OpenOptions};
+use std::fs::{self, File, FileTimes};
 use std::io::{self, Cursor, Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fastcdc::v2020::FastCDC;
 use serde::{Deserialize, Serialize};
+
+use crate::platform::{self, Metadata};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -58,7 +63,7 @@ pub struct Observation {
 /// Captures all entries, including the root directory at the empty-string key.
 pub fn capture(root: &Path, objects: &Path, previous: &Observed) -> Result<(Manifest, Observed)> {
     let root = normalized_root(root)?;
-    let root_metadata = fs::symlink_metadata(&root)?;
+    let root_metadata = platform::symlink_metadata(&root)?;
     if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
         return invalid("capture root must be a real directory, not a symbolic link");
     }
@@ -83,7 +88,7 @@ pub fn capture(root: &Path, objects: &Path, previous: &Observed) -> Result<(Mani
     // Flush all publications together before returning a usable manifest. Do
     // this even for dedup-only captures: an earlier failure may have left an
     // existing, fully synced chunk with an unsynced directory entry.
-    File::open(objects)?.sync_all()?;
+    platform::sync_directory(objects)?;
     Ok((manifest, observed))
 }
 
@@ -96,21 +101,22 @@ fn capture_entry(
     buffer: &mut [u8],
 ) -> Result<()> {
     validate_path(relative)?;
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = platform::symlink_metadata(path)?;
+    platform::validate_capture_metadata(path, &metadata)?;
     let kind = if metadata.file_type().is_symlink() {
         EntryKind::Symlink {
-            target: fs::read_link(path)?.as_os_str().as_bytes().to_vec(),
+            target: read_symlink(path)?,
         }
     } else if metadata.is_dir() {
         EntryKind::Directory
     } else if metadata.is_file() {
         let mut input = open_regular(path)?;
-        let before = input.metadata()?;
+        let before = platform::file_metadata(&input)?;
         if !unchanged(&metadata, &before) {
             return invalid(format!("source changed during capture: {}", path.display()));
         }
         let kind = put_reader(&mut input, objects, buffer)?;
-        let after = input.metadata()?;
+        let after = platform::file_metadata(&input)?;
         let EntryKind::File { size, .. } = &kind else {
             unreachable!()
         };
@@ -159,7 +165,7 @@ fn capture_entry(
                 buffer,
             )?;
         }
-        if !unchanged(&metadata, &fs::symlink_metadata(path)?) {
+        if !unchanged(&metadata, &platform::symlink_metadata(path)?) {
             return invalid(format!(
                 "directory changed during capture: {}",
                 path.display()
@@ -227,6 +233,7 @@ fn assign_ids(manifest: &mut Manifest, observed: &mut Observed, previous: &Obser
 /// Writes a fresh tree only. The caller owns staging and atomic publication.
 pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result<()> {
     validate_manifest(manifest)?;
+    validate_native_manifest(manifest)?;
     let target = normalized_root(target)?;
     ensure_directory_chain(
         target
@@ -236,26 +243,21 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     )?;
     ensure_directory_chain(objects)?;
     // create_dir, not create_dir_all: an existing target is never modified.
-    DirBuilder::new().mode(0o700).create(&target)?;
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+    platform::create_dir(&target, 0o700)?;
+    platform::set_path_mode(&target, 0o700)?;
     let mut directories = Vec::new();
     for (relative, entry) in manifest {
         let path = target.join(relative);
         match &entry.kind {
             EntryKind::Directory => {
                 if !relative.is_empty() {
-                    DirBuilder::new().mode(0o700).create(&path)?;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+                    platform::create_dir(&path, 0o700)?;
+                    platform::set_path_mode(&path, 0o700)?;
                 }
                 directories.push((path, entry.mode, entry.modified_ns));
             }
             EntryKind::File { size, chunks } => {
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)?;
+                let mut output = platform::create_new(&path, 0o600)?;
                 let mut written = 0_u64;
                 for hash in chunks {
                     let bytes = read_chunk(objects, hash)?;
@@ -270,13 +272,13 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
                 if written != *size {
                     return invalid(format!("chunk lengths do not match file size: {relative}"));
                 }
-                output.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+                platform::set_mode(&output, entry.mode)?;
                 output
                     .set_times(FileTimes::new().set_modified(modified_time(entry.modified_ns)?))?;
                 output.sync_all()?;
             }
             EntryKind::Symlink { target: link } => {
-                std::os::unix::fs::symlink(OsString::from_vec(link.clone()), &path)?;
+                create_symlink(link, &path)?;
                 #[cfg(target_os = "macos")]
                 set_symlink_permissions(&path, entry.mode)?;
                 crate::copy_tree::set_symlink_modified(&path, entry.modified_ns)?;
@@ -286,18 +288,17 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     // Child directories are finalized before parents, including mode-000 dirs.
     directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
     for (path, mode, modified_ns) in directories {
-        let directory = File::open(path)?;
-        directory.set_permissions(fs::Permissions::from_mode(mode))?;
+        let directory = platform::open_directory(&path)?;
+        platform::set_mode(&directory, mode)?;
         directory.set_times(FileTimes::new().set_modified(modified_time(modified_ns)?))?;
-        directory.sync_all()?;
+        platform::sync_directory_file(&directory)?;
     }
-    File::open(
+    platform::sync_directory(
         target
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new(".")),
-    )?
-    .sync_all()?;
+    )?;
     Ok(())
 }
 
@@ -325,11 +326,45 @@ pub fn read_file(entry: &Entry, objects: &Path) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// A bounded writer for one durability batch of immutable content objects.
+///
+/// Every existing object is read and hash-verified, including repeated chunks
+/// within this batch. The allocation is reused, never trusted object content.
+/// Callers must successfully call `finish` before publishing or returning a
+/// manifest containing the entries returned by `put_reader`. Dropping a batch
+/// does not make directory entries durable. An error may leave valid objects
+/// behind; retrying verifies them and `finish` syncs dedup-only batches too.
+#[must_use = "finish the batch before publishing its object references"]
+pub struct ObjectBatch {
+    objects: PathBuf,
+    buffer: Vec<u8>,
+}
+
+impl ObjectBatch {
+    pub fn open(objects: &Path) -> Result<Self> {
+        prepare_objects(objects)?;
+        Ok(Self {
+            objects: objects.to_owned(),
+            buffer: vec![0_u8; MAX_CHUNK],
+        })
+    }
+
+    pub fn put_reader(&mut self, reader: &mut impl Read) -> Result<EntryKind> {
+        put_reader(reader, &self.objects, &mut self.buffer)
+    }
+
+    /// Flush all publications, even if this batch only reused existing chunks.
+    pub fn finish(self) -> Result<()> {
+        platform::sync_directory(&self.objects)?;
+        Ok(())
+    }
+}
+
 pub fn put_bytes(bytes: &[u8], objects: &Path) -> Result<EntryKind> {
     prepare_objects(objects)?;
     let kind = put_reader(&mut Cursor::new(bytes), objects, &mut vec![0_u8; MAX_CHUNK])?;
     // Like capture, sync even when every chunk already existed.
-    File::open(objects)?.sync_all()?;
+    platform::sync_directory(objects)?;
     Ok(kind)
 }
 
@@ -377,7 +412,7 @@ fn put_reader(reader: &mut impl Read, objects: &Path, buffer: &mut [u8]) -> Resu
 fn put_chunk(bytes: &[u8], objects: &Path) -> Result<String> {
     let hash = blake3::hash(bytes).to_hex().to_string();
     let destination = objects.join(&hash);
-    match fs::symlink_metadata(&destination) {
+    match platform::symlink_metadata(&destination) {
         Ok(_) => {
             if read_chunk(objects, &hash)? != bytes {
                 return invalid("existing chunk differs from its content address");
@@ -392,14 +427,10 @@ fn put_chunk(bytes: &[u8], objects: &Path) -> Result<String> {
         std::process::id(),
         unique_id("chunk", 0, 0)
     ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let mut file = platform::create_new(&temporary, 0o600)?;
     let _cleanup = Temporary(temporary.clone());
     file.write_all(bytes)?;
-    file.set_permissions(fs::Permissions::from_mode(0o444))?;
+    platform::protect_object(&file)?;
     file.sync_all()?;
     // Linking publishes a fully synced inode without overwriting an existing
     // object. Workspace files are never hard-linked to these immutable objects.
@@ -509,6 +540,7 @@ fn validate_path(path: &str) -> Result<()> {
     if path.is_empty() {
         return Ok(());
     }
+    platform::validate_relative_path(path)?;
     if path.contains('\0')
         || path
             .split('/')
@@ -555,7 +587,10 @@ fn ensure_directory_chain(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current)?;
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = platform::symlink_metadata(&current)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return invalid(format!(
                 "directory path contains a symbolic link or non-directory: {}",
@@ -572,18 +607,20 @@ fn prepare_objects(objects: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in objects.components() {
         current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        match platform::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => return invalid("object store path contains a symbolic link or non-directory"),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                DirBuilder::new().mode(0o700).create(&current)?;
-                File::open(
+                platform::create_dir(&current, 0o700)?;
+                platform::sync_directory(
                     current
                         .parent()
                         .filter(|path| !path.as_os_str().is_empty())
                         .unwrap_or_else(|| Path::new(".")),
-                )?
-                .sync_all()?;
+                )?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -603,15 +640,51 @@ fn set_symlink_permissions(path: &Path, mode: u32) -> Result<()> {
 }
 
 fn open_regular(path: &Path) -> Result<File> {
-    // NONBLOCK prevents a concurrently substituted FIFO from blocking open.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return invalid("expected a regular file");
+    Ok(platform::open_regular(path)?)
+}
+
+#[cfg(unix)]
+fn read_symlink(path: &Path) -> Result<Vec<u8>> {
+    Ok(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn read_symlink(_path: &Path) -> Result<Vec<u8>> {
+    invalid("symbolic links are not supported on Windows")
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &[u8], path: &Path) -> Result<()> {
+    Ok(std::os::unix::fs::symlink(
+        OsString::from_vec(target.to_vec()),
+        path,
+    )?)
+}
+
+#[cfg(windows)]
+fn create_symlink(_target: &[u8], _path: &Path) -> Result<()> {
+    invalid("symbolic links are not supported on Windows")
+}
+
+fn validate_native_manifest(manifest: &Manifest) -> Result<()> {
+    #[cfg(unix)]
+    let _ = manifest;
+    #[cfg(windows)]
+    for (path, entry) in manifest {
+        let expected_mode = match entry.kind {
+            EntryKind::Directory => 0o755,
+            EntryKind::File { .. } => 0o644,
+            EntryKind::Symlink { .. } => {
+                return invalid("symbolic links are not supported on Windows");
+            }
+        };
+        if entry.mode != expected_mode || entry.modified_ns % 100 != 0 {
+            return invalid(format!(
+                "Windows cannot preserve this entry's POSIX mode or sub-100ns timestamp: {path:?}"
+            ));
+        }
     }
-    Ok(file)
+    Ok(())
 }
 
 fn same_node(left: &Metadata, right: &Metadata) -> bool {

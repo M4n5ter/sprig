@@ -4,23 +4,23 @@
 
 **用真实目录并行工作，用内容寻址历史保存值得保留的结果。**
 
-Sprig 为本地实验、构建工具和编码智能体提供独立的原生工作区，以及分支、三方合并和可恢复的编辑操作。你可以像平时一样在普通目录中使用熟悉的工具，再将结果记录为修订。历史通过 BLAKE3 寻址的 FastCDC 内容分块共享数据，无需为每次提交保存一整棵原生目录树。不依赖数据库、守护进程、FUSE 挂载或网络服务。
+Sprig 为本地实验、构建工具和编码智能体提供独立的原生工作区，以及分支、三方合并和可恢复的编辑操作。你可以像平时一样在普通目录中使用熟悉的工具，再将结果记录为修订。历史通过 BLAKE3 寻址的 FastCDC 内容分块共享数据，无需为每次提交保存一整棵原生目录树。默认的复制／reflink 后端不依赖数据库、守护进程、挂载或网络服务。可选的 Linux 投影后端则在同一套历史与分块存储之上提供挂载式工作区。
 
 Sprig 是本地单用户工具。工作区不是沙箱，检查点也不能为运行中的数据库提供一致性快照。
 
 ## 核心模型
 
-- **存储库（store）：** 一个目录，容纳历史、分支引用、原生工作区和恢复记录。
+- **存储库（store）：** 一个目录，容纳历史、分支引用、工作区和恢复记录。
 - **修订（revision）：** 不可变的清单，包含父修订 ID、逻辑时钟和提交说明。清单中的每个条目记录逻辑身份、类型、普通 Unix 权限及修改时间；文件内容表示为有序分块哈希列表。
 - **分支（branch）：** 指向某个修订的可移动名称。修订组成有向无环图，普通合并可以有两个父修订。
 - **工作区（workspace）：** 关联某个分支和基准修订的真实目录。多个工作区可以共用一个分支，当前文件也可以与已记录的基准不同。
-- **工作代（generation）：** 工作区背后的一棵原生目录树。托管编辑发布新的一代，同时保留上一代供恢复。
+- **工作代（generation）：** 工作区背后的一棵目录树，可以是原生目录或投影视图。托管编辑发布新的一代，同时保留上一代供恢复。
 
 原生克隆与内容去重解决不同的问题。支持克隆的文件系统可以先不复制文件的数据块，就生成可独立写入的工作文件；分块存储则让历史中的相同内容共享数据。两者都不会消除目录扫描、哈希计算、元数据处理或保留工作代的开销。
 
 ## 构建并体验
 
-需要 Linux 或 macOS、带有 C 链接器的 Rust 工具链，以及 POSIX shell。在仓库根目录执行下面的完整示例。它会在临时目录中自行创建一个小项目和新的存储库，不需要准备已有项目。
+使用带有 C 链接器的 stable Rust 构建。下面的示例适用于 Linux 或 macOS 的 POSIX shell；Windows 的[原生复制子集与构建要求](#windows-原生工作区)见后文。在仓库根目录执行下面的完整示例。它会在临时目录中自行创建一个小项目和新的存储库，不需要准备已有项目。
 
 ```sh
 cargo build --locked --release
@@ -69,6 +69,54 @@ printf '\nDemo retained at: %s\n' "$DEMO"
 
 这些命令不会覆盖已有工作区。历史引用可以是完整修订 ID、分支名或 `workspace:NAME`。显式工作区引用表示其**已提交的基准修订**，不包含未提交文件。`merge OURS THEIRS OUTPUT` 中，OURS 必须是分支，THEIRS 可以是任意历史引用。
 
+## 可选的 Linux 投影后端
+
+使用 `cargo build --locked --release --features projection` 构建，在 `import`、`fork`、`checkout` 或 `restore` 时加上 `--projected`。不加此选项时，创建操作使用现有原生后端；但派生或恢复投影工作区会保留其后端，无需再次指定该选项。macOS 和 Windows 不支持投影；各平台仍默认使用原生工作区。
+
+投影工作代由不可变修订的只读 FUSE 视图与 OverlayFS 可写上层目录组成。文件内容按需从现有 BLAKE3 分块存储读取，验证后进入每个视图最多 16 MiB 的缓存，不另设历史格式。检查点只有在能够证明下层来源以及没有上层变更时才复用下层内容；修改过或无法证明的文件会重新哈希。普通检查点推进分支，但不会更换该工作代固定引用的下层修订，也不会丢弃上层数据。
+
+### 环境要求与示例
+
+投影目前要求**显式以 root 身份执行**、可以访问 `/dev/fuse`、内核支持 FUSE 与 OverlayFS，并有权挂载这两种文件系统。上层所在文件系统也必须支持 OverlayFS；受限容器中的 root 身份本身并不足够。存储库应归 root 所有并保持私有，只运行可信程序：`exec` 不是沙箱，也不会降权。Sprig 不安装特权辅助程序、系统服务或持久权限变更。每个已挂载视图有一个 Sprig FUSE 工作进程，持续到卸载为止。
+
+仅在隔离、可丢弃的 Linux 测试主机上运行以下示例。它新建独立的 root 所有存储库，结束时正常卸载两个视图，但保留数据：
+
+```sh
+cargo build --locked --release --features projection
+sudo env SPRIG="$PWD/target/release/sprig" sh <<'SH'
+set -eu
+DEMO="$(mktemp -d /var/tmp/sprig-projection.XXXXXX)"
+STORE="$DEMO/store"
+mkdir "$DEMO/source"
+printf 'hello\n' > "$DEMO/source/note.txt"
+s() { "$SPRIG" --store "$STORE" "$@"; }
+s init
+s --projected import "$DEMO/source" main
+s fork main experiment
+s exec experiment -- sh -c 'printf "experiment\n" >> note.txt'
+s checkpoint experiment -m 'Record projected edits'
+s diff-files main experiment
+s show experiment
+s unmount experiment
+s mount experiment
+s exec experiment -- cat note.txt
+s unmount experiment
+s unmount main
+s doctor
+printf '\nDemo retained at: %s\n' "$DEMO"
+SH
+```
+
+### 挂载、占用与恢复
+
+- `show`、`list` 和 `status` 报告后端及挂载状态。`mount NAME` 重新打开保留的工作代；需要访问文件的操作也会挂载尚未挂载的投影。`show` 本身不会挂载；直接打开未挂载的路径前，应先运行 `mount`。部分挂载或无效挂载会报错，不会被当作空目录。
+- 创建检查点前停止外部写入；卸载或替换工作代前关闭文件句柄，并让进程离开相关工作目录。`exec` 租约只协调 Sprig 操作，无法阻止其他应用读写。
+- `unmount NAME` 只执行正常卸载，绝不强制或延迟卸载。挂载被占用时会失败，不会强制清理。若仅卸载了一部分，应检查 `show` 和 `doctor`，关闭仍在使用视图的程序，再正常卸载后重新挂载。保留的上层数据不会被删除。
+- 托管编辑与落后工作区的合并会创建替代工作代并保留旧代，发布前必须正常卸载旧视图，因此占用可能阻止发布。之后应重新查询路径。
+- `drop workspace NAME` 先正常卸载，再移入可恢复回收区。`recover TOKEN NAME` 保留原条目、恢复原挂载状态，并创建新的投影工作区。对于回收条目中保留的工作代或 `doctor` 报告的孤立工作代，可用 `unmount-generation GENERATION` 正常卸载而不删除数据。启动失败可能留下工作代与诊断日志；重试前先检查，不要直接删除挂载下的目录。
+
+投影拒绝 1970 年之前的修改时间和超过 4,095 字节的符号链接目标，并遵守下文关于可信、停止外部写入的目录树与元数据的限制。挂载、崩溃恢复和性能取决于具体主机；仅通过单元测试不能证明其在特定内核或文件系统上的表现。
+
 ## 常见工作流
 
 ### 使用熟悉的工具编辑
@@ -81,9 +129,9 @@ s read experiment notes.txt
 s blame experiment notes.txt
 ```
 
-`show` 的 `path` 字段给出原生目录。你可以用编辑器打开它、在其中构建，或通过 `exec` 运行程序。外部编辑只有在执行检查点后才进入历史；`commit` 是 `checkpoint` 的别名。清单没有变化时，检查点会复用当前修订，即使提供了不同的提交说明也不会另建修订。
+`show` 的 `path` 字段给出工作区目录。你可以用编辑器打开它、在其中构建，或通过 `exec` 运行程序。外部编辑只有在执行检查点后才进入历史；`commit` 是 `checkpoint` 的别名。清单没有变化时，检查点会复用当前修订，即使提供了不同的提交说明也不会另建修订。
 
-**托管编辑后，或检查点合并了落后于分支的工作区后，应重新查询路径。** 当前工作代可能已改变。切换工作代时暂停外部读写，之后重新打开当前路径。旧路径和已打开的文件句柄可能仍指向保留的上一代。
+**托管编辑后，或检查点合并了落后于分支的工作区后，应重新查询路径。** 当前工作代可能已改变。切换工作代时暂停外部读写，之后重新打开当前路径。对于原生工作区，旧路径和已打开的文件句柄可能仍指向保留的上一代；替换投影视图则必须先正常卸载旧视图。
 
 `exec` 在工作区目录中运行程序，继承标准输入、输出和错误，并返回子进程的退出状态。运行期间，租约阻止 Sprig 对该工作区执行托管变更。它不会自动创建检查点、停止其他应用，也不会限制文件系统或网络访问。
 
@@ -164,7 +212,7 @@ python3 examples/compare.py --binary target/release/sprig --require-clone
 
 ## 命令参考
 
-在命令前指定 `--store PATH`。`--json` 和 `--copy-mode` 是全局选项。运行 `sprig --help` 或 `sprig --store PATH COMMAND --help` 查看语法。名称由 1–96 个 ASCII 字母、数字、下划线或连字符组成。托管路径相对于工作区；绝对路径和向父目录逃逸的路径会被拒绝。
+在命令前指定 `--store PATH`。`--json`、`--copy-mode` 和 `--projected` 是全局选项，但 `--projected` 只接受前文列出的四种创建命令。运行 `sprig --help` 或 `sprig --store PATH COMMAND --help` 查看语法。名称由 1–96 个 ASCII 字母、数字、下划线或连字符组成。托管路径相对于工作区；绝对路径和向父目录逃逸的路径会被拒绝。
 
 ```text
 # 工作区与分支
@@ -183,6 +231,9 @@ show WORKSPACE
 list
 status
 exec WORKSPACE -- PROGRAM [ARGS...]
+mount WORKSPACE
+unmount WORKSPACE
+unmount-generation GENERATION
 
 # 不可变历史与内容
 log [REFERENCE]
@@ -216,13 +267,13 @@ backend
 
 ### 复制策略
 
-导入、工作区派生以及从原生工作区目录树恢复时：
+使用原生后端导入、派生，以及从原生工作区目录树恢复时：
 
 - `--copy-mode auto`（默认）：尝试原生克隆，不支持时回退到普通复制。
 - `--copy-mode copy`，或 `--copy`：只使用普通复制。
 - `--copy-mode clone`：只要有一个普通文件无法原生克隆，操作就失败。
 
-检出、修订还原以及已丢弃分支的恢复会从分块重建文件，因此不使用这些策略。托管编辑使用自动克隆或复制。`backend` 描述的是能力，不代表某一对路径一定能成功克隆；仍取决于源与目标所在文件系统的支持情况。
+检出、修订还原以及已丢弃分支的恢复会从分块重建文件，因此不使用这些策略。创建或恢复投影工作区同样不使用这些策略。托管编辑先用自动克隆或复制准备变更，再发布到工作区所选的后端。`backend` 描述的是能力，不代表某一对路径一定能成功克隆；仍取决于源与目标所在文件系统的支持情况。Windows 只支持普通复制：`auto` 和 `copy` 可用，严格 `clone` 会失败。
 
 ### 读取与检查历史
 
@@ -234,7 +285,7 @@ backend
 
 ### 托管事务与 Rust API
 
-七个托管编辑命令共用 `Store::apply`。它们在私有原生工作代中编辑，将已有未提交编辑一起捕获，并把上一棵目录树保留在可恢复的回收区中。通常工作区与分支头一起发布，返回 `committed: true`；等待解决冲突时则按前文所述处理。
+七个托管编辑命令共用 `Store::apply`。它们在私有原生目录树中准备编辑，将已有未提交编辑一起捕获，并把上一工作代保留在可恢复的回收区中。投影工作区在准备完毕后发布新的投影工作代；这条路径仍会生成实际的工作文件。通常工作区与分支头一起发布，返回 `committed: true`；等待解决冲突时则按前文所述处理。
 
 `write --file` 接受任意字节；`--text` 不追加换行。`edit` 要求 UTF-8 文本中的 OLD 恰好匹配一次。`cp` 和 `mv` 的目标必须是一个尚不存在的精确路径。`chmod` 接受 `644`、`0755` 等普通八进制权限位。库调用者可以将多个变更放入一个事务：
 
@@ -261,6 +312,8 @@ fn add_notes(store: &Store) -> sprig::Result<()> {
 }
 ```
 
+库调用者使用投影时，还必须通过 `Store::with_projection_executable` 配置 Sprig 可执行文件，并满足相同的挂载要求。CLI 会自动配置自身可执行文件。
+
 ### JSON 与退出状态
 
 `--json` 将结果或错误作为一个格式化 JSON 对象输出到标准输出：
@@ -284,9 +337,9 @@ fn add_notes(store: &Store) -> sprig::Result<()> {
 
 ## 恢复与存储
 
-`drop workspace NAME` 保留原生目录树，包括未提交文件，同时保留分支。执行 `drop branch NAME` 前，必须先丢弃关联工作区。`list` 提供准确的回收条目令牌。`recover TOKEN NAME` 创建新工作区和分支，不消耗原恢复条目。恢复已丢弃分支时重建其已提交修订；恢复已丢弃工作区时保留其当时的目录树。
+`drop workspace NAME` 保留工作代，包括未提交文件，同时保留分支。执行 `drop branch NAME` 前，必须先丢弃关联工作区。`list` 提供准确的回收条目令牌。`recover TOKEN NAME` 创建新工作区和分支，不消耗原恢复条目。恢复已丢弃分支时重建其已提交修订；恢复已丢弃工作区时保留其当时的目录树。
 
-`doctor` 检查元数据和引用的内容哈希，报告孤立修订、原生工作代和暂存条目，不自动修复或删除。`gc` **只生成预演计划**，即使省略 `--dry-run` 也不会删除。它保守地将分支头、工作区基准、待解决候选、回收条目、修订祖先和元数据备份都作为保留根。没有永久清除命令。
+`doctor` 检查元数据和引用的内容哈希，报告孤立修订、工作代和暂存条目，不自动修复或删除。`gc` **只生成预演计划**，即使省略 `--dry-run` 也不会删除。它保守地将分支头、工作区基准、固定引用的不可变投影下层、待解决候选、回收条目、修订祖先和元数据备份都作为保留根。没有永久清除命令。
 
 `recover-state GENERATION` 恢复经过验证的元数据备份，即使当前元数据无法正常打开也可使用；当前状态的原始字节会保留供检查。这可能使引用退回较早位置，并让之后的数据不再被引用。它不是普通的内容回滚：应先做好独立备份，谨慎选择 `backups` 中的代号，恢复后运行 `doctor`。
 
@@ -296,31 +349,71 @@ STORE/
   lock                # 元数据协作锁
   objects/HASH        # 不可变内容分块
   revisions/HASH.json.zst # 压缩的不可变修订清单及父修订
-  native/GENERATION/  # 原生工作目录树与租约文件
+  native/GENERATION/  # 原生树或投影 lower/upper/work/tree，以及租约文件
   staging/            # 未发布数据和保留的恢复记录
   backups/            # 压缩的历史元数据代
 ```
 
-修订清单和元数据备份采用带校验的 Zstandard 无损压缩。修订 ID 仍对原始 JSON 字节计算哈希；读取时验证压缩帧和修订哈希，不通过丢弃历史或恢复根来节省空间。当前的 `state.json` 保持未压缩。每个新分块文件独立同步，目录项也会在捕获操作返回内容引用之前完成同步。捕获操作在文件之间复用一个 256 KiB I/O 缓冲区，但不复用文件内容：即使大小和 mtime 没变，仍会读取每个文件并验证每个已有分块。
+修订清单和元数据备份采用带校验的 Zstandard 无损压缩。修订 ID 仍对原始 JSON 字节计算哈希；读取时验证压缩帧和修订哈希，不通过丢弃历史或恢复根来节省空间。当前的 `state.json` 保持未压缩。每个新分块文件独立同步，目录项也会在捕获操作返回内容引用之前完成同步。原生捕获在文件之间复用一个 256 KiB I/O 缓冲区，但不复用文件内容：即使大小和 mtime 没变，仍会读取每个文件并验证每个已有分块。投影捕获则采用前文所述的下层来源检查。
 
 `stats.object_bytes` 汇总所有已存分块的字节数，包括未被引用的对象。`reachable_logical_bytes` 累加受保护修订中的文件长度，相同内容在不同修订中会重复计入。二者都不是总物理磁盘占用。保留的目录树和备份会有意占用空间。
 
-不支持的存储结构（schema）会被拒绝，存储库保持不变。存储格式和 API 均无兼容性保证，请保留独立备份。
+当前存储结构（schema）为 **4**。旧版或其他不支持的结构会被拒绝，不自动迁移或修改。请为此版本新建存储库；存储格式和 API 均无兼容性保证，应保留独立备份。
 
 ## 保证与边界
 
 - 工作区之间不共享硬链接。原生克隆可以独立写入。导入和派生时，源硬链接会变成具有不同逻辑身份的独立文件；相同内容仍可共享历史分块。
 - 存储库级协作锁协调 Sprig 的元数据发布，不会冻结其他程序。导入、派生和检查点应使用可信且停止外部写入的目录树。源变更检查只能检测部分竞态，无法检测所有外部写入或恶意祖先路径替换。
-- 支持普通文件、目录和符号链接。复制和捕获保留符号链接本身，不跟随目标；之后打开这些链接仍可能访问工作区之外的位置。拒绝特殊文件和非 UTF-8 条目名。源根目录不能是符号链接，源目录与存储库也不能互相包含。
-- 保留普通 Unix 权限，包括可执行位，并在文件系统时间精度允许的范围内保留记录的修改时间。去掉特殊权限位。不保留所有者、访问或状态变更时间、ACL、扩展属性以及稀疏布局。
+- Unix 支持普通文件、目录和符号链接。复制和捕获保留符号链接本身，不跟随目标；之后打开这些链接仍可能访问工作区之外的位置。拒绝特殊文件和非 UTF-8 条目名。源根目录不能是符号链接，源目录与存储库也不能互相包含。Windows 拒绝所有重解析点，包括符号链接和目录联接。
+- Unix 上保留普通权限，包括可执行位，并在文件系统时间精度允许的范围内保留记录的修改时间。去掉特殊权限位。不保留所有者、访问或状态变更时间、ACL、扩展属性以及稀疏布局。
 - 发布会同步数据并原子替换存储元数据，但不能保证抵御所有文件系统、内核、硬件或断电故障。发布后的报错可能意味着变更实际上已生效；重试前检查 `status`、`list` 和 `doctor`。
-- 失败尝试可能留下未发布对象或原生工作代，不会自动清除。请保持底层存储私有且不被直接修改：不可变性是工具契约，无法阻止操作系统所有者手动改写存储文件。
+- 失败尝试可能留下未发布对象或工作代，不会自动清除。请保持底层存储私有且不被直接修改：不可变性是工具契约，无法阻止操作系统所有者手动改写存储文件。
 
 ## 平台与开发
 
-仓库使用 **stable Rust**，包含 rustfmt 和 Clippy。Cargo 声明的最低 Rust 版本为 **1.89**，这不是固定的开发工具链版本。Linux 使用 `FICLONE`，macOS 使用 `fclonefileat`。两者都是逐文件克隆，不是整树快照或 Btrfs 子卷快照。是否支持克隆取决于文件系统。不支持 Windows。
+仓库使用 **stable Rust**，包含 rustfmt 和 Clippy。Cargo 声明的最低 Rust 版本为 **1.89**，这不是固定的开发工具链版本。Linux 使用 `FICLONE`，macOS 使用 `fclonefileat`。两者都是逐文件克隆，不是整树快照或 Btrfs 子卷快照。是否支持克隆取决于文件系统。Windows 使用普通复制，限制见下文。
 
 [CI](.github/workflows/ci.yml) 在 Linux 和 macOS 上运行 stable Rust。macOS 作业设置 `SPRIG_REQUIRE_REFLINK=1`，要求实际 APFS 克隆成功并验证写入隔离。Linux 测试普通路径与回退路径；通过测试不代表该运行环境支持 reflink。示例也在 CI 中执行，macOS 额外要求严格克隆。
+
+### Windows 原生工作区
+
+Windows 后端支持**本地 NTFS 磁盘上的可写普通文件与目录**，使用普通复制；不支持其他 Windows 文件系统。构建需要 stable Rust 的 MSVC 工具链，以及包含 Windows SDK 的 Visual Studio C++ 构建工具；Zstandard 依赖需要 C 编译器。运行原生工作区不需要文件系统驱动或管理员权限。
+
+在仓库根目录执行以下 PowerShell 示例：
+
+```powershell
+cargo build --locked --release
+$Sprig = Join-Path $PWD 'target\release\sprig.exe'
+$Demo = Join-Path ([IO.Path]::GetTempPath()) ('sprig-demo-' + [guid]::NewGuid().ToString('N'))
+$Source = Join-Path $Demo 'source'
+$Store = Join-Path $Demo 'store'
+New-Item -ItemType Directory -Path $Source -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $Source 'note.txt'), "hello`n")
+function s { & $Sprig --store $Store @args; if ($LASTEXITCODE) { throw 'Sprig failed' } }
+s init
+s import $Source main
+s fork main experiment
+s write experiment note.txt --text 'hello from Windows' -m 'Edit copy'
+s exec experiment -- cmd /c type note.txt
+s diff-files main experiment
+s doctor
+Write-Output "Demo retained at: $Demo"
+```
+
+Windows 对不支持的行为明确报错，不做静默转换：
+
+- 不支持原生克隆、Linux 投影或 POSIX `chmod`。支持普通 `exec`，外部修改仍需显式创建检查点。
+- 拒绝重解析点，包括符号链接和目录联接，不跟随它们遍历。拒绝 UNC、设备与驱动器相对路径、保留名称、备用数据流路径语法以及不支持的路径别名。请使用普通本地 NTFS 路径和 UTF-8 名称。
+- 文件或目录若包含命名 NTFS 数据流，包括 `Zone.Identifier`，会在捕获或复制前被拒绝，不会静默丢弃这些数据流。
+- 捕获时目录记为 `0755`，可写文件记为 `0644`，只读文件会被拒绝。还原时拒绝其他权限模式或精度细于 100 ns 的时间戳，避免静默丢失已记录元数据，因此跨平台还原历史存在限制。
+- 新目录继承 Windows ACL；Unix 私有权限位不等于 ACL 安全保证。请将存储库放在仅自己的账户可访问的位置。
+- 普通文件会被刷新，元数据替换采用写穿重命名。这里没有等价的目录 fsync 保证，不宣称与 Unix 后端具有相同的断电后目录命名空间持久性。
+
+Windows 的 `exec` 通过继承的独占访问文件句柄维持租约。在多线程 SDK 宿主中，若其他线程恰好在短暂的句柄继承窗口内绕过 Sprig 启动子进程，该子进程也可能保留租约，使 `workspace_busy` 持续更久。应等这些子进程退出；Sprig 不会强行解除租约，也不提供沙箱。
+
+Windows 实机运行验证仍待完成。已实现的子集不代表完整平台对等，也不代表 Windows 测试已通过。
+
+### 开发检查
 
 对这个独立 Cargo 项目，适用之处遵循 [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html)。
 
@@ -329,8 +422,18 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 
+# Linux 投影代码与无需挂载的测试；通过不代表支持实际挂载。
+cargo test --locked --features projection
+
 # 仅在支持原生克隆后端的文件系统上执行。
 SPRIG_REQUIRE_REFLINK=1 cargo test --locked
+```
+
+按需运行的[实际挂载工作流](tests/projection_workflow.py)需要 Python 3，以及具备前述挂载权限、隔离且可丢弃的 Linux 测试环境。它创建独立测试存储库，失败时保留现场，绝不强制或延迟卸载：
+
+```sh
+cargo build --locked --features projection
+sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 ```
 
 CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。项目尚未选择许可证。

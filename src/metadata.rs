@@ -5,9 +5,7 @@
 //! fast slice-based parsing, just as plain JSON metadata did. Store contents
 //! must remain trusted; document size and model allocations are not bounded.
 
-use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -34,10 +32,7 @@ pub(crate) fn encode(bytes: &[u8]) -> Result<Vec<u8>> {
 pub(crate) fn read<T: DeserializeOwned>(path: &Path) -> Result<(T, blake3::Hash)> {
     // Do not follow a replaced leaf symlink or block opening a substituted FIFO.
     // Ancestor paths still require the store's trusted, single-user ownership.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let file = crate::platform::open_regular(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

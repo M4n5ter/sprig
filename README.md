@@ -8,15 +8,17 @@ Sprig gives local experiments, build tools and coding agents independent native
 workspaces with branches, three-way merges and recoverable edits. Work in an
 ordinary directory with your usual tools, then record a revision. History shares
 BLAKE3-addressed, FastCDC content chunks instead of storing another full native
-tree for every commit. There is no database, daemon, FUSE mount or network service.
+tree for every commit. The default copy/reflink backend needs no database, daemon,
+mount or network service. An optional Linux projection backend provides a mounted
+workspace over the same history and chunk store.
 
 Sprig is a local, single-user tool. A workspace is not a sandbox, and a checkpoint
 is not a consistent snapshot of a live database.
 
 ## The model
 
-- **Store:** a directory containing history, branch references, native workspaces
-  and recovery records.
+- **Store:** a directory containing history, branch references, workspaces and
+  recovery records.
 - **Revision:** an immutable manifest with parent IDs, a logical clock and a
   message. Each entry records its logical identity, type, ordinary Unix mode and
   modification time; file content is an ordered list of chunk hashes.
@@ -24,8 +26,8 @@ is not a consistent snapshot of a live database.
   graph; a normal merge can have two parents.
 - **Workspace:** a real directory attached to a branch and a base revision.
   Multiple workspaces can share a branch. Files may differ from the recorded base.
-- **Generation:** one native tree behind a workspace. Managed edits publish a
-  new generation and retain the previous one for recovery.
+- **Generation:** one working tree behind a workspace, either native or projected.
+  Managed edits publish a new generation and retain the previous one for recovery.
 
 Native cloning and content deduplication solve different problems. A supported
 filesystem can clone a working file without copying its payload immediately.
@@ -34,8 +36,9 @@ hashing, metadata or retained native generations free.
 
 ## Build and try it
 
-Requirements: Linux or macOS, a Rust toolchain with a C linker, and a POSIX shell.
-Run the following block from this repository. It creates its own tiny source
+Build with stable Rust and a C linker. The following examples use a POSIX shell
+on Linux or macOS; Windows has a [native-copy subset](#windows-native-workspaces)
+with its own requirements below. Run this block from the repository. It creates its own tiny source
 project and a fresh store in a temporary directory; no existing project is needed.
 
 ```sh
@@ -94,6 +97,90 @@ full revision IDs, branch names or `workspace:NAME`. The explicit workspace form
 means its **committed base**, never its uncommitted files. `merge OURS THEIRS OUTPUT`
 requires OURS to be a branch; THEIRS may be any history reference.
 
+## Optional Linux projection
+
+Build with `cargo build --locked --release --features projection`, then add
+`--projected` to `import`, `fork`, `checkout` or `restore`. Without this option,
+creation uses the existing native backend. Forking or recovering a projected
+workspace preserves its backend even without the option. Projection is not
+available on macOS or Windows. Native workspaces remain the default.
+
+A projected generation combines a read-only FUSE view of an immutable revision
+with an OverlayFS writable upper directory. File contents are read from the
+existing BLAKE3 chunk store on demand, verified before entering a 16 MiB cache per
+view. There is no separate history format. Checkpoint reuses lower content only
+when its provenance and absence of upper changes are proven; changed or uncertain
+files are hashed. An ordinary checkpoint advances the branch without changing
+that generation's immutable lower pin or discarding its upper data.
+
+### Requirements and example
+
+Projection currently requires **explicit root execution**, accessible `/dev/fuse`,
+kernel FUSE and OverlayFS support, and permission to mount both filesystems.
+The upper filesystem must support OverlayFS. Root inside a restricted container
+is not enough. Keep the store root-owned and private, and use trusted programs:
+`exec` is not a sandbox and does not drop privileges. Sprig installs no privileged
+helper, system service or persistent permission changes. One Sprig FUSE worker
+runs for each mounted view until it is unmounted.
+
+Run the following example only on an isolated, disposable Linux test host. It
+creates a separate root-owned store, leaves its data in place and normally unmounts
+both views at the end:
+
+```sh
+cargo build --locked --release --features projection
+sudo env SPRIG="$PWD/target/release/sprig" sh <<'SH'
+set -eu
+DEMO="$(mktemp -d /var/tmp/sprig-projection.XXXXXX)"
+STORE="$DEMO/store"
+mkdir "$DEMO/source"
+printf 'hello\n' > "$DEMO/source/note.txt"
+s() { "$SPRIG" --store "$STORE" "$@"; }
+s init
+s --projected import "$DEMO/source" main
+s fork main experiment
+s exec experiment -- sh -c 'printf "experiment\n" >> note.txt'
+s checkpoint experiment -m 'Record projected edits'
+s diff-files main experiment
+s show experiment
+s unmount experiment
+s mount experiment
+s exec experiment -- cat note.txt
+s unmount experiment
+s unmount main
+s doctor
+printf '\nDemo retained at: %s\n' "$DEMO"
+SH
+```
+
+### Mounts, busy views and recovery
+
+- `show`, `list` and `status` report the backend and mount state. `mount NAME`
+  reopens the retained generation; operations that need its files also mount an
+  unmounted projection. `show` itself does not mount: run `mount` before opening
+  an unmounted path directly. A partial or invalid mount is an error, not an empty tree.
+- Stop external writers before checkpointing. Close open files and leave working
+  directories before unmounting or replacing a generation. `exec` leases coordinate
+  Sprig operations only; they cannot stop unrelated applications.
+- `unmount NAME` uses normal unmounts, never forced or lazy detach. A busy mount
+  causes failure rather than forced cleanup. If only part of the view unmounted,
+  inspect `show` and `doctor`, close remaining users, then retry normal unmount
+  before remounting. Retained upper data is not deleted.
+- Managed edits and stale-workspace merges create replacement generations and
+  retain the old one. They must normally unmount the old view before publication;
+  a busy view can therefore prevent publication. Re-query the path afterward.
+- `drop workspace NAME` normally unmounts before moving the workspace to recoverable
+  trash. `recover TOKEN NAME` retains the original, restores its previous mount
+  state, and creates a new projected workspace. Use `unmount-generation GENERATION`
+  for a retained generation listed in trash or an orphan reported by `doctor`; it
+  removes mounts normally without deleting data. Failed startup can leave retained generations and diagnostic logs;
+  inspect them before retrying rather than removing directories under a mount.
+
+Projection rejects pre-1970 modification times and symlink targets longer than
+4,095 bytes. It shares the trusted, quiescent-tree and metadata limits described
+below. Mounting, crash recovery and performance depend on the host; unit tests
+alone do not establish their behavior on a particular kernel or filesystem.
+
 ## Everyday workflows
 
 ### Edit with your usual tools
@@ -106,15 +193,16 @@ s read experiment notes.txt
 s blame experiment notes.txt
 ```
 
-`show` returns the native directory in `path`. Open it in an editor, build there,
+`show` returns the workspace directory in `path`. Open it in an editor, build there,
 or use `exec`. External edits become history only when you checkpoint; `commit`
 is an alias. A checkpoint with an unchanged manifest reuses the current revision,
 even if you supply a different message.
 
 **Look up the path again after a managed edit or a checkpoint that merges a stale
 workspace.** The active generation can change. Pause external readers and writers
-while changing generations, then reopen the current path. Old paths and open file
-handles can still point to a retained generation.
+while changing generations, then reopen the current path. For native workspaces,
+old paths and open handles can still point to a retained generation. Projected
+replacements require normal unmount of the old view.
 
 `exec` inherits standard input, output and error, runs in the workspace directory
 and returns the child's exit status. Its lease excludes Sprig's managed mutations
@@ -254,8 +342,9 @@ competing changes. Use the default conflict strategy when that would be unsafe.
 
 ## Command reference
 
-Put `--store PATH` before the command. `--json` and `--copy-mode` are global
-options. Use `sprig --help` or `sprig --store PATH COMMAND --help` for syntax.
+Put `--store PATH` before the command. `--json`, `--copy-mode` and `--projected`
+are global options; `--projected` is accepted only for the four creation commands
+listed above. Use `sprig --help` or `sprig --store PATH COMMAND --help` for syntax.
 Names contain 1–96 ASCII letters, digits, underscores or hyphens. Managed paths
 are workspace-relative; absolute paths and parent-directory escapes are rejected.
 
@@ -276,6 +365,9 @@ show WORKSPACE
 list
 status
 exec WORKSPACE -- PROGRAM [ARGS...]
+mount WORKSPACE
+unmount WORKSPACE
+unmount-generation GENERATION
 
 # Immutable history and contents
 log [REFERENCE]
@@ -309,16 +401,19 @@ backend
 
 ### Copy policy
 
-For import, fork and recovery of a native workspace tree:
+For native import, fork and recovery of a native workspace tree:
 
 - `--copy-mode auto` (default): try native cloning; fall back to ordinary copying.
 - `--copy-mode copy`, or `--copy`: use ordinary copying only.
 - `--copy-mode clone`: fail if any regular file cannot be natively cloned.
 
 Checkout, revision restore and recovery of a dropped branch reconstruct files
-from chunks, so the policy does not apply. Managed edits use automatic clone/copy.
+from chunks, so the policy does not apply. Projected creation and projected
+workspace recovery do not use this policy. Managed edits prepare changes with
+automatic clone/copy before publishing the workspace backend.
 `backend` describes capabilities, not proof that a particular pair of paths can
-clone. Source and destination filesystem support still matters.
+clone. Source and destination filesystem support still matters. Windows supports
+ordinary copying only: `auto` and `copy` work; strict `clone` fails.
 
 ### Reading and inspecting history
 
@@ -344,11 +439,12 @@ attribution.
 
 ### Managed transactions and the Rust API
 
-The seven managed edit commands share `Store::apply`. They edit a private native
-generation, include existing uncommitted edits in the capture, and retain the
-previous tree in recoverable trash. Normally the workspace and branch head publish
-together with `committed: true`. Pending conflict resolution is the exception
-described above.
+The seven managed edit commands share `Store::apply`. They prepare edits in a
+private native tree, include existing uncommitted edits in the capture, and retain
+the previous generation in recoverable trash. Projected workspaces publish a new
+projected generation after preparation; this path still materializes working files.
+Normally the workspace and branch head publish together with `committed: true`.
+Pending conflict resolution is the exception described above.
 
 `write --file` accepts arbitrary bytes; `--text` adds no newline. `edit` requires
 exactly one match of OLD in UTF-8 text. `cp` and `mv` require a new exact destination
@@ -377,6 +473,10 @@ fn add_notes(store: &Store) -> sprig::Result<()> {
     Ok(())
 }
 ```
+
+Library callers using projection must also configure the Sprig executable through
+`Store::with_projection_executable` and satisfy the same mount requirements. The
+CLI configures its own executable automatically.
 
 ### JSON and exit status
 
@@ -407,17 +507,17 @@ status instead. Check store state before retrying a failed publication.
 
 ## Recovery and storage
 
-`drop workspace NAME` retains its native tree, including uncommitted files, and
+`drop workspace NAME` retains its generation, including uncommitted files, and
 leaves its branch in place. Drop attached workspaces before `drop branch NAME`.
 `list` gives exact trash tokens. `recover TOKEN NAME` creates a new workspace and
 branch without consuming the recovery entry. Dropped branch recovery materializes
 its committed revision; dropped workspace recovery preserves its retained tree.
 
 `doctor` checks metadata and referenced content hashes and reports orphaned
-revisions, native generations and staging entries. It does not repair or delete.
+revisions, workspace generations and staging entries. It does not repair or delete.
 `gc` is **dry-run only**, even without `--dry-run`. Its conservative roots include
-branch heads, workspace bases, pending candidates, trash, revision ancestors and
-metadata backups. There is no permanent purge command.
+branch heads, workspace bases, immutable projection lowers, pending candidates,
+trash, revision ancestors and metadata backups. There is no permanent purge command.
 
 `recover-state GENERATION` restores a validated metadata backup, even if current
 metadata cannot be opened, while retaining the current state bytes for inspection.
@@ -431,7 +531,7 @@ STORE/
   lock                # Advisory metadata lock
   objects/HASH        # Immutable content chunks
   revisions/HASH.json.zst # Compressed immutable manifests and parents
-  native/GENERATION/  # Native working trees and lease files
+  native/GENERATION/  # Native trees or projection lower/upper/work/tree, and leases
   staging/            # Unpublished data and retained recovery records
   backups/            # Compressed previous metadata generations
 ```
@@ -441,16 +541,18 @@ compression. Revision IDs still hash the original JSON bytes; reads validate the
 frame and revision hash. No history or recovery roots are discarded to save space.
 The current `state.json` stays uncompressed. Chunk files are synced individually,
 and their directory entries are synced before a capture can return references.
-Capture reuses one 256 KiB I/O buffer across files, not their contents: every file
-is still read and every existing chunk verified, even when size and mtime match.
+Native capture reuses one 256 KiB I/O buffer across files, not their contents:
+every file is still read and every existing chunk verified, even when size and
+mtime match. Projected capture uses the lower-provenance checks described above.
 
 `stats.object_bytes` totals stored chunk bytes, including unreferenced objects.
 `reachable_logical_bytes` sums file lengths across protected revisions; repeated
 content counts in each revision. Neither value is total physical disk usage.
 Retained trees and backups intentionally consume space.
 
-Unsupported storage schemas are rejected without modifying the store. There is
-no storage-format or API compatibility guarantee; keep independent backups.
+The current storage schema is **4**. Earlier or otherwise unsupported schemas are
+rejected without migration or modification. Use a fresh store for this version;
+there is no storage-format or API compatibility guarantee. Keep independent backups.
 
 ## Guarantees and boundaries
 
@@ -461,11 +563,12 @@ no storage-format or API compatibility guarantee; keep independent backups.
   not freeze other programs. Use trusted, quiescent trees for import, fork and
   checkpoint; source-change checks detect some races, not every external write
   or hostile ancestor replacement.
-- Regular files, directories and symlinks are supported. Copying and capture keep
-  symlinks without following them; opening those links later can leave the
+- On Unix, regular files, directories and symlinks are supported. Copying and
+  capture keep symlinks without following them; opening those links later can leave the
   workspace. Special files and non-UTF-8 entry names are rejected. Source roots
-  cannot be symlinks, and source and store must not contain one another.
-- Ordinary Unix permissions, including executable bits, and recorded modification
+  cannot be symlinks, and source and store must not contain one another. Windows
+  rejects reparse points, including symlinks and junctions.
+- On Unix, ordinary permissions, including executable bits, and recorded modification
   times are preserved subject to timestamp precision. Special mode bits are
   stripped. Ownership, access/change times, ACLs, extended attributes and sparse
   layout are not preserved.
@@ -473,7 +576,7 @@ no storage-format or API compatibility guarantee; keep independent backups.
   guarantee survival of every filesystem, kernel, hardware or power-loss failure.
   An error after publication can mean the change already took effect. Inspect
   `status`, `list` and `doctor` before retrying.
-- Failed attempts may retain unpublished objects or native generations. Nothing
+- Failed attempts may retain unpublished objects or workspace generations. Nothing
   is automatically purged. Keep storage private and unmodified: immutability is
   a tool contract, not protection against the operating-system owner editing it.
 
@@ -482,12 +585,73 @@ no storage-format or API compatibility guarantee; keep independent backups.
 The repository selects **stable Rust**, with rustfmt and Clippy. Cargo declares a
 minimum Rust version of **1.89**, not a pinned development toolchain. Linux uses
 `FICLONE`; macOS uses `fclonefileat`. Both clone individual files, not whole trees
-or Btrfs subvolumes. Clone support depends on the filesystem. Windows is unsupported.
+or Btrfs subvolumes. Clone support depends on the filesystem. Windows uses ordinary
+copying, with the restrictions below.
 
 [CI](.github/workflows/ci.yml) runs stable Rust on Linux and macOS. The macOS job
 sets `SPRIG_REQUIRE_REFLINK=1` to require real APFS clones and test write isolation.
 Linux tests ordinary and fallback paths; passing there does not prove reflink
 support on the runner. The example runs in CI too, with strict cloning on macOS.
+
+### Windows native workspaces
+
+The Windows backend supports **writable regular files and directories on local
+NTFS disks**, using ordinary copies. Other Windows filesystems are unsupported.
+Build with stable Rust's MSVC toolchain and the Visual Studio C++ build tools,
+including the Windows SDK; the Zstandard dependency
+needs a C compiler. Running native workspaces needs no filesystem driver or
+administrator access.
+
+PowerShell example from the repository root:
+
+```powershell
+cargo build --locked --release
+$Sprig = Join-Path $PWD 'target\release\sprig.exe'
+$Demo = Join-Path ([IO.Path]::GetTempPath()) ('sprig-demo-' + [guid]::NewGuid().ToString('N'))
+$Source = Join-Path $Demo 'source'
+$Store = Join-Path $Demo 'store'
+New-Item -ItemType Directory -Path $Source -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $Source 'note.txt'), "hello`n")
+function s { & $Sprig --store $Store @args; if ($LASTEXITCODE) { throw 'Sprig failed' } }
+s init
+s import $Source main
+s fork main experiment
+s write experiment note.txt --text 'hello from Windows' -m 'Edit copy'
+s exec experiment -- cmd /c type note.txt
+s diff-files main experiment
+s doctor
+Write-Output "Demo retained at: $Demo"
+```
+
+Windows limitations are explicit rather than silent conversions:
+
+- Native cloning, Linux projection and POSIX `chmod` are unsupported. Ordinary
+  `exec` is supported, with the same requirement to checkpoint external edits.
+- Reparse points, including symlinks and junctions, are rejected without traversal.
+  UNC, device and drive-relative paths, reserved names, alternate-stream path syntax
+  and unsupported path aliases are rejected. Use ordinary local NTFS paths and
+  UTF-8 names.
+- Files and directories with named NTFS data streams, including `Zone.Identifier`,
+  are rejected before capture or copying rather than silently dropping those streams.
+- Captures record `0755` for directories and `0644` for writable files. Read-only
+  files are rejected. Materialization refuses other modes or timestamps finer than
+  100 ns instead of silently losing recorded metadata. This limits cross-platform
+  history materialization.
+- New directories inherit Windows ACLs; Unix private-mode bits are not an ACL
+  guarantee. Keep the store in a location already private to your account.
+- Regular files are flushed and metadata replacement uses write-through rename.
+  Windows has no equivalent directory-fsync guarantee here; equal power-loss
+  namespace durability with the Unix backend is not claimed.
+
+Windows `exec` keeps its lease through an inherited file handle opened without sharing.
+In a multithreaded SDK host, children spawned outside Sprig during the brief handle-
+inheritance window can also retain that lease and prolong `workspace_busy`. Wait
+for those children to finish; Sprig does not force the lease open or sandbox them.
+
+Windows runtime validation is still pending. The implemented subset is not a claim
+of full platform parity or of a passed Windows test run.
+
+### Development checks
 
 Follow the [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html)
 where applicable to this standalone Cargo project.
@@ -497,8 +661,20 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 
+# Linux projection code and non-mount tests; this does not prove mount support.
+cargo test --locked --features projection
+
 # Use only on a filesystem supporting the native clone backend.
 SPRIG_REQUIRE_REFLINK=1 cargo test --locked
+```
+
+The opt-in [mounted workflow](tests/projection_workflow.py) requires Python 3 and
+an isolated, disposable Linux runner with the mount privileges described above. It creates a
+synthetic store, retains it on failure, and never forces or lazily detaches mounts:
+
+```sh
+cargo build --locked --features projection
+sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 ```
 
 The CLI is a thin adapter over the Rust library. Tests cover history, concurrent

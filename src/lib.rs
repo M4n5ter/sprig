@@ -2,8 +2,8 @@
 //! All mutations share one commit engine and optimistic branch-head checks.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("Sprig supports Linux and macOS");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("Sprig supports Linux, macOS and Windows");
 
 pub mod blame;
 pub mod content;
@@ -11,6 +11,9 @@ pub mod copy_tree;
 pub mod merge;
 mod metadata;
 mod model;
+mod platform;
+#[cfg(all(target_os = "linux", feature = "projection"))]
+pub mod projection;
 mod store;
 
 pub use blame::{BlameLine, LineBlame as Blame};

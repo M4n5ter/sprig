@@ -3,12 +3,17 @@
 //! Native acceleration clones individual files, not an atomic filesystem tree.
 //! Ancestor replacement by hostile concurrent writers is outside this contract.
 
-use std::fs::{self, DirBuilder, File, FileTimes, Metadata, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File, FileTimes};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::platform::{self, Metadata};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,9 +41,16 @@ pub struct NativeBackendInfo {
 }
 
 pub fn copy_tree(source: &Path, target: &Path, mode: CopyMode) -> io::Result<CopyStats> {
+    #[cfg(windows)]
+    if mode == CopyMode::Clone {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native file cloning is not supported on Windows",
+        ));
+    }
     let source = normalized_root(source)?;
     let target = normalized_root(target)?;
-    let metadata = fs::symlink_metadata(&source)?;
+    let metadata = platform::symlink_metadata(&source)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -62,13 +74,12 @@ pub fn copy_tree(source: &Path, target: &Path, mode: CopyMode) -> io::Result<Cop
     }
     let mut stats = CopyStats::default();
     copy_entry(&source, &target, mode, &mut stats)?;
-    File::open(
+    platform::sync_directory(
         target
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new(".")),
-    )?
-    .sync_all()?;
+    )?;
     Ok(stats)
 }
 
@@ -78,9 +89,10 @@ fn copy_entry(
     mode: CopyMode,
     stats: &mut CopyStats,
 ) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
+    let metadata = platform::symlink_metadata(source)?;
+    platform::validate_capture_metadata(source, &metadata)?;
     if metadata.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(source)?, target)?;
+        copy_symlink(source, target)?;
         #[cfg(target_os = "macos")]
         set_symlink_permissions(target, metadata.mode() & 0o777)?;
         set_symlink_modified(
@@ -89,29 +101,26 @@ fn copy_entry(
         )?;
         stats.symlinks += 1;
     } else if metadata.is_dir() {
-        DirBuilder::new().mode(0o700).create(target)?;
-        fs::set_permissions(target, fs::Permissions::from_mode(0o700))?;
-        let directory = File::open(target)?;
+        platform::create_dir(target, 0o700)?;
+        platform::set_path_mode(target, 0o700)?;
+        let directory = platform::open_directory(target)?;
         let mut children = fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
         children.sort_by_key(|entry| entry.file_name());
         for child in children {
             copy_entry(&child.path(), &target.join(child.file_name()), mode, stats)?;
         }
-        if !unchanged(&metadata, &fs::symlink_metadata(source)?) {
+        if !unchanged(&metadata, &platform::symlink_metadata(source)?) {
             return Err(io::Error::other(format!(
                 "source changed during copy: {}",
                 source.display()
             )));
         }
-        directory.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o777))?;
+        platform::set_mode(&directory, metadata.mode() & 0o777)?;
         directory.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
-        directory.sync_all()?;
+        platform::sync_directory_file(&directory)?;
     } else if metadata.is_file() {
-        let mut input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(source)?;
-        let before = input.metadata()?;
+        let mut input = platform::open_regular(source)?;
+        let before = platform::file_metadata(&input)?;
         if !before.is_file() || !unchanged(&metadata, &before) {
             return Err(io::Error::other("source changed type while copying"));
         }
@@ -130,12 +139,7 @@ fn copy_entry(
                     "native file cloning is not supported for this source and destination",
                 ));
             }
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(target)?;
+            let mut output = platform::create_new(target, 0o600)?;
             let copied = io::copy(&mut input, &mut output)?;
             if copied != before.len() {
                 return Err(io::Error::other("source size changed while copying"));
@@ -143,10 +147,12 @@ fn copy_entry(
             stats.copied += 1;
             output
         };
-        if !unchanged(&before, &input.metadata()?) || output.metadata()?.len() != before.len() {
+        if !unchanged(&before, &platform::file_metadata(&input)?)
+            || output.metadata()?.len() != before.len()
+        {
             return Err(io::Error::other("source changed while copying"));
         }
-        output.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o777))?;
+        platform::set_mode(&output, metadata.mode() & 0o777)?;
         output.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
         output.sync_all()?;
     } else {
@@ -251,6 +257,7 @@ fn unsupported_clone(error: &io::Error) -> bool {
 
 /// Restores a symlink's mtime without touching the target, including dangling
 /// or absolute links. atime is intentionally left unchanged.
+#[cfg(unix)]
 pub(crate) fn set_symlink_modified(path: &Path, modified_ns: i128) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -285,6 +292,27 @@ pub(crate) fn set_symlink_modified(path: &Path, modified_ns: i128) -> io::Result
     Ok(())
 }
 
+#[cfg(windows)]
+pub(crate) fn set_symlink_modified(_path: &Path, _modified_ns: i128) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symbolic links are not supported on Windows",
+    ))
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, target: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(source)?, target)
+}
+
+#[cfg(windows)]
+fn copy_symlink(_source: &Path, _target: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symbolic links are not supported on Windows",
+    ))
+}
+
 pub fn native_backend_info(path: &Path) -> io::Result<NativeBackendInfo> {
     Ok(NativeBackendInfo {
         platform: std::env::consts::OS.to_owned(),
@@ -292,7 +320,11 @@ pub fn native_backend_info(path: &Path) -> io::Result<NativeBackendInfo> {
         clone_api: if cfg!(target_os = "linux") { Some("FICLONE".to_owned()) }
             else if cfg!(target_os = "macos") { Some("fclonefileat".to_owned()) } else { None },
         whole_tree_snapshots: false,
-        note: "Per-file copy-on-write clones are attempted at copy time; filesystem detection alone does not guarantee support. No whole-tree native snapshot is used.".to_owned(),
+        note: if cfg!(windows) {
+            "Windows uses ordinary copies on NTFS only; clone mode and projection are unsupported. Reparse points and read-only files are rejected. ACLs are inherited, not reproduced. File flushes and write-through replacement do not provide POSIX directory-fsync power-loss guarantees."
+        } else {
+            "Per-file copy-on-write clones are attempted at copy time; filesystem detection alone does not guarantee support. No whole-tree native snapshot is used."
+        }.to_owned(),
     })
 }
 
@@ -339,10 +371,10 @@ fn filesystem_name(path: &Path) -> io::Result<String> {
     Ok(name.to_string_lossy().into_owned())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
 fn filesystem_name(path: &Path) -> io::Result<String> {
-    fs::metadata(path)?;
-    Ok("unknown".to_owned())
+    platform::symlink_metadata(path)?;
+    Ok("NTFS".to_owned())
 }
 
 fn normalized_root(path: &Path) -> io::Result<PathBuf> {
@@ -379,7 +411,10 @@ fn ensure_parent_directories(target: &Path) -> io::Result<()> {
         .components()
     {
         current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current)?;
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = platform::symlink_metadata(&current)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

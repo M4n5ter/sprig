@@ -648,8 +648,12 @@ In a multithreaded SDK host, children spawned outside Sprig during the brief han
 inheritance window can also retain that lease and prolong `workspace_busy`. Wait
 for those children to finish; Sprig does not force the lease open or sandbox them.
 
-Windows runtime validation is still pending. The implemented subset is not a claim
-of full platform parity or of a passed Windows test run.
+The [Windows CI contract](https://github.com/M4n5ter/sprig/actions/runs/39894835808)
+has passed on a hosted Windows runner: native copying, history and merge, recovery,
+path/stream rejection, and inherited execution leases. The same run passed Linux
+and macOS native checks and the rootful Linux projection workflow, including
+busy-handle refusal and normal cleanup. These synthetic checks do not establish
+full platform parity or power-loss durability.
 
 ### Development checks
 

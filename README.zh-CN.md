@@ -411,7 +411,7 @@ Windows 对不支持的行为明确报错，不做静默转换：
 
 Windows 的 `exec` 通过继承的独占访问文件句柄维持租约。在多线程 SDK 宿主中，若其他线程恰好在短暂的句柄继承窗口内绕过 Sprig 启动子进程，该子进程也可能保留租约，使 `workspace_busy` 持续更久。应等这些子进程退出；Sprig 不会强行解除租约，也不提供沙箱。
 
-Windows 实机运行验证仍待完成。已实现的子集不代表完整平台对等，也不代表 Windows 测试已通过。
+[Windows CI 联动契约](https://github.com/M4n5ter/sprig/actions/runs/39894835808) 已在托管 Windows runner 上通过，覆盖原生复制、历史与合并、恢复、路径和命名流拒绝，以及继承执行租约。同一轮的 Linux、macOS 原生检查和 rootful Linux 投影工作流也已通过，包括忙句柄拒绝卸载及正常清理。这些合成数据验证不代表完整平台对等或断电持久性证明。
 
 ### 开发检查
 

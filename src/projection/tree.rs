@@ -426,12 +426,7 @@ mod tests {
         fn library(&self) -> PathBuf {
             self.path.join("library")
         }
-        fn manifest(&self) -> Manifest {
-            serde_json::from_slice(&fs::read(self.library().join("manifest.json")).unwrap())
-                .unwrap()
-        }
-        fn load(&self) -> Projection {
-            let manifest = self.manifest();
+        fn load(&self, manifest: &Manifest) -> Projection {
             let digest = blake3::hash(&serde_json::to_vec(&manifest).unwrap())
                 .to_hex()
                 .to_string();
@@ -453,7 +448,7 @@ mod tests {
             }
             projection
         }
-        fn import(&self) {
+        fn import(&self) -> Manifest {
             fs::create_dir_all(self.library()).unwrap();
             let (manifest, _) = content::capture(
                 &self.source(),
@@ -461,11 +456,7 @@ mod tests {
                 &Observed::new(),
             )
             .unwrap();
-            fs::write(
-                self.library().join("manifest.json"),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
+            manifest
         }
     }
     impl Drop for Fixture {
@@ -495,7 +486,7 @@ mod tests {
         }
     }
 
-    fn handbuilt(fixture: &Fixture, chunks: &[Vec<u8>]) -> Vec<String> {
+    fn handbuilt(fixture: &Fixture, chunks: &[Vec<u8>]) -> (Vec<String>, Manifest) {
         let root = fixture.library();
         fs::create_dir_all(root.join("objects")).expect("create objects");
         let hashes: Vec<String> = chunks
@@ -519,12 +510,7 @@ mod tests {
                 ),
             ),
         ]);
-        fs::write(
-            root.join("manifest.json"),
-            serde_json::to_vec(&manifest).expect("serialize manifest"),
-        )
-        .expect("write manifest");
-        hashes
+        (hashes, manifest)
     }
 
     fn import_preserves_bytes_modes_times_symlink_and_stable_inode_layout() {
@@ -551,9 +537,9 @@ mod tests {
             .expect("set fixture mtime");
         let target = OsString::from_vec(b"nested/\xff-target".to_vec());
         symlink(&target, fixture.source().join("link")).expect("write byte symlink");
-        fixture.import();
-        let mut projection = fixture.load();
-        let second = fixture.load();
+        let manifest = fixture.import();
+        let mut projection = fixture.load(&manifest);
+        let second = fixture.load(&manifest);
         let nonce = projection.session(ROOT_INODE).unwrap();
         assert_eq!(nonce.len(), 64);
         assert!(
@@ -681,10 +667,10 @@ mod tests {
         fs::create_dir(fixture.source()).expect("create source");
         let bytes = data(store::CACHE_BYTES + 3 * MAX_READ_BYTES);
         fs::write(fixture.source().join("large"), &bytes).expect("write large source");
-        fixture.import();
+        let manifest = fixture.import();
         // The projection remains independent of the original tree.
         fs::remove_dir_all(fixture.source()).expect("remove test-owned source");
-        let mut projection = fixture.load();
+        let mut projection = fixture.load(&manifest);
         assert_eq!(projection.stats()["verified_chunk_bytes"], 0);
         let inode = projection
             .lookup(ROOT_INODE, OsStr::new("large"))
@@ -709,16 +695,13 @@ mod tests {
             .map(|entry| entry.expect("library entry").file_name())
             .collect();
         entries.sort();
-        assert_eq!(
-            entries,
-            [OsString::from("manifest.json"), OsString::from("objects")]
-        );
+        assert_eq!(entries, [OsString::from("objects")]);
     }
 
     fn chunk_lru_checks_hashes_before_caching_and_evicts_the_least_recently_used() {
         let fixture = Fixture::new();
         let chunks = [vec![1; 65_536], vec![2; 65_536], vec![3; 65_536]];
-        let hashes = handbuilt(&fixture, &chunks);
+        let (hashes, _) = handbuilt(&fixture, &chunks);
         let store = ObjectStore::open(&fixture.library().join("objects")).expect("load store");
         let mut cache = ChunkCache::new(131_072);
         assert_eq!(cache.get(&store, &hashes[0]).expect("A"), chunks[0]);
@@ -754,29 +737,29 @@ mod tests {
 
     fn missing_symlink_oversize_and_length_mismatch_objects_are_rejected() {
         let fixture = Fixture::new();
-        let hashes = handbuilt(&fixture, &[vec![1; 32]]);
+        let (hashes, manifest) = handbuilt(&fixture, &[vec![1; 32]]);
         let object = fixture.library().join("objects").join(&hashes[0]);
         fs::remove_file(&object).expect("remove test chunk");
         assert!(
-            Projection::new(&fixture.library().join("objects"), fixture.manifest(), 0, 0).is_err()
+            Projection::new(&fixture.library().join("objects"), manifest.clone(), 0, 0).is_err()
         );
         fs::write(fixture.path.join("outside"), vec![1; 32]).expect("write symlink target");
         symlink(fixture.path.join("outside"), &object).expect("replace object with symlink");
         assert!(
-            Projection::new(&fixture.library().join("objects"), fixture.manifest(), 0, 0).is_err()
+            Projection::new(&fixture.library().join("objects"), manifest.clone(), 0, 0).is_err()
         );
         fs::remove_file(&object).expect("remove test symlink");
         fs::write(&object, vec![1; 33]).expect("wrong length chunk");
         assert!(
-            Projection::new(&fixture.library().join("objects"), fixture.manifest(), 0, 0).is_err()
+            Projection::new(&fixture.library().join("objects"), manifest.clone(), 0, 0).is_err()
         );
         fs::write(&object, vec![1; store::MAX_CHUNK_BYTES + 1]).expect("oversize chunk");
         assert!(
-            Projection::new(&fixture.library().join("objects"), fixture.manifest(), 0, 0).is_err()
+            Projection::new(&fixture.library().join("objects"), manifest.clone(), 0, 0).is_err()
         );
         let linked = fixture.path.join("linked");
         symlink(fixture.library(), &linked).unwrap();
-        let mut invalid_manifest = fixture.manifest();
+        let mut invalid_manifest = manifest.clone();
         invalid_manifest.get_mut("file").unwrap().id = "root".into();
         assert!(
             Projection::new(&fixture.library().join("objects"), invalid_manifest, 0, 0).is_err()
@@ -787,8 +770,8 @@ mod tests {
 
     fn readonly_permissions_reject_every_write_intent_and_respect_mode() {
         let fixture = Fixture::new();
-        handbuilt(&fixture, &[vec![1; 32]]);
-        let projection = fixture.load();
+        let (_, manifest) = handbuilt(&fixture, &[vec![1; 32]]);
+        let projection = fixture.load(&manifest);
         let inode = projection
             .lookup(ROOT_INODE, OsStr::new("file"))
             .expect("lookup");
@@ -826,32 +809,21 @@ mod tests {
 
     fn pre_epoch_timestamps_fail_closed_without_changing_the_manifest() {
         let fixture = Fixture::new();
-        handbuilt(&fixture, &[vec![1; 32]]);
-        let path = fixture.library().join("manifest.json");
-        let mut manifest: Manifest =
-            serde_json::from_slice(&fs::read(&path).expect("read manifest"))
-                .expect("decode manifest");
+        let (_, mut manifest) = handbuilt(&fixture, &[vec![1; 32]]);
         for nanoseconds in [-1_000_000_000, -500_000_000, -1] {
             manifest.get_mut("file").expect("file entry").modified_ns = nanoseconds;
             let encoded = serde_json::to_vec(&manifest).expect("encode timestamp fixture");
-            fs::write(&path, &encoded).expect("write timestamp fixture");
             let error =
-                match Projection::new(&fixture.library().join("objects"), fixture.manifest(), 0, 0)
-                {
+                match Projection::new(&fixture.library().join("objects"), manifest.clone(), 0, 0) {
                     Ok(_) => panic!("pre-epoch metadata must not be exposed incorrectly"),
                     Err(error) => error,
                 };
             assert!(error.to_string().contains("pre-1970 mtime"));
-            assert_eq!(fs::read(&path).expect("unchanged manifest"), encoded);
+            assert_eq!(serde_json::to_vec(&manifest).unwrap(), encoded);
         }
         for nanoseconds in [0, 1, 500_000_000] {
             manifest.get_mut("file").expect("file entry").modified_ns = nanoseconds;
-            fs::write(
-                &path,
-                serde_json::to_vec(&manifest).expect("encode timestamp"),
-            )
-            .expect("write valid timestamp");
-            let projection = fixture.load();
+            let projection = fixture.load(&manifest);
             let inode = projection
                 .lookup(ROOT_INODE, OsStr::new("file"))
                 .expect("lookup");
@@ -864,11 +836,7 @@ mod tests {
 
     fn symlink_targets_fit_the_linux_readlink_reply() {
         let fixture = Fixture::new();
-        handbuilt(&fixture, &[vec![1; 32]]);
-        let path = fixture.library().join("manifest.json");
-        let mut manifest: Manifest =
-            serde_json::from_slice(&fs::read(&path).expect("read manifest"))
-                .expect("decode manifest");
+        let (_, mut manifest) = handbuilt(&fixture, &[vec![1; 32]]);
         for length in [4095, 4096] {
             manifest.insert(
                 "link".into(),
@@ -879,13 +847,8 @@ mod tests {
                     },
                 ),
             );
-            fs::write(
-                &path,
-                serde_json::to_vec(&manifest).expect("encode symlink"),
-            )
-            .expect("write symlink fixture");
             let result =
-                Projection::new(&fixture.library().join("objects"), fixture.manifest(), 0, 0);
+                Projection::new(&fixture.library().join("objects"), manifest.clone(), 0, 0);
             if length == 4095 {
                 let projection = result.expect("maximum safe readlink reply accepted");
                 let inode = projection

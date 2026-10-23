@@ -1476,29 +1476,6 @@ mod tests {
             );
         }
         fs::remove_file(upper_path.join("alias")).unwrap();
-        // Opt-in repetitions remain inside the existing grouped test. Timings
-        // exclude fixture construction and verify exact inventories every pass.
-        if std::env::var_os("SPRIG_INVENTORY_AB").is_some() {
-            for repeat in 0..7 {
-                let started = Instant::now();
-                let old: Vec<_> = paths.iter().map(|path| original(path).unwrap()).collect();
-                let old_seconds = started.elapsed().as_secs_f64();
-                let started = Instant::now();
-                let mut new = BTreeMap::new();
-                for (path, expected) in paths.iter().zip(&old) {
-                    let inventory = clean_inventory(&upper, path).unwrap();
-                    assert_eq!(&inventory, expected);
-                    require_parent_inventory(&new, path, &inventory).unwrap();
-                    new.insert(path.clone(), inventory);
-                }
-                let new_seconds = started.elapsed().as_secs_f64();
-                eprintln!(
-                    "inventory_ab repeat={} directories={} old_seconds={old_seconds:.6} new_seconds={new_seconds:.6}",
-                    repeat + 1,
-                    paths.len()
-                );
-            }
-        }
     }
 
     // A private proof-engine differential test, NOT a real OverlayFS test.
@@ -1951,44 +1928,35 @@ mod tests {
         assert!(dedup_batch.finish().is_err());
     }
 
+    fn empty_file(id: &str) -> Entry {
+        entry(
+            id,
+            EntryKind::File {
+                size: 0,
+                chunks: vec![],
+            },
+        )
+    }
+
+    fn observation(id: &str, device: u64, inode: u64) -> Observation {
+        Observation {
+            id: id.into(),
+            device,
+            inode,
+        }
+    }
+
     #[test]
     fn same_path_identity_wins_and_origin_duplicates_get_fresh_ids() {
         let base = Manifest::from([
             ("".into(), entry("root", EntryKind::Directory)),
-            (
-                "a".into(),
-                entry(
-                    "a-id",
-                    EntryKind::File {
-                        size: 0,
-                        chunks: vec![],
-                    },
-                ),
-            ),
+            ("a".into(), empty_file("a-id")),
             ("old".into(), entry("rename-id", EntryKind::Directory)),
         ]);
         let mut fresh = Manifest::from([
             ("".into(), entry("", EntryKind::Directory)),
-            (
-                "a".into(),
-                entry(
-                    "",
-                    EntryKind::File {
-                        size: 0,
-                        chunks: vec![],
-                    },
-                ),
-            ),
-            (
-                "copy".into(),
-                entry(
-                    "",
-                    EntryKind::File {
-                        size: 0,
-                        chunks: vec![],
-                    },
-                ),
-            ),
+            ("a".into(), empty_file("")),
+            ("copy".into(), empty_file("")),
             ("new".into(), entry("", EntryKind::Directory)),
             ("new-copy".into(), entry("", EntryKind::Directory)),
         ]);
@@ -2007,16 +1975,7 @@ mod tests {
         // The immutable lower and logical previous checkpoint are different
         // bases after the first checkpoint. Same-path upper-only IDs must not
         // change on repeated captures against that still-mounted lower.
-        fresh.insert(
-            "upper-only".into(),
-            entry(
-                "random-capture-id",
-                EntryKind::File {
-                    size: 0,
-                    chunks: vec![],
-                },
-            ),
-        );
+        fresh.insert("upper-only".into(), empty_file("random-capture-id"));
         let mut previous = fresh.clone();
         previous.get_mut("upper-only").unwrap().id = "checkpoint-id".into();
         previous.remove("new");
@@ -2046,66 +2005,20 @@ mod tests {
         // hints; shared inode/hardlink ambiguity must not steal logical IDs.
         let old = Manifest::from([
             ("".into(), entry("root", EntryKind::Directory)),
-            (
-                "old".into(),
-                entry(
-                    "upper-id",
-                    EntryKind::File {
-                        size: 0,
-                        chunks: vec![],
-                    },
-                ),
-            ),
+            ("old".into(), empty_file("upper-id")),
         ]);
         let old_observed = Observed::from([
-            (
-                "".into(),
-                Observation {
-                    id: "root".into(),
-                    device: 7,
-                    inode: 1,
-                },
-            ),
-            (
-                "old".into(),
-                Observation {
-                    id: "upper-id".into(),
-                    device: 7,
-                    inode: 2,
-                },
-            ),
+            ("".into(), observation("root", 7, 1)),
+            ("old".into(), observation("upper-id", 7, 2)),
         ]);
         let mut renamed = CaptureResult {
             manifest: Manifest::from([
                 ("".into(), entry("capture-root", EntryKind::Directory)),
-                (
-                    "new".into(),
-                    entry(
-                        "capture-new",
-                        EntryKind::File {
-                            size: 0,
-                            chunks: vec![],
-                        },
-                    ),
-                ),
+                ("new".into(), empty_file("capture-new")),
             ]),
             observed: Observed::from([
-                (
-                    "".into(),
-                    Observation {
-                        id: "capture-root".into(),
-                        device: 7,
-                        inode: 1,
-                    },
-                ),
-                (
-                    "new".into(),
-                    Observation {
-                        id: "capture-new".into(),
-                        device: 7,
-                        inode: 2,
-                    },
-                ),
+                ("".into(), observation("capture-root", 7, 1)),
+                ("new".into(), observation("capture-new", 7, 2)),
             ]),
             stats: CaptureStats::default(),
         };
@@ -2113,24 +2026,12 @@ mod tests {
         assert_eq!(renamed.manifest["new"].id, "upper-id");
         assert_eq!(renamed.observed["new"].id, "upper-id");
         renamed.manifest.get_mut("new").unwrap().id = "capture-new".into();
-        renamed.manifest.insert(
-            "link".into(),
-            entry(
-                "capture-link",
-                EntryKind::File {
-                    size: 0,
-                    chunks: vec![],
-                },
-            ),
-        );
-        renamed.observed.insert(
-            "link".into(),
-            Observation {
-                id: "capture-link".into(),
-                device: 7,
-                inode: 2,
-            },
-        );
+        renamed
+            .manifest
+            .insert("link".into(), empty_file("capture-link"));
+        renamed
+            .observed
+            .insert("link".into(), observation("capture-link", 7, 2));
         renamed.reconcile_identities(&old, &old_observed).unwrap();
         assert_ne!(renamed.manifest["new"].id, "upper-id");
         assert_ne!(renamed.manifest["link"].id, "upper-id");

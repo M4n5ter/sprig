@@ -259,8 +259,9 @@ impl Reader {
 }
 
 /// Requested-content integrity for ordinary point reads, not an index audit.
-/// The index file is pinned once; bounded probes validate their references
-/// and extents, and successful reads always hash against the caller's original
+/// The index file is pinned once; bounded probes compare addresses, and only
+/// a matching record has its pack reference and extent validated. Successful
+/// reads always hash against the caller's original
 /// address. The global checksum, ordering, duplicates and unvisited records
 /// are deliberately not audited here. Reader/Snapshot retain that contract.
 pub(crate) struct PointReader {
@@ -381,20 +382,24 @@ impl PointIndex {
             }
             let middle = low + (high - low) / 2;
             let record = self.record::<OBJECT_RECORD_BYTES>(self.object_start, middle)?;
-            let number =
-                u32::from_le_bytes(record[32..36].try_into().expect("fixed field")) as usize;
-            if number >= self.pack_count {
-                return invalid("object refers to an unknown pack");
-            }
-            let pack = self.record::<PACK_RECORD_BYTES>((HEADER_BYTES + 8) as u64, number)?;
-            let offset = u64::from_le_bytes(record[36..44].try_into().expect("fixed field"));
-            let length = u32::from_le_bytes(record[44..48].try_into().expect("fixed field")) as u64;
-            let pack_length = u64::from_le_bytes(pack[32..40].try_into().expect("fixed field"));
-            validate_extent(offset, length, pack_length)?;
             match record[..32].cmp(&address[..]) {
                 std::cmp::Ordering::Less => low = middle + 1,
                 std::cmp::Ordering::Greater => high = middle,
                 std::cmp::Ordering::Equal => {
+                    let number = u32::from_le_bytes(record[32..36].try_into().expect("fixed field"))
+                        as usize;
+                    if number >= self.pack_count {
+                        return invalid("object refers to an unknown pack");
+                    }
+                    let pack =
+                        self.record::<PACK_RECORD_BYTES>((HEADER_BYTES + 8) as u64, number)?;
+                    let offset =
+                        u64::from_le_bytes(record[36..44].try_into().expect("fixed field"));
+                    let length =
+                        u32::from_le_bytes(record[44..48].try_into().expect("fixed field")) as u64;
+                    let pack_length =
+                        u64::from_le_bytes(pack[32..40].try_into().expect("fixed field"));
+                    validate_extent(offset, length, pack_length)?;
                     return Ok(Some(Location {
                         pack: format!("pack-{}", hex(pack[..32].try_into().expect("fixed field"))),
                         offset,
@@ -1213,6 +1218,22 @@ mod tests {
                 .read(selected_hash)
                 .unwrap(),
             *selected_bytes
+        );
+        // A nonmatching midpoint need not resolve its pack/extent. It cannot
+        // authorize bytes for the requested hash; full readers still audit it.
+        damaged = point_index.clone();
+        damaged[selected_start + 32..selected_start + 36].copy_from_slice(&u32::MAX.to_le_bytes());
+        let checksum = blake3::hash(&damaged[HEADER_BYTES..]);
+        damaged[20..HEADER_BYTES].copy_from_slice(checksum.as_bytes());
+        overwrite(&point_index_path, &damaged);
+        assert!(Reader::open(&point_fixture.0).is_err());
+        let (first_hash, first_bytes) = expected.first_key_value().unwrap();
+        assert_eq!(
+            PointReader::open(&point_fixture.0)
+                .unwrap()
+                .read(first_hash)
+                .unwrap(),
+            *first_bytes
         );
         damaged = point_index.clone();
         damaged[20] ^= 1;

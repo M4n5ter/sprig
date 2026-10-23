@@ -551,7 +551,9 @@ No published pack is deleted automatically.
 
 The current index is rewritten when a pack is added and is limited to 64 MiB
 on disk. Ordinary file reads pin one index generation and binary-search bounded
-records, then verify the requested chunk hashes and whole-file size. They do not
+records, validate the matching pack reference and extent, then verify the requested
+chunk hashes and whole-file size. Nonmatching probes do not validate pack references
+or extents. They do not
 validate the global index checksum or all records: unrelated corruption can be
 detected later, and damaged ordering can produce a missing-object error. A loose
 fallback must independently verify the requested hash; it is not proof that an

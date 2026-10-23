@@ -366,7 +366,7 @@ STORE/
 
 `stats.object_bytes` 汇总索引和 loose 布局中唯一文件内容块和元数据页块的字节数，包括未引用对象。`object_storage_bytes` 包含对象目录中的所有文件，包括索引、锁、孤立数据包和临时文件。Unix 上的 `object_allocated_bytes` 累加这些文件报告的已分配块，并不代表共享/CoW 存储上的独占物理占用；Windows 返回 null。`reachable_logical_bytes` 累加受保护修订中的文件长度，相同内容在不同修订中会重复计入。这些值都不是整个存储库的物理占用，保留的目录树、修订记录和备份也需要空间。`doctor` 列出全部对象存储条目，使保留的孤立/临时文件可见。
 
-当前存储结构（schema）为 **7**。
+当前存储结构（schema）为 **8**。
 
 ## 保证与边界
 

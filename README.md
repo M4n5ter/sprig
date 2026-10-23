@@ -592,7 +592,7 @@ content counts in each revision. None is whole-store physical usage: retained
 trees, revision records and backups also consume space. `doctor` lists all object
 store entries so retained orphan/temporary files are visible.
 
-The current storage schema is **7**.
+The current storage schema is **8**.
 
 ## Guarantees and boundaries
 

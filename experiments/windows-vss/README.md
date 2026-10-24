@@ -139,3 +139,15 @@ four former captures; the larger external reserve is retained conservatively.
 No registry, ACL, service startup, driver or host-security setting is changed.
 Neither a successful build nor a Fresh restore establishes application-atomic
 snapshot semantics or Windows desktop compatibility.
+
+The Cargo oracle obtains Windows metadata through no-follow read-only handles,
+using one query family for identity, size, links, mtime and the complete attribute
+word. Attribute changes still fail capture; no unknown bits are masked away.
+The known `NOT_CONTENT_INDEXED` bit is accepted as a content-indexing hint but is
+not persisted, like the archive hint. This is not a full Windows metadata backup:
+ACLs, ownership and indexing policy are not part of the canonical restore contract.
+
+Cargo 校验通过只读、不跟随重解析点的句柄统一读取 Windows 元数据，仍完整比较
+属性位，变化即拒绝，不屏蔽未知位。已知的 `NOT_CONTENT_INDEXED` 是内容索引提示，
+允许读取但不持久化，与归档提示相同；此能力不是完整 Windows 元数据备份，
+不承诺恢复 ACL、所有者或索引策略。

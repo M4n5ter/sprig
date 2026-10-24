@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import uuid
 
 import fixture as base
@@ -117,8 +118,83 @@ def plain_component(value):
              *("LPT%d" % i for i in range(1, 10))})
 
 
+class WindowsHandleInfo(ctypes.Structure):
+    """BY_HANDLE_FILE_INFORMATION, with ABI-stable fields on every test host."""
+
+    _fields_ = [("attributes", ctypes.c_uint32),
+                ("creation_time", ctypes.c_uint32 * 2),
+                ("access_time", ctypes.c_uint32 * 2),
+                ("write_time", ctypes.c_uint32 * 2),
+                ("volume_serial", ctypes.c_uint32),
+                ("size_high", ctypes.c_uint32), ("size_low", ctypes.c_uint32),
+                ("links", ctypes.c_uint32),
+                ("index_high", ctypes.c_uint32), ("index_low", ctypes.c_uint32)]
+
+
+def windows_info_to_stat(info, file_type):
+    """Pure conversion: preserve the entire attributes word and integer times."""
+    require(file_type == 1, "Cargo metadata handle is not FILE_TYPE_DISK")
+    require(not info.attributes & 0x400, "Cargo metadata handle is a reparse point")
+    directory = bool(info.attributes & 0x10)
+    permissions = 0o777 if directory else 0o666
+    if info.attributes & 1:
+        permissions &= ~0o222
+    write_ticks = (int(info.write_time[1]) << 32) | int(info.write_time[0])
+    return SimpleNamespace(
+        st_dev=int(info.volume_serial),
+        st_ino=(int(info.index_high) << 32) | int(info.index_low),
+        st_mode=(stat.S_IFDIR if directory else stat.S_IFREG) | permissions,
+        st_size=(int(info.size_high) << 32) | int(info.size_low),
+        st_nlink=int(info.links),
+        st_mtime_ns=(write_ticks - 116444736000000000) * 100,
+        st_file_attributes=int(info.attributes))
+
+
+def windows_tree_info(path):
+    """Read all oracle metadata through one no-follow READ_ATTRIBUTES handle.
+
+    Do not mix directory-enumeration/lstat attributes with handle metadata or
+    exempt any unknown attribute bit from the full stable_info comparison.
+    Close this handle before tree_node invokes its separate ADS enumeration.
+    """
+    require(os.name == "nt", "Windows handle metadata requires Windows")
+    from ctypes import wintypes
+
+    assert ctypes.sizeof(WindowsHandleInfo) == 52
+    assert WindowsHandleInfo.volume_serial.offset == 28 and WindowsHandleInfo.index_low.offset == 48
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_file = kernel.CreateFileW
+    open_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                          ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    open_file.restype = wintypes.HANDLE
+    get_type = kernel.GetFileType
+    get_type.argtypes = [wintypes.HANDLE]
+    get_type.restype = wintypes.DWORD
+    get_info = kernel.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(WindowsHandleInfo)]
+    get_info.restype = wintypes.BOOL
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    # FILE_READ_ATTRIBUTES; share READ|WRITE|DELETE; OPEN_EXISTING;
+    # FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT. No inherited handle.
+    handle = open_file(str(path), 0x80, 7, None, 3, 0x02000000 | 0x00200000, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        file_type = get_type(handle)
+        require(file_type == 1, "Cargo metadata handle is not FILE_TYPE_DISK")
+        info = WindowsHandleInfo()
+        if not get_info(handle, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return windows_info_to_stat(info, file_type)
+    finally:
+        if not close(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
 def tree_node(path):
-    info = Path(path).lstat()
+    info = windows_tree_info(path) if os.name == "nt" else Path(path).lstat()
     require(not stat.S_ISLNK(info.st_mode) and not base.is_reparse(info),
             "Cargo tree refuses links/reparse points: " + str(path))
     require(stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode),
@@ -846,8 +922,53 @@ def finalize(args):
     return finish_report(work, "finalize.json", report, commands, action)
 
 
+def selftest_windows_metadata():
+    """Exercise only fixed-width values; do not load or call any Windows API."""
+    require(ctypes.sizeof(WindowsHandleInfo) == 52
+            and [getattr(WindowsHandleInfo, name).offset for name, _ in WindowsHandleInfo._fields_]
+            == [0, 4, 12, 20, 28, 32, 36, 40, 44, 48], "Windows metadata ABI differs")
+    raw = WindowsHandleInfo()
+    raw.attributes, raw.volume_serial = 0x20, 0x89ABCDEF
+    raw.index_high, raw.index_low = 0xFEDCBA98, 0x76543210
+    raw.size_high, raw.size_low, raw.links = 1, 42, 3
+    expected_ns = 1700000000123456700
+    ticks = 116444736000000000 + expected_ns // 100
+    raw.write_time[:] = (ticks & 0xFFFFFFFF, ticks >> 32)
+    info = windows_info_to_stat(raw, 1)
+    require(stable_info(info) == (0x89ABCDEF, 0xFEDCBA9876543210, stat.S_IFREG | 0o666,
+                                  (1 << 32) + 42, 3, expected_ns, 0x20),
+            "Windows handle metadata conversion lost an integer field")
+    raw.attributes = 1
+    require(windows_info_to_stat(raw, 1).st_mode == stat.S_IFREG | 0o444,
+            "Windows read-only mode conversion lost the write-bit restriction")
+    raw.attributes = 0x10002010
+    directory_before = windows_info_to_stat(raw, 1)
+    require(directory_before.st_mode == stat.S_IFDIR | 0o777
+            and directory_before.st_file_attributes == 0x10002010,
+            "Windows directory conversion masked attributes or changed ordinary mode")
+    raw.attributes = 0x2010
+    directory_after = windows_info_to_stat(raw, 1)
+    require(stable_info(directory_before)[:-1] == stable_info(directory_after)[:-1]
+            and stable_info(directory_before) != stable_info(directory_after)
+            and directory_after.st_file_attributes == 0x2010,
+            "The full attributes comparison silently exempted an unknown bit")
+    ticks = 116444736000000000 - 1
+    raw.write_time[:] = (ticks & 0xFFFFFFFF, ticks >> 32)
+    require(windows_info_to_stat(raw, 1).st_mtime_ns == -100,
+            "Windows FILETIME conversion lost signed 100 ns precision")
+    for file_type, attributes in ((0, 0x20), (2, 0x20), (3, 0x20), (1, 0x400), (1, 0x410)):
+        raw.attributes = attributes
+        try:
+            windows_info_to_stat(raw, file_type)
+        except FixtureError:
+            pass
+        else:
+            raise FixtureError("Windows metadata conversion accepted a non-disk or reparse node")
+
+
 def selftest():
     """No executable except this Python interpreter is launched by this test."""
+    selftest_windows_metadata()
     with tempfile.TemporaryDirectory(prefix="sprig-vss-cargo-selftest-") as temporary:
         root = Path(temporary)
         require(all(plain_component(name) for name in ("Cargo.toml", ".cargo", "test-123.exe")),
@@ -982,7 +1103,8 @@ def selftest():
             "checks": ["fixed crate and edits", "full repeated oracle", "internal hardlinks",
                        "external hardlinks rejected", "safe path components", "bounded JSON before write",
                        "positive Fresh/compile/test evidence", "bounded mock stdout/stderr drains",
-                       "pre-ingestion failure report preserves phase/call and WinError metadata"]}
+                       "pre-ingestion failure report preserves phase/call and WinError metadata",
+                       "pure Windows handle metadata ABI, integer conversion, full attributes and type/reparse rejection"]}
 
 
 def parser():

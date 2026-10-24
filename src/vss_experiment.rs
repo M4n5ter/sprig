@@ -667,11 +667,13 @@ fn directory_children(file: &File) -> io::Result<Vec<ChildName>> {
 }
 
 fn validate_tree_attributes(attributes: u32, directory: bool, links: u32) -> io::Result<()> {
-    // Archive/normal/directory are the ordinary writable contract. Reject rather
+    // Archive/normal/directory and NOT_CONTENT_INDEXED are accepted. The latter
+    // is an indexing hint, not preserved in canonical metadata (like archive).
+    // Raw attributes must still stay identical across capture. Reject rather
     // than silently dropping hidden/system/readonly, sparse/compressed/encrypted,
     // offline/recall, reparse, or any unknown storage semantics. ACLs and access
     // times remain outside Sprig's canonical metadata contract, as elsewhere.
-    const ACCEPTED: u32 = ATTRIBUTE_DIRECTORY | 0x20 | 0x80;
+    const ACCEPTED: u32 = ATTRIBUTE_DIRECTORY | 0x20 | 0x80 | 0x2000;
     if attributes & !ACCEPTED != 0
         || (attributes & ATTRIBUTE_DIRECTORY != 0) != directory
         || links == 0
@@ -1531,10 +1533,13 @@ mod tests {
             0x1000,
             0x4000,
             0x40000,
+            0x10000000,
         ] {
             assert!(validate_tree_attributes(attributes, false, 1).is_err());
         }
         assert!(validate_tree_attributes(0x20, false, 1).is_ok());
+        assert!(validate_tree_attributes(0x2020, false, 1).is_ok());
+        assert!(validate_tree_attributes(0x2010, true, 1).is_ok());
         assert!(validate_tree_attributes(ATTRIBUTE_DIRECTORY, true, 1).is_ok());
         assert!(validate_tree_attributes(0x20, false, 0).is_err());
     }

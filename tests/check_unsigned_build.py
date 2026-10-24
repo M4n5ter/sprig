@@ -21,6 +21,8 @@ if a.xml.stat().st_size > 64 * 1024 * 1024:
 root = ET.parse(a.xml).getroot()
 local = lambda e: e.tag.rsplit('}', 1)[-1]
 namespace = root.tag.split('}')[0][1:] if '}' in root.tag else ''
+if namespace:
+    ET.register_namespace('', namespace)  # MSBuild requires unprefixed project elements.
 qualify = lambda name: '{' + namespace + '}' + name if namespace else name
 for e in root.iter():
     if 'signmode' in e.attrib.get('TreatAsLocalProperty', '').lower():

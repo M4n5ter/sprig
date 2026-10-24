@@ -43,7 +43,15 @@ function Run-BuildCommand([string]$Name,[string]$Command,[string]$ClExtra='') {
     $process.Refresh()
     $result.steps += [ordered]@{ name=$Name; command=$Command; compilerExtra=$ClExtra; exitCode=$process.ExitCode; seconds=$watch.Elapsed.TotalSeconds }
     if((Output-Size) -gt 12GB){throw 'Build output limit exceeded.'}
-    if($process.ExitCode -ne 0){ throw "Build-only phase failed: $Name ($($process.ExitCode))." }
+    if($process.ExitCode -ne 0){
+        # /pp may write its parse error into the requested output rather than
+        # stdout. Preserve only bounded diagnostic lines, not imported kit source.
+        foreach($candidate in Get-ChildItem $WorkRoot -Filter '*.pp.xml' -File) {
+            $diagnostics=@(Select-String -LiteralPath $candidate.FullName -Pattern 'error MSB[0-9]{4}' | Select-Object -First 10 | ForEach-Object { $_.Line.Substring(0,[Math]::Min($_.Line.Length,2048)) })
+            if($diagnostics.Count){$diagnostics | Set-Content (Join-Path $logs ($Name+'-preprocess-errors.txt'))}
+        }
+        throw "Build-only phase failed: $Name ($($process.ExitCode))."
+    }
 }
 function Msbuild-Command([string]$Project,[string]$Target='Build') {
     $guardProperty=if($guards.ContainsKey($Project)) {' /p:ForceImportAfterCppTargets='+$guards[$Project]}else{''}

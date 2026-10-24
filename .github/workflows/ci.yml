@@ -172,11 +172,14 @@ jobs:
       - name: Parse build-only scripts before downloading tools
         shell: pwsh
         run: |
-          foreach ($file in @('windows_ewdk_build.ps1', 'windows_ewdk_compile.ps1')) {
+          foreach ($file in @('windows_ewdk_build.ps1', 'windows_ewdk_compile.ps1', 'windows_signing_guard_smoke.ps1')) {
             $tokens=$null; $errors=$null
             [System.Management.Automation.Language.Parser]::ParseFile("$PWD/tests/$file", [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
           }
+      - name: Validate generated signing guards before downloading the EWDK
+        shell: pwsh
+        run: ./tests/windows_signing_guard_smoke.ps1
       - name: Compile fixed baseline and isolated experiment without running outputs
         shell: pwsh
         run: ./tests/windows_ewdk_build.ps1 -AllowBuildOnly

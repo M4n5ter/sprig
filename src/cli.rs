@@ -118,6 +118,18 @@ enum Command {
         #[arg(long)]
         marker_token: String,
     },
+    #[cfg(all(windows, feature = "vss-experiment"))]
+    #[command(hide = true)]
+    SnapshotImportTreeExperiment {
+        source: PathBuf,
+        name: String,
+        #[arg(long)]
+        root_handle: usize,
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        marker_token: String,
+    },
     #[command(name = "__writable-serve", hide = true)]
     WritableServe {
         #[arg(long)]
@@ -515,6 +527,61 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
                 .map_err(|_| CliError::arguments("invalid snapshot serial"))?;
             result(sprig::vss_experiment::import(
                 &store,
+                source,
+                name,
+                serial,
+                marker_token,
+            )?)
+        }
+        #[cfg(all(windows, feature = "vss-experiment"))]
+        Command::SnapshotImportTreeExperiment {
+            source,
+            name,
+            root_handle,
+            serial,
+            marker_token,
+        } => {
+            use std::os::windows::io::{FromRawHandle, OwnedHandle};
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn DuplicateHandle(
+                    source_process: *mut std::ffi::c_void,
+                    source: *mut std::ffi::c_void,
+                    target_process: *mut std::ffi::c_void,
+                    target: *mut *mut std::ffi::c_void,
+                    access: u32,
+                    inherit: i32,
+                    options: u32,
+                ) -> i32;
+            }
+            if serial.len() != 8 || !serial.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(CliError::arguments(
+                    "serial must be eight hexadecimal digits",
+                ));
+            }
+            let serial = u32::from_str_radix(serial, 16)
+                .map_err(|_| CliError::arguments("invalid snapshot serial"))?;
+            let raw = *root_handle as *mut std::ffi::c_void;
+            let mut flags = 0;
+            if *root_handle == 0
+                || *root_handle == usize::MAX
+                || unsafe { GetHandleInformation(raw, &mut flags) } == 0
+            {
+                return Err(CliError::arguments("invalid inherited snapshot handle"));
+            }
+            // Own only our fresh, non-inheritable duplicate. A malformed numeric
+            // argument must never make validation Drop close an unrelated handle.
+            let mut duplicate = std::ptr::null_mut();
+            let process = unsafe { GetCurrentProcess() };
+            if unsafe { DuplicateHandle(process, raw, process, &mut duplicate, 0, 0, 2) } == 0 {
+                return Err(CliError::arguments("cannot duplicate snapshot capability"));
+            }
+            let handle = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+            result(sprig::vss_experiment::import_tree(
+                &store,
+                handle,
                 source,
                 name,
                 serial,

@@ -1,4 +1,4 @@
-//! Opt-in, synthetic-fixture-only ingestion from an immutable VSS snapshot.
+//! Opt-in, bounded fixture ingestion from an immutable VSS snapshot.
 //!
 //! The trusted requester must retain its VSS lease until this call returns.
 //! A device-looking pathname and a marker are not proof of a live VSS lease,
@@ -6,10 +6,11 @@
 //! nor deletes snapshots, enables privileges, or opens the source for writing.
 //! It intentionally does not relax the ordinary platform path restrictions.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -40,6 +41,309 @@ const ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const EPOCH_TICKS: i128 = 116_444_736_000_000_000;
 const INVALID_HANDLE: *mut c_void = -1isize as *mut c_void;
+const TREE_BYTES: u64 = 32 * 1024 * 1024;
+const TREE_ENTRIES: usize = 4096;
+const TREE_DEPTH: usize = 64;
+// FILE_GENERIC_READ after Windows has expanded GENERIC_READ. No write, delete,
+// owner, DACL, execute/traverse, maximum-allowed, or generic access is accepted.
+const FILE_GENERIC_READ: u32 = 0x0012_0089;
+const FILE_READ_DATA_ATTRIBUTES: u32 = 0x0081;
+const NT_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const NT_SYNCHRONOUS_NONALERT: u32 = 0x0020;
+const NT_DIRECTORY_FILE: u32 = 0x0001;
+const NT_NON_DIRECTORY_FILE: u32 = 0x0040;
+const OBJ_DONT_REPARSE: u32 = 0x1000;
+const QUERY_BYTES: usize = 64 * 1024;
+
+/// Imports the complete bounded tree beneath an owned read-only directory
+/// handle. The trusted requester must keep its immutable VSS lease alive until
+/// this returns. `expected_root` is an exact binding assertion, never authority
+/// to open the tree: only the inherited handle authorizes descendant opens.
+///
+/// The only accepted root is an explicitly expected VSS device's `\\fixture`.
+/// The volume serial and outer marker token are checked independently. This
+/// neither creates a snapshot nor establishes human authorization or a lease.
+/// At most 4096 entries (including root), depth 64, and 32 MiB of logical file
+/// contents (counting every hard-link alias) are accepted. All files are read;
+/// timestamps, USNs, and prior captures are never used to skip content.
+pub fn import_tree(
+    store: &crate::Store,
+    root: OwnedHandle,
+    expected_root: &Path,
+    name: &str,
+    serial: u32,
+    token: &str,
+) -> crate::Result<crate::WorkspaceResult> {
+    let capability = SnapshotTree::from_handle(root, expected_root, serial, token)?;
+    store.import_streamed_writable(name, |batch| capability.capture(batch))
+}
+
+// Deliberately private and non-Clone. The handle binds descendant reads, but
+// VSS lease lifetime is still enforced by the trusted requester/job protocol,
+// not by this Rust type or by the directory handle alone.
+struct SnapshotTree {
+    root: Node,
+    volume: Node,
+    marker: Node,
+    serial: u32,
+    token: String,
+}
+
+impl SnapshotTree {
+    fn from_handle(
+        root: OwnedHandle,
+        expected_root: &Path,
+        serial: u32,
+        token: &str,
+    ) -> crate::Result<Self> {
+        validate_token(token)?;
+        let expected = expected_root
+            .to_str()
+            .ok_or_else(|| invalid("expected snapshot fixture root must be ASCII"))?;
+        validate_root(expected)?;
+        let file = File::from(root);
+        require_read_only_handle(&file)?;
+        let before = snapshot(&file, serial)?;
+        if !before.directory {
+            return Err(invalid("snapshot capability must own a directory handle").into());
+        }
+        // Query the device name from the handle, not from a command-line path.
+        let path = final_device_path(&file)?;
+        let device = validate_root_binding(&path, expected)?.to_owned();
+        let root = Node { file, path, before };
+        validate_tree_metadata(&root)?;
+
+        // The only absolute open is the already handle-derived device root.
+        // Keep this ancestor and the inherited root alive for the entire scan.
+        let volume = Node::open(format!("{device}\\"), true, serial)?;
+        same_volume(&volume, &root)?;
+        let bound_root = Node::open_relative(&volume, "fixture", true, serial)?;
+        if bound_root.before != root.before || final_device_path(&bound_root.file)? != root.path {
+            return Err(invalid("inherited handle does not bind to the approved fixture").into());
+        }
+        let marker = Node::open_relative(&volume, OUTER_MARKER, false, serial)?;
+        same_volume(&volume, &marker)?;
+        validate_tree_metadata(&marker)?;
+        let expected_marker = format!("sprig-vss-synthetic-only-v1\n{token}\n");
+        if marker.before.links != 1
+            || marker.before.size != expected_marker.len() as u64
+            || read_bounded(&marker, expected_marker.len() as u64)? != expected_marker.as_bytes()
+        {
+            return Err(
+                invalid("synthetic volume marker does not match the expected token").into(),
+            );
+        }
+        Ok(Self {
+            root,
+            volume,
+            marker,
+            serial,
+            token: token.to_owned(),
+        })
+    }
+
+    fn capture(self, batch: &mut content::ObjectBatch) -> crate::Result<Manifest> {
+        let Self {
+            root,
+            volume,
+            marker,
+            serial,
+            token,
+        } = self;
+        let root_path = root.path.clone();
+        let mut nodes = vec![TreeNode {
+            node: root,
+            relative: String::new(),
+            parent: None,
+            depth: 0,
+            children: None,
+        }];
+        let mut budget = TreeBudget::default();
+        budget.add(0, true, 0)?;
+        // First inspect the entire tree and all metadata before writing objects.
+        // Every opened directory and leaf stays owned until capture is complete.
+        let mut index = 0;
+        while index < nodes.len() {
+            if nodes[index].node.before.directory {
+                let children = directory_children(&nodes[index].node.file)?;
+                for child in &children {
+                    let depth = nodes[index].depth + 1;
+                    if depth > TREE_DEPTH || nodes.len() >= TREE_ENTRIES {
+                        return Err(invalid("snapshot exceeds its depth or entry bound").into());
+                    }
+                    let node = Node::open_relative(
+                        &nodes[index].node,
+                        &child.name,
+                        child.directory,
+                        serial,
+                    )?;
+                    same_volume(&volume, &node)?;
+                    validate_tree_metadata(&node)?;
+                    budget.add(depth, node.before.directory, node.before.size)?;
+                    let relative = if nodes[index].relative.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{}/{}", nodes[index].relative, child.name)
+                    };
+                    nodes.push(TreeNode {
+                        node,
+                        relative,
+                        parent: Some(index),
+                        depth,
+                        children: None,
+                    });
+                }
+                nodes[index].children = Some(children);
+            }
+            index += 1;
+        }
+        validate_tree_links(nodes.iter().map(|item| &item.node.before))?;
+
+        let mut manifest = Manifest::new();
+        let mut observed = content::Observed::new();
+        let mut physical = BTreeMap::<(u64, [u8; 16]), (&Snapshot, EntryKind)>::new();
+        for item in &nodes {
+            let node = &item.node;
+            let kind = if node.before.directory {
+                EntryKind::Directory
+            } else {
+                let mut source = &node.file;
+                let mut exact = ExactReader::new(&mut source, node.before.size);
+                let kind = batch.put_reader(&mut exact)?;
+                exact.require_finished()?;
+                if !matches!(&kind, EntryKind::File { size, .. } if *size == node.before.size) {
+                    return Err(invalid("captured size differs from snapshot handle").into());
+                }
+                // Read every alias, rather than silently skipping based on ID.
+                // A physical identity must agree on all supported metadata and
+                // content before it can become a canonical hard-link group.
+                let key = (node.before.volume, node.before.identifier);
+                if let Some((prior, prior_kind)) = physical.get(&key) {
+                    if *prior != &node.before || prior_kind != &kind {
+                        return Err(invalid("hard-link aliases disagree during capture").into());
+                    }
+                } else {
+                    physical.insert(key, (&node.before, kind.clone()));
+                }
+                kind
+            };
+            node.recheck(serial)?;
+            let value = entry(&root_path, &token, &item.relative, &node.before, kind);
+            observed.insert(
+                item.relative.clone(),
+                content::Observation {
+                    id: value.id.clone(),
+                    link_group: None,
+                    device: node.before.volume,
+                    inode: u128::from_le_bytes(node.before.identifier),
+                },
+            );
+            manifest.insert(item.relative.clone(), value);
+        }
+
+        // Repeat complete namespace/stream/identity checks, including paths read
+        // early. A name rebound to another inode must not pass a retained-handle
+        // check: reopen that single name relative to its still-owned parent.
+        for item in &nodes {
+            item.node.recheck(serial)?;
+            validate_tree_metadata(&item.node)?;
+            if let Some(children) = &item.children {
+                if directory_children(&item.node.file)? != *children {
+                    return Err(invalid("snapshot directory changed during capture").into());
+                }
+            }
+            if let Some(parent) = item.parent {
+                let name = item.relative.rsplit('/').next().expect("non-root name");
+                let current = Node::open_relative(
+                    &nodes[parent].node,
+                    name,
+                    item.node.before.directory,
+                    serial,
+                )?;
+                if current.before != item.node.before {
+                    return Err(invalid("snapshot name changed its physical identity").into());
+                }
+            }
+        }
+        if final_device_path(&nodes[0].node.file)? != root_path {
+            return Err(invalid("snapshot root binding changed during capture").into());
+        }
+        let bound_root = Node::open_relative(&volume, "fixture", true, serial)?;
+        let bound_marker = Node::open_relative(&volume, OUTER_MARKER, false, serial)?;
+        if bound_root.before != nodes[0].node.before || bound_marker.before != marker.before {
+            return Err(invalid("snapshot fixture or marker binding changed").into());
+        }
+        volume.recheck(serial)?;
+        marker.recheck(serial)?;
+        validate_tree_metadata(&marker)?;
+        // Use the ordinary canonical path-ID/link-group assignment, including
+        // ungrouped singleton files. Store still owns batch finish/publication.
+        content::assign_link_groups(&mut manifest, &mut observed, &content::Observed::new())?;
+        Ok(manifest)
+    }
+}
+
+struct TreeNode {
+    node: Node,
+    relative: String,
+    parent: Option<usize>,
+    depth: usize,
+    children: Option<Vec<ChildName>>,
+}
+
+#[derive(Default)]
+struct TreeBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+impl TreeBudget {
+    fn add(&mut self, depth: usize, directory: bool, size: u64) -> io::Result<()> {
+        let entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| invalid("entry count overflow"))?;
+        let bytes = self
+            .bytes
+            .checked_add(if directory { 0 } else { size })
+            .ok_or_else(|| invalid("snapshot logical byte count overflow"))?;
+        if depth > TREE_DEPTH || entries > TREE_ENTRIES || bytes > TREE_BYTES {
+            return Err(invalid(
+                "snapshot exceeds 4096 entries, depth 64, or 32 MiB logical content",
+            ));
+        }
+        self.entries = entries;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+fn validate_tree_links<'a>(metadata: impl Iterator<Item = &'a Snapshot>) -> io::Result<()> {
+    let mut identities = BTreeMap::<(u64, [u8; 16]), (&Snapshot, u32)>::new();
+    for value in metadata {
+        let key = (value.volume, value.identifier);
+        if let Some((prior, count)) = identities.get_mut(&key) {
+            if value.directory || *prior != value {
+                return Err(invalid(
+                    "duplicate directory identity or inconsistent hard-link metadata",
+                ));
+            }
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid("hard-link count overflow"))?;
+        } else {
+            identities.insert(key, (value, 1));
+        }
+    }
+    for (value, count) in identities.values() {
+        if !value.directory && value.links != *count {
+            return Err(invalid(
+                "snapshot hard links escape the approved fixture root",
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Imports only the approved six-file synthetic fixture into a CAS-backed
 /// writable workspace. The caller owns the immutable snapshot's lifetime.
@@ -141,6 +445,317 @@ pub(crate) fn capture(
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn validate_root_binding<'a>(actual: &'a str, expected: &str) -> io::Result<&'a str> {
+    validate_root(expected)?;
+    let device = validate_root(actual)?;
+    if actual != expected {
+        return Err(invalid(
+            "inherited handle is not the exact approved VSS fixture root",
+        ));
+    }
+    Ok(device)
+}
+
+fn validate_granted_access(access: u32) -> io::Result<()> {
+    if access & FILE_READ_DATA_ATTRIBUTES != FILE_READ_DATA_ATTRIBUTES
+        || access & !FILE_GENERIC_READ != 0
+    {
+        return Err(invalid(
+            "snapshot capability must grant only read access, including list/read-attributes",
+        ));
+    }
+    Ok(())
+}
+
+fn nt_result(status: i32) -> io::Result<()> {
+    if status < 0 {
+        // SAFETY: this routine maps an NTSTATUS value and has no pointer inputs.
+        Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ))
+    } else if status != 0 {
+        // These synchronous opens/queries require STATUS_SUCCESS, not merely
+        // NT_SUCCESS. In particular, STATUS_PENDING is not completed output.
+        Err(invalid(format!(
+            "unexpected non-success NTSTATUS: {status:#010x}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_read_only_handle(file: &File) -> io::Result<()> {
+    let mut basic = ObjectBasicInfo::default();
+    let mut returned = 0;
+    // SAFETY: File owns a live handle and the output matches the documented
+    // PUBLIC_OBJECT_BASIC_INFORMATION layout. Querying access changes nothing.
+    nt_result(unsafe {
+        NtQueryObject(
+            file.as_raw_handle(),
+            0,
+            (&mut basic as *mut ObjectBasicInfo).cast(),
+            std::mem::size_of::<ObjectBasicInfo>() as u32,
+            &mut returned,
+        )
+    })?;
+    if returned as usize != std::mem::size_of::<ObjectBasicInfo>() {
+        return Err(invalid("unexpected object access-information size"));
+    }
+    validate_granted_access(basic.granted_access)
+}
+
+fn final_device_path(file: &File) -> io::Result<String> {
+    // Bounded even if a malicious/unsupported driver advertises a huge name.
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: owned live file and writable UTF-16 output. VOLUME_NAME_NT (2)
+    // returns the final device path without needing a drive-letter mapping.
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            2,
+        )
+    } as usize;
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length >= buffer.len() {
+        return Err(invalid("snapshot handle path exceeds its bound"));
+    }
+    let nt = String::from_utf16(&buffer[..length])
+        .map_err(|_| invalid("snapshot handle has a non-Unicode path"))?;
+    if !nt.starts_with(r"\Device\") || nt.contains('\0') {
+        return Err(invalid("snapshot handle has no final NT device path"));
+    }
+    Ok(format!(r"\\?\GLOBALROOT{nt}"))
+}
+
+fn validate_child_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.contains(['/', '\\', '\0'])
+        || name.encode_utf16().count() > 255
+    {
+        return Err(invalid(
+            "snapshot child must be one bounded relative component",
+        ));
+    }
+    crate::platform::validate_relative_path(name)
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ChildName {
+    name: String,
+    directory: bool,
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> io::Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| invalid("short native metadata record"))?;
+    Ok(u32::from_le_bytes(value.try_into().expect("four bytes")))
+}
+
+fn i64_at(bytes: &[u8], offset: usize) -> io::Result<i64> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| invalid("short native metadata record"))?;
+    Ok(i64::from_le_bytes(value.try_into().expect("eight bytes")))
+}
+
+fn utf16_field(bytes: &[u8], offset: usize, length: usize) -> io::Result<String> {
+    if length == 0 || length % 2 != 0 {
+        return Err(invalid("invalid native filename length"));
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("native name length overflow"))?;
+    let value = bytes
+        .get(offset..end)
+        .ok_or_else(|| invalid("native name exceeds its record"))?;
+    let units: Vec<u16> = value
+        .chunks_exact(2)
+        .map(|part| u16::from_le_bytes([part[0], part[1]]))
+        .collect();
+    String::from_utf16(&units).map_err(|_| invalid("non-Unicode snapshot name"))
+}
+
+fn parse_directory_buffer(bytes: &[u8], children: &mut Vec<ChildName>) -> io::Result<()> {
+    let mut offset = 0;
+    loop {
+        let record = bytes
+            .get(offset..)
+            .ok_or_else(|| invalid("directory record outside buffer"))?;
+        let next = u32_at(record, 0)? as usize;
+        let length = u32_at(record, 60)? as usize;
+        let end = 68usize
+            .checked_add(length)
+            .ok_or_else(|| invalid("directory name overflow"))?;
+        if end > record.len() || (next != 0 && (next % 8 != 0 || next < end || next > record.len()))
+        {
+            return Err(invalid("invalid native directory record bounds"));
+        }
+        let name = utf16_field(record, 68, length)?;
+        if name != "." && name != ".." {
+            validate_child_name(&name)?;
+            if children.len() >= TREE_ENTRIES || u32_at(record, 64)? != 0 {
+                return Err(invalid(
+                    "directory exceeds entry bound or has unsupported extended attributes",
+                ));
+            }
+            let attributes = u32_at(record, 56)?;
+            if attributes & ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid(
+                    "reparse entries are outside the snapshot tree contract",
+                ));
+            }
+            children.push(ChildName {
+                name,
+                directory: attributes & ATTRIBUTE_DIRECTORY != 0,
+            });
+        }
+        if next == 0 {
+            return Ok(());
+        }
+        offset += next;
+    }
+}
+
+fn directory_children(file: &File) -> io::Result<Vec<ChildName>> {
+    // FILE_FULL_DIR_INFO requires eight-byte alignment. Its filename begins at
+    // byte 68; parse explicit lengths, never a speculative NUL terminator.
+    let mut buffer = vec![0u64; QUERY_BYTES / 8];
+    let mut children = Vec::new();
+    let mut restart = true;
+    loop {
+        buffer.fill(0);
+        // SAFETY: owned directory handle, correctly aligned live output buffer.
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                if restart { 15 } else { 14 },
+                buffer.as_mut_ptr().cast(),
+                QUERY_BYTES as u32,
+            )
+        };
+        if success == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(18) {
+                break;
+            }
+            return Err(error);
+        }
+        restart = false;
+        // SAFETY: the buffer owns QUERY_BYTES initialized bytes for this scope.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), QUERY_BYTES) };
+        parse_directory_buffer(bytes, &mut children)?;
+    }
+    children.sort();
+    let mut names = BTreeSet::new();
+    for child in &children {
+        // A case-sensitive source must not silently collapse when materialized
+        // into the ordinary case-insensitive Windows writable destination.
+        if !names.insert(child.name.to_uppercase()) {
+            return Err(invalid("duplicate or case-alias snapshot child name"));
+        }
+    }
+    Ok(children)
+}
+
+fn validate_tree_attributes(attributes: u32, directory: bool, links: u32) -> io::Result<()> {
+    // Archive/normal/directory are the ordinary writable contract. Reject rather
+    // than silently dropping hidden/system/readonly, sparse/compressed/encrypted,
+    // offline/recall, reparse, or any unknown storage semantics. ACLs and access
+    // times remain outside Sprig's canonical metadata contract, as elsewhere.
+    const ACCEPTED: u32 = ATTRIBUTE_DIRECTORY | 0x20 | 0x80;
+    if attributes & !ACCEPTED != 0
+        || (attributes & ATTRIBUTE_DIRECTORY != 0) != directory
+        || links == 0
+    {
+        return Err(invalid("unsupported snapshot attributes or link metadata"));
+    }
+    Ok(())
+}
+
+fn query_file_information(file: &File, class: u32, buffer: &mut [u64]) -> io::Result<usize> {
+    let mut status = IoStatusBlock::default();
+    // SAFETY: the file remains owned; the output is live, initialized and aligned.
+    // Synchronous metadata queries require no completion callback or event.
+    nt_result(unsafe {
+        NtQueryInformationFile(
+            file.as_raw_handle(),
+            &mut status,
+            buffer.as_mut_ptr().cast(),
+            std::mem::size_of_val(buffer) as u32,
+            class,
+        )
+    })?;
+    if status.information > std::mem::size_of_val(buffer) {
+        return Err(invalid("native file information exceeds its output buffer"));
+    }
+    Ok(status.information)
+}
+
+fn validate_stream_buffer(bytes: &[u8], directory: bool, size: u64) -> io::Result<()> {
+    if directory && bytes.is_empty() {
+        return Ok(());
+    }
+    // Only the one unnamed default data stream is represented by a file Entry.
+    // An empty default stream is still required for an empty regular file.
+    if directory
+        || u32_at(bytes, 0)? != 0
+        || utf16_field(bytes, 24, u32_at(bytes, 4)? as usize)? != "::$DATA"
+        || i64_at(bytes, 8)? < 0
+        || i64_at(bytes, 8)? as u64 != size
+    {
+        return Err(invalid(
+            "named, missing, or inconsistent snapshot data stream",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tree_metadata(node: &Node) -> io::Result<()> {
+    validate_tree_attributes(
+        node.before.attributes,
+        node.before.directory,
+        node.before.links,
+    )?;
+    if node.before.directory {
+        let mut flags = 0u32;
+        // SAFETY: the owned directory and FILE_CASE_SENSITIVE_INFO output remain
+        // live. Case-sensitive directory semantics are not recreated by Sprig.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                node.file.as_raw_handle(),
+                23,
+                (&mut flags as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if flags != 0 {
+            return Err(invalid("case-sensitive directory metadata is unsupported"));
+        }
+    }
+    let mut ea = [0u64; 1];
+    let length = query_file_information(&node.file, 7, &mut ea)?; // FileEaInformation
+    if length != 4 || ea[0] & u64::from(u32::MAX) != 0 {
+        return Err(invalid(
+            "extended attributes are outside the snapshot tree contract",
+        ));
+    }
+    let mut streams = vec![0u64; QUERY_BYTES / 8];
+    let length = query_file_information(&node.file, 22, &mut streams)?; // FileStreamInformation
+    // SAFETY: only the initialized returned prefix of the aligned output is read.
+    let bytes = unsafe { std::slice::from_raw_parts(streams.as_ptr().cast::<u8>(), length) };
+    validate_stream_buffer(bytes, node.before.directory, node.before.size)
 }
 
 fn validate_root(root: &str) -> io::Result<&str> {
@@ -319,6 +934,62 @@ struct Node {
 }
 
 impl Node {
+    fn open_relative(parent: &Node, name: &str, directory: bool, serial: u32) -> io::Result<Self> {
+        validate_child_name(name)?;
+        if !parent.before.directory {
+            return Err(invalid("relative snapshot parent must be a directory"));
+        }
+        let mut units: Vec<u16> = name.encode_utf16().collect();
+        let mut unicode = UnicodeString {
+            length: (units.len() * 2) as u16,
+            maximum_length: (units.len() * 2) as u16,
+            buffer: units.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root: parent.file.as_raw_handle(),
+            name: &mut unicode,
+            attributes: OBJ_DONT_REPARSE,
+            security: std::ptr::null_mut(),
+            quality_of_service: std::ptr::null_mut(),
+        };
+        let mut status = IoStatusBlock::default();
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: parent owns its retained directory handle; exactly one checked
+        // relative component and all NT ABI inputs remain live. NtOpenFile never
+        // creates anything. No reparse following, writes, inheritance, or sharing
+        // of write/delete is requested. The output is a new uniquely owned handle.
+        nt_result(unsafe {
+            NtOpenFile(
+                &mut raw,
+                FILE_GENERIC_READ,
+                &mut attributes,
+                &mut status,
+                SHARE_READ,
+                NT_OPEN_REPARSE_POINT
+                    | NT_SYNCHRONOUS_NONALERT
+                    | if directory {
+                        NT_DIRECTORY_FILE
+                    } else {
+                        NT_NON_DIRECTORY_FILE
+                    },
+            )
+        })?;
+        if raw.is_null() || raw == INVALID_HANDLE {
+            return Err(invalid("native relative open returned an invalid handle"));
+        }
+        // SAFETY: only a successful NtOpenFile's fresh output reaches this point.
+        let file = unsafe { File::from_raw_handle(raw) };
+        let before = snapshot(&file, serial)?;
+        if before.directory != directory || before.links == 0 {
+            return Err(invalid(
+                "relative snapshot node has the wrong type or no links",
+            ));
+        }
+        let path = format!("{}\\{name}", parent.path.trim_end_matches('\\'));
+        Ok(Self { file, path, before })
+    }
+
     fn open(path: String, directory: bool, serial: u32) -> io::Result<Self> {
         let wide = wide(&path)?;
         // SAFETY: a bounded, validated snapshot path is NUL terminated and live;
@@ -373,7 +1044,7 @@ fn same_volume(root: &Node, child: &Node) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Snapshot {
     volume: u64,
     identifier: [u8; 16],
@@ -572,6 +1243,37 @@ fn reject_named_streams(path: &str, directory: bool) -> io::Result<()> {
 
 #[repr(C)]
 #[derive(Default)]
+struct ObjectBasicInfo {
+    attributes: u32,
+    granted_access: u32,
+    handle_count: u32,
+    pointer_count: u32,
+    reserved: [u32; 10],
+}
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    root: *mut c_void,
+    name: *mut UnicodeString,
+    attributes: u32,
+    security: *mut c_void,
+    quality_of_service: *mut c_void,
+}
+#[repr(C)]
+#[derive(Default)]
+struct IoStatusBlock {
+    // The first member is an NTSTATUS/pointer union, hence pointer-sized.
+    status_or_pointer: usize,
+    information: usize,
+}
+#[repr(C)]
+#[derive(Default)]
 struct FileIdInfo {
     volume: u64,
     identifier: [u8; 16],
@@ -629,6 +1331,10 @@ impl Default for FindData {
     }
 }
 const _: () = {
+    assert!(std::mem::size_of::<ObjectBasicInfo>() == 56);
+    assert!(std::mem::offset_of!(ObjectBasicInfo, granted_access) == 4);
+    assert!(std::mem::size_of::<IoStatusBlock>() == 2 * std::mem::size_of::<usize>());
+    assert!(std::mem::offset_of!(ObjectAttributes, root) == std::mem::size_of::<usize>());
     assert!(std::mem::size_of::<FileIdInfo>() == 24);
     assert!(std::mem::offset_of!(FileIdInfo, identifier) == 8);
     assert!(std::mem::size_of::<BasicInfo>() == 40);
@@ -643,6 +1349,12 @@ const _: () = {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn GetFinalPathNameByHandleW(
+        handle: *mut c_void,
+        path: *mut u16,
+        length: u32,
+        flags: u32,
+    ) -> u32;
     fn CreateFileW(
         path: *const u16,
         access: u32,
@@ -681,9 +1393,373 @@ unsafe extern "system" {
     fn FindClose(handle: *mut c_void) -> i32;
 }
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryObject(
+        handle: *mut c_void,
+        class: u32,
+        info: *mut c_void,
+        size: u32,
+        returned: *mut u32,
+    ) -> i32;
+    fn NtOpenFile(
+        handle: *mut *mut c_void,
+        access: u32,
+        attributes: *mut ObjectAttributes,
+        status: *mut IoStatusBlock,
+        share: u32,
+        options: u32,
+    ) -> i32;
+    fn NtQueryInformationFile(
+        handle: *mut c_void,
+        status: *mut IoStatusBlock,
+        info: *mut c_void,
+        size: u32,
+        class: u32,
+    ) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_metadata(directory: bool) -> Snapshot {
+        Snapshot {
+            volume: 42,
+            identifier: [1; 16],
+            size: 0,
+            links: 1,
+            attributes: if directory { ATTRIBUTE_DIRECTORY } else { 0x20 },
+            directory,
+            creation: EPOCH_TICKS as i64,
+            write: EPOCH_TICKS as i64,
+            change: EPOCH_TICKS as i64,
+        }
+    }
+
+    fn directory_record(name: &str, attributes: u32) -> Vec<u8> {
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let mut record = vec![0; 68 + 2 * name.len()];
+        record[56..60].copy_from_slice(&attributes.to_le_bytes());
+        record[60..64].copy_from_slice(&(2 * name.len() as u32).to_le_bytes());
+        for (bytes, unit) in record[68..].chunks_exact_mut(2).zip(name) {
+            bytes.copy_from_slice(&unit.to_le_bytes());
+        }
+        record
+    }
+
+    #[test]
+    fn tree_capability_scope_and_resource_bounds_are_fail_closed() {
+        assert!(nt_result(0).is_ok());
+        assert!(nt_result(0x103).is_err()); // STATUS_PENDING
+        assert!(nt_result(0x4000_0000).is_err()); // Informational, not success.
+        let root = r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\fixture";
+        assert!(validate_root_binding(root, root).is_ok());
+        for other in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy2\fixture",
+            r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\fixture\src",
+            r"C:\fixture",
+        ] {
+            assert!(validate_root_binding(other, root).is_err());
+            assert!(validate_root_binding(root, other).is_err());
+        }
+        for accepted in [FILE_GENERIC_READ, FILE_READ_DATA_ATTRIBUTES] {
+            assert!(validate_granted_access(accepted).is_ok());
+        }
+        for denied in [
+            0,
+            0x80,
+            GENERIC_READ,
+            0x1000_0000,
+            0x0002,
+            0x0004,
+            0x0010,
+            0x0020,
+            0x0040,
+            0x0100,
+            0x0001_0000,
+            0x0004_0000,
+            0x0008_0000,
+        ] {
+            assert!(validate_granted_access(denied).is_err());
+            if denied != 0 && denied != 0x80 {
+                assert!(validate_granted_access(FILE_GENERIC_READ | denied).is_err());
+            }
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            r"a\b",
+            "a:ads",
+            "NUL.txt",
+            "trailing.",
+            "a\0b",
+        ] {
+            assert!(validate_child_name(name).is_err(), "{name:?}");
+        }
+        assert!(validate_child_name("Cargo.toml").is_ok());
+        assert!(validate_child_name("模块.rs").is_ok());
+        let mut budget = TreeBudget::default();
+        budget.add(0, true, u64::MAX).unwrap();
+        budget.add(TREE_DEPTH, false, TREE_BYTES).unwrap();
+        assert!(budget.add(1, false, 1).is_err());
+        assert!(budget.add(TREE_DEPTH + 1, true, 0).is_err());
+        assert_eq!(budget.bytes, TREE_BYTES);
+        for _ in 2..TREE_ENTRIES {
+            budget.add(1, true, 0).unwrap();
+        }
+        assert!(budget.add(1, true, 0).is_err());
+        assert!(
+            TreeBudget {
+                entries: 0,
+                bytes: u64::MAX
+            }
+            .add(0, false, 1)
+            .is_err()
+        );
+        for attributes in [
+            ATTRIBUTE_READONLY,
+            0x2,
+            0x4,
+            0x100,
+            0x200,
+            0x400,
+            0x800,
+            0x1000,
+            0x4000,
+            0x40000,
+        ] {
+            assert!(validate_tree_attributes(attributes, false, 1).is_err());
+        }
+        assert!(validate_tree_attributes(0x20, false, 1).is_ok());
+        assert!(validate_tree_attributes(ATTRIBUTE_DIRECTORY, true, 1).is_ok());
+        assert!(validate_tree_attributes(0x20, false, 0).is_err());
+    }
+
+    #[test]
+    fn native_tree_records_and_hard_link_groups_are_validated() {
+        let record = directory_record("Cargo.toml", 0x20);
+        let mut children = Vec::new();
+        parse_directory_buffer(&record, &mut children).unwrap();
+        assert_eq!(
+            children,
+            [ChildName {
+                name: "Cargo.toml".to_owned(),
+                directory: false
+            }]
+        );
+        for bad in [
+            record[..record.len() - 1].to_vec(),
+            directory_record("../outside", 0),
+            directory_record("link", ATTRIBUTE_REPARSE_POINT),
+        ] {
+            assert!(parse_directory_buffer(&bad, &mut Vec::new()).is_err());
+        }
+        for (offset, value) in [(0, 1u32), (0, u32::MAX), (60, u32::MAX), (64, 1)] {
+            let mut bad = record.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(parse_directory_buffer(&bad, &mut Vec::new()).is_err());
+        }
+        let mut stream = vec![0; 38];
+        stream[4..8].copy_from_slice(&14u32.to_le_bytes());
+        for (bytes, unit) in stream[24..]
+            .chunks_exact_mut(2)
+            .zip("::$DATA".encode_utf16())
+        {
+            bytes.copy_from_slice(&unit.to_le_bytes());
+        }
+        assert!(validate_stream_buffer(&stream, false, 0).is_ok());
+        assert!(validate_stream_buffer(&[], true, 0).is_ok());
+        assert!(validate_stream_buffer(&[], false, 0).is_err());
+        assert!(validate_stream_buffer(&stream, true, 0).is_err());
+        assert!(validate_stream_buffer(&stream, false, 1).is_err());
+        let mut ads = stream.clone();
+        ads[26] = b'x';
+        assert!(validate_stream_buffer(&ads, false, 0).is_err());
+        stream[0..4].copy_from_slice(&40u32.to_le_bytes());
+        assert!(validate_stream_buffer(&stream, false, 0).is_err());
+
+        let mut directory = sample_metadata(true);
+        directory.identifier = [0; 16];
+        let mut file = sample_metadata(false);
+        file.links = 2;
+        assert!(validate_tree_links([&directory, &file, &file].into_iter()).is_ok());
+        assert!(validate_tree_links([&directory, &file].into_iter()).is_err());
+        assert!(validate_tree_links([&directory, &directory].into_iter()).is_err());
+        let mut changed = file.clone();
+        changed.write += 1;
+        assert!(validate_tree_links([&file, &changed].into_iter()).is_err());
+        let mut manifest = Manifest::new();
+        let mut observed = content::Observed::new();
+        for (path, metadata) in [("", &directory), ("a", &file), ("b", &file)] {
+            let kind = if metadata.directory {
+                EntryKind::Directory
+            } else {
+                EntryKind::File {
+                    size: 0,
+                    chunks: vec![],
+                }
+            };
+            let value = entry("root", "token", path, metadata, kind);
+            observed.insert(
+                path.to_owned(),
+                content::Observation {
+                    id: value.id.clone(),
+                    link_group: None,
+                    device: metadata.volume,
+                    inode: u128::from_le_bytes(metadata.identifier),
+                },
+            );
+            manifest.insert(path.to_owned(), value);
+        }
+        content::assign_link_groups(&mut manifest, &mut observed, &content::Observed::new())
+            .unwrap();
+        assert_ne!(manifest["a"].id, manifest["b"].id);
+        assert_eq!(manifest["a"].link_group.as_ref(), Some(&manifest["a"].id));
+        assert_eq!(manifest["a"].link_group, manifest["b"].link_group);
+        assert_eq!(manifest[""].link_group, None);
+    }
+
+    #[test]
+    fn local_windows_handles_are_relative_read_only_and_not_vss_authority() -> crate::Result<()> {
+        use std::fs::{self, OpenOptions};
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        struct Temporary(std::path::PathBuf);
+        impl Drop for Temporary {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "sprig-vss-handles-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&path)?;
+        let temporary = Temporary(path.canonicalize()?);
+        let source = temporary.0.join("source");
+        fs::create_dir(&source)?;
+        fs::create_dir(source.join("src"))?;
+        fs::write(source.join("a"), b"bounded")?;
+        fs::hard_link(source.join("a"), source.join("b"))?;
+        fs::write(source.join("ads"), b"ordinary")?;
+        fs::write(source.join("ads:extra"), b"not represented")?;
+        let root_file = OpenOptions::new()
+            .access_mode(GENERIC_READ)
+            .share_mode(SHARE_READ)
+            .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+            .open(&source)?;
+        require_read_only_handle(&root_file)?;
+        let mut serial = 0;
+        // SAFETY: owned live handle; only the requested serial output is nonnull.
+        if unsafe {
+            GetVolumeInformationByHandleW(
+                root_file.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                &mut serial,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let root = Node {
+            before: snapshot(&root_file, serial)?,
+            file: root_file,
+            path: source
+                .to_str()
+                .expect("Unicode temporary directory")
+                .to_owned(),
+        };
+        validate_tree_metadata(&root)?;
+        assert_eq!(
+            directory_children(&root.file)?
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "ads", "b", "src"]
+        );
+        let a = Node::open_relative(&root, "a", false, serial)?;
+        let b = Node::open_relative(&root, "b", false, serial)?;
+        assert_eq!(a.before, b.before);
+        validate_tree_links([&a.before, &b.before].into_iter())?;
+        assert!(validate_tree_links([&a.before].into_iter()).is_err());
+        validate_tree_metadata(&a)?;
+        assert!(
+            validate_tree_metadata(&Node::open_relative(&root, "ads", false, serial)?).is_err()
+        );
+        assert!(Node::open_relative(&root, "../a", false, serial).is_err());
+        assert!(Node::open_relative(&root, "src", false, serial).is_err());
+        assert!(Node::open_relative(&root, "a", true, serial).is_err());
+        assert_eq!(read_bounded(&a, 7)?, b"bounded");
+        a.recheck(serial)?;
+
+        let store_path = temporary.0.join("store");
+        let store = crate::Store::init(&store_path)?;
+        let state = fs::read(store_path.join("state.json"))?;
+        let expected = Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\fixture");
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(
+            import_tree(
+                &store,
+                root.file.try_clone()?.into(),
+                expected,
+                "ordinary",
+                serial,
+                token
+            )
+            .is_err()
+        );
+        assert!(
+            import_tree(
+                &store,
+                a.file.try_clone()?.into(),
+                expected,
+                "file",
+                serial,
+                token
+            )
+            .is_err()
+        );
+        let writable = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temporary.0.join("writable"))?;
+        assert!(require_read_only_handle(&writable).is_err());
+        assert!(import_tree(&store, writable.into(), expected, "writable", serial, token).is_err());
+        let mut reader = std::ptr::null_mut();
+        let mut writer = std::ptr::null_mut();
+        // SAFETY: live writable output slots; no inheritance/security is requested.
+        if unsafe { CreatePipe(&mut reader, &mut writer, std::ptr::null(), 0) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: CreatePipe succeeded and returned two fresh owned handles.
+        let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
+        let _writer = unsafe { OwnedHandle::from_raw_handle(writer) };
+        assert!(import_tree(&store, reader, expected, "pipe", serial, token).is_err());
+        assert_eq!(state, fs::read(store_path.join("state.json"))?);
+        assert!(store.list()?.workspaces.is_empty());
+        Ok(())
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreatePipe(
+            reader: *mut *mut c_void,
+            writer: *mut *mut c_void,
+            security: *const c_void,
+            size: u32,
+        ) -> i32;
+    }
 
     #[test]
     fn root_and_token_are_narrowly_scoped() {

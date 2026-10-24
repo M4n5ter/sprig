@@ -129,8 +129,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ('${{ inputs.refs_volume }}' -eq 'true' -or ('${{ inputs.vss_compile }}' -eq 'true' -and '${{ inputs.vss_volume }}' -eq 'true')) { throw 'Choose exactly one isolated experiment mode.' }
           $source = Join-Path $env:GITHUB_WORKSPACE 'experiments\windows-vss'
-          python -m py_compile "$source\fixture.py"
+          python -m py_compile "$source\fixture.py" "$source\cargo_fixture.py"
           if ($LASTEXITCODE -ne 0) { throw 'Python source validation failed.' }
+          python "$source\cargo_fixture.py" selftest
+          if ($LASTEXITCODE -ne 0) { throw 'Bounded Cargo oracle selftest failed.' }
           $tokens = $null; $errors = $null
           $ast = [Management.Automation.Language.Parser]::ParseFile("$source\run_vss_fixture.ps1", [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw ($errors | Out-String) }
@@ -180,7 +182,7 @@ jobs:
         if: inputs.vss_volume
         shell: pwsh
         run: |
-          ./experiments/windows-vss/run_vss_fixture.ps1 -AllowSyntheticVolume -DirectImport -Requester "$env:SPRIG_VSS_BUILD\requester.exe" -Sprig "$env:GITHUB_WORKSPACE\target\release\sprig.exe"
+          ./experiments/windows-vss/run_vss_fixture.ps1 -AllowSyntheticVolume -CargoWorkload -Requester "$env:SPRIG_VSS_BUILD\requester.exe" -Sprig "$env:GITHUB_WORKSPACE\target\release\sprig.exe"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -191,4 +193,6 @@ jobs:
             ${{ runner.temp }}/sprig-vss-evidence-*/result.json
             ${{ runner.temp }}/sprig-vss-evidence-*/*.log
             ${{ runner.temp }}/sprig-vss-evidence-*/capture-*.json
+            ${{ runner.temp }}/sprig-vss-evidence-*/cargo-prepare.json
+            ${{ runner.temp }}/sprig-vss-evidence-*/cargo-finalize.json
           if-no-files-found: warn

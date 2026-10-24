@@ -215,16 +215,19 @@ Options parse(int argc, wchar_t** argv) {
             (o.exe[0] >= L'a' && o.exe[0] <= L'z')) && o.exe[1] == L':' && o.exe[2] == L'\\',
             "Child executable must be an absolute local drive path");
     require(same(o.exe.substr(o.exe.size() - 4), L".exe"), "Child must be an executable, not a script or shell command");
-    unsigned substitutions = 0;
+    unsigned substitutions = 0, handleSubstitutions = 0;
     for (; i < argc; ++i) {
         std::wstring arg = argv[i];
         require(arg.size() <= 8192 && o.args.size() < 64, "Child argument bound exceeded");
-        if (arg == L"{snapshot-root}") ++substitutions;
-        else require(arg.find(L"{snapshot-root}") == std::wstring::npos,
+        if (arg == L"{snapshot-handle}") ++handleSubstitutions;
+        else if (arg == L"{snapshot-root}") ++substitutions;
+        else require(arg.find(L"{snapshot-root}") == std::wstring::npos &&
+                     arg.find(L"{snapshot-handle}") == std::wstring::npos,
                      "Snapshot substitution must occupy one entire argument");
         o.args.push_back(arg);
     }
     require(substitutions == 1, "Exactly one child argument must be {snapshot-root}");
+    require(handleSubstitutions <= 1, "At most one inherited snapshot handle argument is permitted");
     return o;
 }
 
@@ -573,8 +576,29 @@ bool waitJobEmpty(HANDLE job, DWORD timeout) {
 }
 
 void runChild(const Options& o, const std::wstring& root, Report& r) {
+    // The Session remains the lease owner until this entire job drains. The
+    // inherited read-only root is an object capability, not a reusable path grant.
+    SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    const bool capabilityRequested = std::find(o.args.begin(), o.args.end(), L"{snapshot-handle}") != o.args.end();
+    Handle snapshotRoot;
+    if (capabilityRequested) {
+        const std::wstring fixture = root + L"fixture";
+        snapshotRoot.reset(CreateFileW(fixture.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            &inheritable, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        win(static_cast<bool>(snapshotRoot), "Open immutable snapshot fixture capability");
+        BY_HANDLE_FILE_INFORMATION info{};
+        win(GetFileInformationByHandle(snapshotRoot.get(), &info) != FALSE, "Inspect snapshot root capability");
+        require(GetFileType(snapshotRoot.get()) == FILE_TYPE_DISK &&
+            (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+            (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+            info.dwVolumeSerialNumber == o.serial, "Snapshot root capability binding mismatch");
+    }
     std::wstring command = quoteArg(o.exe);
-    for (const auto& arg : o.args) command += L" " + quoteArg(arg == L"{snapshot-root}" ? root : arg);
+    for (const auto& arg : o.args) {
+        const auto value = arg == L"{snapshot-root}" ? root : arg == L"{snapshot-handle}" ?
+            std::to_wstring(reinterpret_cast<std::uintptr_t>(snapshotRoot.get())) : arg;
+        command += L" " + quoteArg(value);
+    }
     require(command.size() < 30000, "Child command line exceeds conservative bound");
     std::vector<wchar_t> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(L'\0');
@@ -585,17 +609,18 @@ void runChild(const Options& o, const std::wstring& root, Report& r) {
     win(SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits,
                                 sizeof(limits)) != FALSE, "Set owned-job lifetime");
     HANDLE jobForAttribute = job.get();
-    SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     Handle nullOutput(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, 0, nullptr));
     win(static_cast<bool>(nullOutput), "Open isolated child standard streams");
     HANDLE inheritedNull = nullOutput.get();
+    std::vector<HANDLE> inheritedHandles{inheritedNull};
+    if (snapshotRoot) inheritedHandles.push_back(snapshotRoot.get());
     Attributes attributes;
     win(UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
                                    &jobForAttribute, sizeof(jobForAttribute), nullptr, nullptr) != FALSE,
         "Assign job at child creation");
     win(UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   &inheritedNull, sizeof(inheritedNull), nullptr, nullptr) != FALSE,
+                                   inheritedHandles.data(), inheritedHandles.size() * sizeof(HANDLE), nullptr, nullptr) != FALSE,
         "Restrict child inherited handles");
     STARTUPINFOEXW startup{};
     startup.StartupInfo.cb = sizeof(startup);
@@ -641,7 +666,7 @@ void usage() {
         L"  --marker-token 32HEX --acknowledge-storage-snapshot-only --allow-own-volume-diff-512m\n"
         L"  --child-exe C:\\absolute\\python.exe [--vss-timeout-seconds 120]\n"
         L"  [--child-timeout-seconds 300] -- child-arguments {snapshot-root}\n"
-        L"Exactly one whole child argument must be {snapshot-root}. No shell is invoked.\n"
+        L"Exactly one whole child argument must be {snapshot-root}; optionally one {snapshot-handle}. No shell is invoked.\n"
         L"Marker: .sprig-vss-synthetic-volume with ASCII sprig-vss-synthetic-only-v1 LF TOKEN LF.\n"
         L"Timeouts are 1..3600 seconds; API calls themselves are not hard real-time bounded.\n"
         L"Only exit 0 plus final ok=true and cleanup confirmations is a completed experiment.\n"

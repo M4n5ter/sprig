@@ -8,6 +8,7 @@
 param(
     [switch] $AllowSyntheticVolume,
     [switch] $DirectImport,
+    [switch] $CargoWorkload,
     [Parameter(Mandatory)] [string] $Requester,
     [Parameter(Mandatory)] [string] $Sprig,
     [string] $Python = 'python',
@@ -48,6 +49,12 @@ function Resolve-LocalFile([string] $Path) {
 $Requester = Resolve-LocalFile $Requester
 $Sprig = Resolve-LocalFile $Sprig
 $Fixture = Resolve-LocalFile $Fixture
+$cargoFixture = Resolve-LocalFile (Join-Path $PSScriptRoot 'cargo_fixture.py')
+$cargo = $null
+if ($CargoWorkload) {
+    $cargoCommand = Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $cargo = Resolve-LocalFile $cargoCommand.Source
+}
 $pythonCommand = Get-Command $Python -CommandType Application -ErrorAction Stop | Select-Object -First 1
 $Python = Resolve-LocalFile $pythonCommand.Source
 $root = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path
@@ -135,6 +142,8 @@ $result = [ordered]@{
     min_diff_area_file_size_mib = $minimumMiB; image_os = $env:ImageOS
     operating_system = ($os | Select-Object Caption, Version, BuildNumber)
     created = $false; mounted = $false; formatted = $false; cleanup = 'not-mounted'
+    workload = $(if ($CargoWorkload) { 'cargo-incremental' } else { 'fixed-six-file' })
+    cargo_prepare = $null; cargo_finalize = $null
     captures = @(); storage_checkpoints = @(); storage_measurement = @(); errors = @()
     budget_plan = [ordered]@{
         capture_count = 4; fixture_file_bytes_ceiling = 25MB
@@ -150,9 +159,17 @@ $result = [ordered]@{
         limitation = 'Finite normal-operation bounds for four fixed six-entry fixtures: at most 6160 payload chunks at minimum 16 KiB, 53-byte packed index entries, and bounded manifests/state/backups. Not a filesystem quota or protection against arbitrary OS/software faults. Tool/build outputs are outside this synthetic experiment budget.'
     }
 }
+if ($CargoWorkload) {
+    $result.payload_file_mib = $null; $result.payload_files = $null
+    $result.budget_plan.capture_count = 1
+    $result.budget_plan.fixture_file_bytes_ceiling = 32MB
+    $result.budget_plan.limitation = 'One dependency-free Cargo tree, at most 32 MiB summed path lengths and 512 entries, one capture and one restored continuation. Existing larger external allowance retained conservatively; fixed commands and byte-capped logs. Not an OS quota. Compiler/toolchain installation is not part of this experiment.'
+}
 $mountAttempted = $false
 $runtimeUncertain = $false
 $writer = $null
+$prepareWork = $null
+$finalWork = $null
 $partition = $null
 $initializedIdentity = $null
 $volumeGuid = $null
@@ -352,6 +369,28 @@ function Copy-CaptureEvidence([string] $CaptureWork, [string] $Label) {
         }
     }
 }
+function Copy-CargoEvidence([string] $Work, [string] $Phase) {
+    if (-not $Work -or -not (Test-Path -LiteralPath $Work -PathType Container)) { return }
+    Assert-PlainPath $Work
+    $reportName = if ($Phase -eq 'prepare') { 'prepare.json' } else { 'finalize.json' }
+    $reportPath = Join-Path $Work $reportName
+    if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
+        Assert-PlainPath $reportPath
+        if ((Get-Item -LiteralPath $reportPath).Length -gt 1MB) { throw 'Cargo report exceeded fixed bound.' }
+        Copy-Item -LiteralPath $reportPath -Destination (Join-Path $evidence ('cargo-' + $reportName))
+    }
+    foreach ($number in 1..4) {
+        foreach ($stream in @('stdout', 'stderr')) {
+            $name = 'cargo-{0:D2}.{1}.log' -f $number, $stream
+            $path = Join-Path (Join-Path $Work 'logs') $name
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                Assert-PlainPath $path
+                if ((Get-Item -LiteralPath $path).Length -gt 512KB) { throw 'Cargo log exceeded fixed bound.' }
+                Copy-Item -LiteralPath $path -Destination (Join-Path $evidence ($Phase + '-' + $name))
+            }
+        }
+    }
+}
 function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
     if ($result.captures.Count -ge 4) { throw 'The fixed four-capture experiment budget is exhausted.' }
     Assert-OwnVolume
@@ -363,6 +402,12 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
         '--sprig', $Sprig, '--label', $Label)
     if ($PreviousReport) { $childArguments += @('--previous-report', $PreviousReport) }
     if ($DirectImport) { $childArguments += '--direct-import' }
+    if ($CargoWorkload) {
+        $childArguments = @($cargoFixture, 'capture', '{snapshot-root}', '--snapshot-handle', '{snapshot-handle}',
+            '--serial', $serialHex, '--marker-token', $markerToken, '--live-root', $liveRoot,
+            '--relative-path', 'fixture', '--work-root', $captureWork, '--store', $store,
+            '--sprig', $Sprig, '--prepare-report', (Join-Path $hostWork 'cargo-prepare\prepare.json'), '--label', $Label)
+    }
     $arguments = @('--approved-synthetic-volume', $volumeGuid, '--expected-serial', $serialHex,
         '--marker-token', $markerToken, '--acknowledge-storage-snapshot-only', '--allow-own-volume-diff-512m',
         '--vss-timeout-seconds', '120', '--child-timeout-seconds', '300', '--child-exe', $Python, '--') + $childArguments
@@ -496,6 +541,33 @@ try {
     [IO.File]::WriteAllText($marker, "sprig-vss-synthetic-only-v1`n$markerToken`n", [Text.ASCIIEncoding]::new())
     Assert-OwnVolume
     Assert-NoOwnVssState
+    if ($CargoWorkload) {
+        $prepareWork = Join-Path $hostWork 'cargo-prepare'
+        $script:runtimeUncertain = $true
+        [void](Invoke-OwnedProcess $Python @($cargoFixture, 'prepare', '--live-root', $liveRoot,
+            '--work-root', $prepareWork, '--cargo', $cargo) 'cargo-prepare' 600)
+        $result.cargo_prepare = Get-Content -LiteralPath (Join-Path $prepareWork 'prepare.json') -Raw | ConvertFrom-Json
+        if ($result.cargo_prepare.status -ne 'passed' -or $result.cargo_prepare.stage -ne 'prepare' -or
+            $result.cargo_prepare.cleanup_safe -ne $true -or $result.cargo_prepare.all_direct_children_exited -ne $true -or
+            $result.cargo_prepare.all_direct_child_pipes_drained -ne $true) { throw 'Cargo preparation child lifetime is unverified; retain volume.' }
+        $script:runtimeUncertain = $false
+        [void](Assert-OutputBudget 'cargo-prepared')
+        Record-StorageMeasurement 'cargo-prepared'
+        $env:SPRIG_VSS_ENABLE_RUNTIME = '1'
+        $cargoCapture = Invoke-Capture 'cargo-edited'
+        $finalWork = Join-Path $hostWork 'cargo-finalize'
+        $script:runtimeUncertain = $true
+        [void](Invoke-OwnedProcess $Python @($cargoFixture, 'finalize', '--capture-report', $cargoCapture,
+            '--prepare-report', (Join-Path $prepareWork 'prepare.json'), '--work-root', $finalWork,
+            '--cargo', $cargo) 'cargo-finalize' 600)
+        $result.cargo_finalize = Get-Content -LiteralPath (Join-Path $finalWork 'finalize.json') -Raw | ConvertFrom-Json
+        if ($result.cargo_finalize.status -ne 'passed' -or $result.cargo_finalize.stage -ne 'finalize' -or
+            $result.cargo_finalize.cleanup_safe -ne $true -or $result.cargo_finalize.all_direct_children_exited -ne $true -or
+            $result.cargo_finalize.all_direct_child_pipes_drained -ne $true) { throw 'Restored Cargo child lifetime is unverified; retain volume.' }
+        $script:runtimeUncertain = $false
+        Copy-CargoEvidence $prepareWork 'prepare'
+        Copy-CargoEvidence $finalWork 'finalize'
+    } else {
     [void](Invoke-OwnedProcess $Python @($Fixture, 'prepare', '--live-root', $liveRoot, '--file-mib', '8') 'fixture-prepare' 120)
     [void](Assert-OutputBudget 'prepared')
     Record-StorageMeasurement 'prepared'
@@ -514,6 +586,7 @@ try {
     if ((Wait-OwnedProcess $writer 320) -ne 0) { throw 'Concurrent writer failed to stop cleanly.' }
     $settledReport = Invoke-Capture 'settled'
     [void](Invoke-Capture 'repeated' $settledReport)
+    }
     Record-StorageMeasurement 'completed-before-detach'
     [void](Assert-OutputBudget 'complete')
     $result.ok = $true
@@ -522,6 +595,16 @@ try {
     $result.errors += $_.Exception.Message
 } finally {
     $env:SPRIG_VSS_ENABLE_RUNTIME = $oldRuntimeOptIn
+    try {
+        if ($CargoWorkload) {
+            Copy-CargoEvidence $prepareWork 'prepare'
+            Copy-CargoEvidence $finalWork 'finalize'
+        }
+    } catch {
+        $result.ok = $false
+        $result.errors += ('Cargo evidence copy failed: ' + $_.Exception.Message)
+        if ($null -eq $scriptFailure) { $scriptFailure = $_ }
+    }
     try {
         if ($null -ne $writer -and $writer.Started -and -not $writer.Drained) {
             # Cooperative stop request is confined to our new host directory.

@@ -70,7 +70,7 @@ revision/head publication. It is not a general public VSS API, a lazy mount, or
 permission to open arbitrary GLOBALROOT paths. The requester must keep its
 immutable snapshot alive throughout the call.
 
-The explicit runtime workflow uses direct import, retaining the same full-read,
+The completed six-file direct-import acceptance used the same full-read,
 post-token, CAS listing, native-restore and repeated-content oracles. Three
 invalid identity/root calls must fail without changing state counts; unit tests
 cover read/metadata/batch-publication failures. Direct capture omits the staging
@@ -110,3 +110,32 @@ CAS、暂存和恢复目录在卷外，额外合成输出上限 2 GiB。不改�
 全部恢复/重复内容/快照稳定性检查仍保留，新增错误身份与根路径拒绝测试，不改变严格 checkpoint。
 基线四轮已通过，但其 GetCompressedFileSizeW 字段对普通文件实际是逻辑长度口径，428.675 MiB 不代表物理峰值。
 新测量改用 FILE_STANDARD_INFO.AllocationSize，仍不等于卷级独占占用或连续峰值；不冒称全场景加速、省空间。
+
+## Bounded Cargo acceptance (candidate, not yet runtime verified)
+
+The next explicit runtime dispatch uses a dependency-free Rust library and its
+real Cargo target directory, not the six-file benchmark. Development and test
+profiles retain incremental compilation, disable debug information, and use one
+codegen unit. Clean, no-op and fixed-edit tests precede one storage snapshot.
+Source plus target must fit 32 MiB summed across paths (including aliases), 512
+entries and 16 MiB per file; exceeding a limit fails rather than dropping target
+files or changing the profile. A native restore must match every supported byte,
+mtime, mode and internal hardlink group, then actually report Cargo `Fresh`.
+Another source edit and test must work in that restored directory.
+
+The requester owns the VSS Session until its entire child job has drained. It
+opens the snapshot's fixed fixture directory read-only and explicitly inherits
+only that handle and NUL standard streams. The Python collector forwards only
+that one capability to the hidden import command. A directory handle does not
+itself keep a VSS snapshot alive: the requester/child lifetime protocol remains
+mandatory. The importer checks granted access, handle type and bound snapshot
+identity, then opens children relative to retained directory handles. It does
+not grant ordinary Sprig APIs permission to traverse arbitrary device paths.
+This remains a restricted experiment, not an unprivileged production broker.
+
+The same 1 GiB new NTFS VHDX, same-volume 512 MiB diff cap, fixed Microsoft provider
+and 2 GiB total synthetic-output allowance apply. One Cargo capture replaces the
+four former captures; the larger external reserve is retained conservatively.
+No registry, ACL, service startup, driver or host-security setting is changed.
+Neither a successful build nor a Fresh restore establishes application-atomic
+snapshot semantics or Windows desktop compatibility.

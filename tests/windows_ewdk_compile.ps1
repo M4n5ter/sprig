@@ -1,6 +1,6 @@
 # Only invoked after the parent has verified and read-only mounted the fixed kit.
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$KitRoot,[Parameter(Mandatory)][string]$WorkRoot)
+param([Parameter(Mandatory)][string]$KitRoot,[Parameter(Mandatory)][string]$WorkRoot, [switch]$InspectGuestTools)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $commit='ddca7bd5481857a65ba552f643b8776fd070836f'
@@ -103,6 +103,12 @@ try {
     $include=(@('um','shared','ucrt') | ForEach-Object {' /I"'+$sdk+'\Include\10.0.26100.0\'+$_+'"'}) -join ''
     $libraries=(@('um','ucrt') | ForEach-Object {' /LIBPATH:"'+$sdk+'\Lib\10.0.26100.0\'+$_+'\x64"'}) -join ''
     Run-BuildCommand 'freeze-probe' ('"'+$compiler+'" /nologo /W4 /std:c11 /O2 /DUNICODE /D_UNICODE'+$include+' "'+$harness+'\freeze_probe.c" /Fo"'+$harness+'\freeze_probe.obj" /Fe"'+$harness+'\freeze_probe.exe" /link'+$libraries+' advapi32.lib')
+    if($InspectGuestTools) {
+        $dumpbin=Join-Path ([IO.Path]::GetDirectoryName($compiler)) 'dumpbin.exe'
+        $signtool=Join-Path $sdk 'bin\10.0.26100.0\x64\signtool.exe'
+        # PE inspection only: this does not execute SignTool or generated code.
+        Run-BuildCommand 'guest-signtool-dependencies' ('"'+$dumpbin+'" /nologo /dependents "'+$signtool+'"')
+    }
     $result.compiled=$true
 } finally {
 

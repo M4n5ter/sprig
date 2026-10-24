@@ -1,6 +1,6 @@
 # Explicit build-only validation. Never installs, loads, or runs its outputs.
 [CmdletBinding()]
-param([switch]$AllowBuildOnly)
+param([switch]$AllowBuildOnly, [string]$GuestPayloadDirectory)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -11,7 +11,7 @@ $url = 'https://download.microsoft.com/download/be985897-caaa-4497-9ea4-17fa7065
 $expectedBytes = [long]20002537472
 $limit = [long](24GB)
 $reportPath = Join-Path $PWD 'ewdk-result.json'
-$result = [ordered]@{ outcome='failed'; phase='guard'; source=$url; expectedBytes=$expectedBytes; downloadLimit=$limit; outputLimit=[long](12GB); sha256=$null; mountedReadOnly=$false; scripts=@(); tools=@(); generatedProgramsExecuted=$false; driverLoaded=$false; cleanup='pending'; failure=$null }
+$result = [ordered]@{ scope='host-build-only'; outcome='failed'; phase='guard'; source=$url; expectedBytes=$expectedBytes; downloadLimit=$limit; outputLimit=[long](12GB); sha256=$null; mountedReadOnly=$false; scripts=@(); tools=@(); generatedProgramsExecuted=$false; driverLoaded=$false; cleanup='pending'; failure=$null }
 $created=$false; $mountAttempted=$false
 
 if (Test-Path -LiteralPath $reportPath) { throw 'Report already exists.' }
@@ -69,7 +69,41 @@ try {
     foreach($entry in $result.scripts) { if($entry.sha256 -ne $expectedScripts[$entry.path]) { throw 'Reviewed environment entry script changed.' } }
     Write-Host 'Reviewed initialization and official tool signatures verified; beginning build-only validation.'
     $result.phase='compile'
-    & (Join-Path $PSScriptRoot 'windows_ewdk_compile.ps1') -KitRoot $drive -WorkRoot $root
+    & (Join-Path $PSScriptRoot 'windows_ewdk_compile.ps1') -KitRoot $drive -WorkRoot $root -InspectGuestTools:([bool]$GuestPayloadDirectory)
+    if ($GuestPayloadDirectory) {
+        # Export only this successful build for the separately opted-in guest.
+        # Never publish this directory as an artifact or execute its programs here.
+        if ($GuestPayloadDirectory -notmatch '^D:\\sprig-kernel-payload-[0-9a-f]{32}$' -or (Test-Path -LiteralPath $GuestPayloadDirectory)) { throw 'Guest payload destination must be a new bounded fixture.' }
+        $null=New-Item -ItemType Directory -Path $GuestPayloadDirectory
+        $release=Join-Path $root 'winfsp-ddca7bd5481857a65ba552f643b8776fd070836f\build\VStudio\build\Release'
+        $files=@{}
+        foreach($name in @('winfsp-x64.sys','winfsp-x64.dll','memfs-x64.exe')) { $files[$name]=Join-Path $release $name }
+        $files['freeze_probe.exe']=Join-Path $root 'harness\freeze_probe.exe'
+        $files['signtool.exe']=Join-Path $drive 'Program Files\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe'
+        $buildResult=Get-Content -LiteralPath (Join-Path $PWD 'ewdk-compile-result.json') -Raw | ConvertFrom-Json
+        if(-not $buildResult.compiled -or $buildResult.executed) { throw 'Guest export requires a completed build-only result.' }
+        $manifest=[ordered]@{sourceCommit='ddca7bd5481857a65ba552f643b8776fd070836f';experimentCommit=$env:GITHUB_SHA;files=@()}
+        foreach($name in ($files.Keys | Sort-Object)) {
+            $source=$files[$name]
+            $item=Get-Item -LiteralPath $source
+            if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 16MB) { throw 'Guest payload source type or bound invalid.' }
+            if($name -eq 'signtool.exe') {
+                $sig=Get-AuthenticodeSignature -LiteralPath $source
+                if($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '(^|, )O=Microsoft Corporation(,|$)') { throw 'Guest signing tool must retain valid Microsoft signature.' }
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $GuestPayloadDirectory $name)
+            $hash=(Get-FileHash -LiteralPath $source).Hash
+            if($name -ne 'signtool.exe') {
+                $relative=$source.Substring($root.Length+1)
+                $built=@($buildResult.outputs | Where-Object name -CEQ $relative)
+                if($built.Count -ne 1 -or $built[0].sha256 -ne $hash -or $built[0].bytes -ne $item.Length) { throw 'Guest payload does not match completed build evidence.' }
+            }
+            if((Get-FileHash -LiteralPath (Join-Path $GuestPayloadDirectory $name)).Hash -ne $hash) { throw 'Guest payload copy hash mismatch.' }
+            $manifest.files += [ordered]@{name=$name;bytes=$item.Length;sha256=$hash}
+        }
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $GuestPayloadDirectory 'payload-manifest.json') -Encoding utf8
+        $result['guestPayload']=$manifest
+    }
     $result.outcome='build-only-passed'
 
 } catch {

@@ -1,20 +1,22 @@
-# Opt-in, disposable GitHub-hosted nested-VM boot smoke only.
-# No feature installation, host BCD writes, networking, test signing, drivers,
-# Driver Verifier, credentials in command lines, or preexisting disk/VM changes.
+# Opt-in, disposable GitHub-hosted nested-VM boot smoke. The separately gated
+# kernel-probe mode permits only the approved guest security/test operations.
+# No host feature/security changes, networking, credential arguments, or
+# preexisting disk/VM changes; boot-only mode still never loads a driver.
 # BCDBoot /s confines its BCD/files to the explicit new ESP and does not create
 # a firmware NVRAM entry. Never retry it without /s or fall back to host repair:
 # https://learn.microsoft.com/windows-hardware/manufacture/desktop/bcdboot-command-line-options-techref-di
 [CmdletBinding()]
-param([switch] $AllowGuestBoot)
+param([switch] $AllowGuestBoot, [switch] $AllowKernelProbe, [string] $KernelPayloadDirectory = '')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-if (-not $AllowGuestBoot -or $env:GITHUB_ACTIONS -ne 'true' -or
+if ((-not $AllowGuestBoot -and -not $AllowKernelProbe) -or $env:GITHUB_ACTIONS -ne 'true' -or
     $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
     throw 'Guest boot requires explicit opt-in on a disposable Windows GitHub-hosted runner.'
 }
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required.' }
+if ($AllowKernelProbe -and $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') { throw 'Kernel probe requires explicit workflow dispatch.' }
 
 $isoUrl = 'https://software-static.download.prss.microsoft.com/dbazure/998969d5-f34g-4e03-ac9d-1f9786c66749/26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'
 $isoBytes = [long]8152356864
@@ -30,6 +32,7 @@ $vhdPath = Join-Path $directory 'guest.vhdx'
 $startedAt = [DateTime]::UtcNow
 # Leave time for teardown before the outer 75-minute CI job timeout.
 $workDeadline = $startedAt.AddMinutes(55)
+$expectedSecureBoot = 'On'
 $resultPath = Join-Path (Get-Location).Path 'guest-boot-result.json'
 $eventsPath = Join-Path (Get-Location).Path 'guest-boot-events.json'
 $phases = [Collections.Generic.List[object]]::new()
@@ -72,6 +75,8 @@ $guestJobs = [Collections.Generic.List[object]]::new()
 
 # Only fixed source-defined codes can be copied from an exception message.
 $safeFailureCodes = @(
+    'probe-driver-service-identity-invalid', 'probe-driver-signature-invalid', 'probe-driver-stop-unknown', 'probe-existing-mount-refused', 'probe-existing-service-refused', 'probe-guest-identity-invalid', 'probe-guest-secureboot-still-enabled', 'probe-guest-version-invalid', 'probe-manifest-entry-invalid', 'probe-manifest-invalid', 'probe-memfs-service-identity-invalid', 'probe-memfs-stop-unknown', 'probe-mount-not-ready', 'probe-native-command-failed', 'probe-native-timeout-retain-guest', 'probe-output-oversize', 'probe-payload-hash-invalid', 'probe-payload-invalid', 'probe-preexisting-verifier-refused', 'probe-reason-invalid', 'probe-reparse-refused', 'probe-result-envelope-invalid', 'probe-services-not-stopped', 'probe-signed-driver-changed', 'probe-signed-driver-invalid', 'probe-signing-tool-untrusted', 'probe-test-signing-not-active', 'probe-uncertain-result-retain-guest', 'probe-unexpected-verifier', 'probe-verifier-not-observed', 'probe-verifier-settings-invalid',
+    'probe-payload-invalid', 'probe-protection-changed', 'probe-no-valid-result', 'probe-test-not-safe', 'probe-shutdown-failed',
     'active-deadline-exceeded', 'administrator-required', 'answer-file-already-exists', 'applied-image-missing-kernel',
     'cleanup-directory-identity-changed', 'cleanup-directory-remains', 'cleanup-iso-still-attached', 'cleanup-reparse-point-refused',
     'cleanup-vhd-identity-changed', 'cleanup-vhd-still-attached', 'cleanup-vm-operation-pending', 'disk-identity-changed',
@@ -254,12 +259,12 @@ function Assert-VMIsolation {
     $result.vm.secureBoot = [string]$firmware.SecureBoot
     if ($adapters.Count -ne 0 -or $drives.Count -ne 1 -or $drives[0].Path -ne $vhdPath -or
         $memory.DynamicMemoryEnabled -or $memory.Startup -ne $memoryBytes -or $cpu.Count -ne 2 -or
-        [string]$firmware.SecureBoot -ne 'On') { throw 'vm-isolation-or-resource-limit-invalid' }
+        [string]$firmware.SecureBoot -ne $expectedSecureBoot) { throw 'vm-isolation-or-resource-limit-invalid' }
 }
-function Invoke-Guest([scriptblock] $Script, [int] $TimeoutSeconds = 60) {
+function Invoke-Guest([scriptblock] $Script, [int] $TimeoutSeconds = 60, [object[]] $Arguments = @()) {
     Assert-VMIsolation
     $timeout = Get-RemainingSeconds $TimeoutSeconds
-    $job = Invoke-Command -VMId $vmId -Credential $guestCredential -ScriptBlock $Script -AsJob -ErrorAction Stop
+    $job = Invoke-Command -VMId $vmId -Credential $guestCredential -ScriptBlock $Script -ArgumentList $Arguments -AsJob -ErrorAction Stop
     $guestJobs.Add($job)
     try {
         $null = Wait-Job -Job $job -Timeout $timeout
@@ -268,10 +273,32 @@ function Invoke-Guest([scriptblock] $Script, [int] $TimeoutSeconds = 60) {
         if ($job.ChildJobs.Count -ne 1 -or $job.ChildJobs[0].Error.Count -ne 0) { throw 'guest-command-failed' }
         return $values
     } finally {
-        if ($job.State -notin @('Completed', 'Failed', 'Stopped')) { Stop-Job -Job $job -ErrorAction SilentlyContinue }
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        $null = $guestJobs.Remove($job)
+        if ($job.State -notin @('Completed', 'Failed', 'Stopped') -and $AllowKernelProbe) {
+            # Retain the remote session and its children until the owned VM is
+            # off. Stopping this runspace could kill a live mapping harness.
+        } else {
+            if ($job.State -notin @('Completed', 'Failed', 'Stopped')) { Stop-Job -Job $job -ErrorAction SilentlyContinue }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            $null = $guestJobs.Remove($job)
+        }
     }
+}
+function Invoke-KernelProbe([string] $Mode, [int] $TimeoutSeconds = 90) {
+    $values = @(Invoke-Guest { param($mode); & C:\SprigProbe\windows_guest_probe_payload.ps1 -Mode $mode } $TimeoutSeconds @($Mode))
+    if ($values.Count -ne 1) { throw 'probe-no-valid-result' }
+    if ($null -ne $values[0].PSObject.Properties['probeFailure']) {
+        $failure = $values[0].probeFailure
+        if ($failure.stage -notmatch '^[a-z-]{1,80}$' -or $failure.code -notmatch '^probe-[a-z-]{1,80}$') { throw 'probe-no-valid-result' }
+        $safe = [ordered]@{stage=[string]$failure.stage;code=[string]$failure.code;hresult=[int]$failure.hresult;native=$null}
+        if ($null -ne $failure.native) {
+            if ($failure.native.program -notin @('signtool.exe','sc.exe','bcdedit.exe','verifier.exe','freeze_probe.exe')) { throw 'probe-no-valid-result' }
+            $safe.native=[ordered]@{program=[string]$failure.native.program;completed=[bool]$failure.native.completed;exitCode=$failure.native.exitCode}
+        }
+        $result.kernelProbe['failure']=$safe
+        Write-SafeResult
+        throw 'probe-no-valid-result'
+    }
+    return $values[0]
 }
 function Wait-GuestReady([int] $TimeoutSeconds, [string] $PreviousBoot = '') {
     $until = [DateTime]::UtcNow.AddSeconds((Get-RemainingSeconds $TimeoutSeconds))
@@ -496,6 +523,34 @@ try {
   </settings>
 </unattend>
 "@
+    if ($AllowKernelProbe) {
+        # Copy only pinned build artifacts to this newly created offline guest.
+        # No guest credential has been copied into this directory.
+        if (-not $KernelPayloadDirectory -or $KernelPayloadDirectory -notmatch '^D:\\sprig-kernel-payload-[0-9a-f]{32}$') { throw 'probe-payload-invalid' }
+        Assert-NoReparse $KernelPayloadDirectory
+        $manifestPath = Join-Path $KernelPayloadDirectory 'payload-manifest.json'
+        Assert-NoReparse $manifestPath
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $payloadNames = @('winfsp-x64.sys','winfsp-x64.dll','memfs-x64.exe','freeze_probe.exe','signtool.exe')
+        if ($manifest.sourceCommit -ne 'ddca7bd5481857a65ba552f643b8776fd070836f' -or
+            $manifest.experimentCommit -ne $env:GITHUB_SHA -or @($manifest.files).Count -ne $payloadNames.Count) { throw 'probe-payload-invalid' }
+        $target = Join-Path $osRoot 'SprigProbe'
+        if (Test-Path -LiteralPath $target) { throw 'probe-payload-invalid' }
+        $null = [IO.Directory]::CreateDirectory($target)
+        foreach ($name in $payloadNames) {
+            $entry = @($manifest.files | Where-Object name -CEQ $name)
+            $source = Join-Path $KernelPayloadDirectory $name
+            Assert-NoReparse $source
+            if ($entry.Count -ne 1 -or $entry[0].bytes -gt 64MB -or (Get-Item $source).Length -ne $entry[0].bytes -or
+                (Get-FileHash $source).Hash -ne $entry[0].sha256) { throw 'probe-payload-invalid' }
+            [IO.File]::Copy($source, (Join-Path $target $name), $false)
+        }
+        [IO.File]::Copy($manifestPath, (Join-Path $target 'payload-manifest.json'), $false)
+        [IO.File]::Copy((Join-Path $PSScriptRoot 'windows_guest_probe_payload.ps1'), (Join-Path $target 'windows_guest_probe_payload.ps1'), $false)
+        $result['kernelProbe'] = [ordered]@{sourceCommit=$manifest.sourceCommit; experimentCommit=$manifest.experimentCommit; protectionBefore=$null; protectionAfter=$null; signing=$null; ordinary=$null; verifier=$null; verified=$null; wholeTreeSnapshotVerified=$false}
+        $result.scope = 'Explicit guest-only test signing and fixed experimental RAM mapping probe; no CAS, no guest NIC, no host security changes'
+    } elseif ($KernelPayloadDirectory) { throw 'probe-payload-invalid' }
+
     Assert-InstallTargets
     $panther = Join-Path $offlineWindows 'Panther'
     $null = [IO.Directory]::CreateDirectory($panther)
@@ -531,8 +586,38 @@ try {
 
     Start-Phase 'first-boot-powershell-direct'
     $result.firstBoot = Wait-GuestReady 900
+    $lastBoot = $result.firstBoot
     Remove-GuestAnswerFiles
     Complete-Phase
+
+    if ($AllowKernelProbe) {
+        Start-Phase 'inspect-original-guest-protection'
+        $before = @(Invoke-KernelProbe 'Inspect' 90)
+        if ($before.Count -ne 1 -or $before[0].driverServices -ne 0 -or -not $before[0].secureBoot) { throw 'probe-no-valid-result' }
+        $result.kernelProbe.protectionBefore = $before[0].protection
+        Complete-Phase
+
+        Start-Phase 'normal-shutdown-before-guest-only-secureboot-change'
+        try { $null = Invoke-Guest { & "$env:SystemRoot\System32\shutdown.exe" /s /t 0; if ($LASTEXITCODE -ne 0) { throw 'probe-shutdown-failed' } } 60 } catch { }
+        $until = [DateTime]::UtcNow.AddSeconds((Get-RemainingSeconds 180))
+        while ((Get-OwnedVM).State -ne 'Off' -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Seconds 2 }
+        if ((Get-OwnedVM).State -ne 'Off') { throw 'probe-shutdown-failed' }
+        Set-VMFirmware -VM (Get-OwnedVM) -EnableSecureBoot Off
+        $expectedSecureBoot = 'Off'
+        Assert-VMIsolation
+        Start-VM -VM (Get-OwnedVM) | Out-Null
+        $lastBoot = Wait-GuestReady 480 $result.firstBoot.lastBootUpTimeUtc
+        $result.kernelProbe['secureBootRestart'] = $lastBoot
+        Complete-Phase
+
+        Start-Phase 'check-protection-and-prepare-guest-signature'
+        $after = @(Invoke-KernelProbe 'Inspect' 90)
+        if ($after.Count -ne 1 -or ($before[0].protection | ConvertTo-Json -Compress) -ne ($after[0].protection | ConvertTo-Json -Compress)) { throw 'probe-protection-changed' }
+        $signed = @(Invoke-KernelProbe 'Prepare' 120)
+        if ($signed.Count -ne 1 -or -not $signed[0].testSigningRequested) { throw 'probe-no-valid-result' }
+        $result.kernelProbe.signing = $signed[0]
+        Complete-Phase
+    }
 
     Start-Phase 'normal-guest-reboot'
     Assert-VMIsolation
@@ -547,10 +632,54 @@ try {
         $phase['requestReturned'] = $true
     } catch { $phase['requestReturned'] = $false }
 
-    $result.secondBoot = Wait-GuestReady 480 $result.firstBoot.lastBootUpTimeUtc
+    $result.secondBoot = Wait-GuestReady 480 $lastBoot.lastBootUpTimeUtc
     $result.rebootObserved = $true
     Remove-GuestAnswerFiles
     Complete-Phase
+
+    if ($AllowKernelProbe) {
+        Start-Phase 'verify-protection-after-testsigning'
+        $after = @(Invoke-KernelProbe 'Inspect' 90)
+        if ($after.Count -ne 1 -or ($before[0].protection | ConvertTo-Json -Compress) -ne ($after[0].protection | ConvertTo-Json -Compress)) { throw 'probe-protection-changed' }
+        $result.kernelProbe.protectionAfter = $after[0].protection
+        Complete-Phase
+
+        Start-Phase 'ordinary-ram-mapping-falsification'
+        $trial = @(Invoke-KernelProbe 'Test' 180)
+        if ($trial.Count -ne 1) { throw 'probe-no-valid-result' }
+        $result.kernelProbe.ordinary = $trial[0]
+        Write-SafeResult
+        if ($trial[0].outcome -ne 'no_in_hold_ack_observed' -or $trial[0].exitCode -ne 0 -or
+            -not $trial[0].negativeControlValid -or -not $trial[0].normalMemfsStop -or
+            -not $trial[0].coherency.a_ioctl.completed_hold -or -not $trial[0].coherency.b_ioctl.completed_hold -or
+            -not $trial[0].coherency.writers_recovered -or -not $trial[0].coherency.continuous_stores_recovered -or
+            -not $trial[0].coherency.observation_completed -or -not $trial[0].coherency.timing_valid -or -not $trial[0].coherency.heartbeats_valid) { throw 'probe-test-not-safe' }
+        Complete-Phase
+
+        Start-Phase 'configure-driver-only-oneboot-verifier'
+        $v = @(Invoke-KernelProbe 'Verifier' 90)
+        if ($v.Count -ne 1 -or $v[0].mask -ne 59 -or $v[0].driver -ne 'winfsp-x64.sys' -or $v[0].bootMode -ne 'oneboot') { throw 'probe-no-valid-result' }
+        $result.kernelProbe.verifier = $v[0]
+        try { $null = Invoke-Guest { & "$env:SystemRoot\System32\shutdown.exe" /r /t 0 } 60 } catch { }
+        $verifierBoot = Wait-GuestReady 480 $result.secondBoot.lastBootUpTimeUtc
+        $result.kernelProbe['verifierRestart'] = $verifierBoot
+        $after = @(Invoke-KernelProbe 'Inspect' 90)
+        if ($after.Count -ne 1 -or ($before[0].protection | ConvertTo-Json -Compress) -ne ($after[0].protection | ConvertTo-Json -Compress)) { throw 'probe-protection-changed' }
+        Complete-Phase
+
+        Start-Phase 'verifier-ram-mapping-falsification'
+        $trial = @(Invoke-KernelProbe 'Test' 180)
+        if ($trial.Count -ne 1) { throw 'probe-no-valid-result' }
+        $result.kernelProbe.verified = $trial[0]
+        if (-not $trial[0].verifierActive) { throw 'probe-no-valid-result' }
+        Write-SafeResult
+        if ($trial[0].outcome -ne 'no_in_hold_ack_observed' -or $trial[0].exitCode -ne 0 -or
+            -not $trial[0].negativeControlValid -or -not $trial[0].normalMemfsStop -or
+            -not $trial[0].coherency.a_ioctl.completed_hold -or -not $trial[0].coherency.b_ioctl.completed_hold -or
+            -not $trial[0].coherency.writers_recovered -or -not $trial[0].coherency.continuous_stores_recovered -or
+            -not $trial[0].coherency.observation_completed -or -not $trial[0].coherency.timing_valid -or -not $trial[0].coherency.heartbeats_valid) { throw 'probe-test-not-safe' }
+        Complete-Phase
+    }
 
     Start-Phase 'collect-whitelisted-event-metadata'
     $events = @(Invoke-Guest {
@@ -589,6 +718,12 @@ try {
     while ([DateTime]::UtcNow -lt $shutdownDeadline -and (Get-OwnedVM).State -ne 'Off') { Start-Sleep -Seconds 3 }
     if ((Get-OwnedVM).State -ne 'Off') { throw 'normal-guest-shutdown-deadline-exceeded' }
     $result.normalShutdownObserved = $true
+    if ($AllowKernelProbe) {
+        $finalHostBoot = Get-HostBootFingerprint
+        if ($beforeBoot.systemStoreSha256 -ne $finalHostBoot.systemStoreSha256 -or
+            $beforeBoot.firmwareEntriesSha256 -ne $finalHostBoot.firmwareEntriesSha256) { throw 'host-boot-fingerprint-changed' }
+        $result.hostBoot['afterGuestExperiment'] = $finalHostBoot
+    }
     $smokePassed = $true
     Complete-Phase
 } catch {
@@ -606,14 +741,32 @@ try {
     $result.cleanup.status = 'pending'
     # Preserve safe diagnostics before any Hyper-V/storage teardown can stall.
     try { Write-SafeResult } catch { $cleanupErrors.Add('sanitized-report-write-failed') }
-    foreach ($job in @($guestJobs.ToArray())) {
-        try { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction Stop }
-        catch { $cleanupErrors.Add('guest-job-cleanup-failed') }
+    if (-not $AllowKernelProbe) {
+        foreach ($job in @($guestJobs.ToArray())) {
+            try { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction Stop }
+            catch { $cleanupErrors.Add('guest-job-cleanup-failed') }
+        }
     }
     try {
         $ownedVM = Get-OwnedVM -AllowMissing
         if ($null -ne $ownedVM) {
-            if ($ownedVM.State -ne 'Off') {
+            $safeTrialReturned = $false
+            if ($AllowKernelProbe -and $result.Contains('kernelProbe')) {
+                foreach ($trialResult in @($result.kernelProbe.ordinary, $result.kernelProbe.verified)) {
+                    if ($null -ne $trialResult -and $trialResult.normalMemfsStop) { $safeTrialReturned = $true }
+                }
+            }
+            if ($ownedVM.State -ne 'Off' -and $safeTrialReturned -and $guestJobs.Count -eq 0) {
+                # A useful negative result is not a hang. Prefer normal power
+                # down after all harness handles and memfs have closed.
+                try {
+                    $null = Invoke-Guest { & "$env:SystemRoot\System32\shutdown.exe" /s /t 0 } 30
+                } catch { }
+                $normalUntil = [DateTime]::UtcNow.AddSeconds(60)
+                while ((Get-OwnedVM).State -ne 'Off' -and [DateTime]::UtcNow -lt $normalUntil) { Start-Sleep -Seconds 2 }
+                if ((Get-OwnedVM).State -eq 'Off') { $result.normalShutdownObserved = $true }
+            }
+            if ((Get-OwnedVM).State -ne 'Off') {
                 # Explicit authorization is limited to this exact newly created VM.
                 $stopJob = Stop-VM -VM (Get-OwnedVM) -TurnOff -Force -Confirm:$false -AsJob
                 Wait-CleanupJob $stopJob
@@ -627,6 +780,12 @@ try {
         }
         $result.cleanup.vmRemoved = $true
     } catch { $cleanupErrors.Add('owned-vm-cleanup-failed') }
+    if ($AllowKernelProbe -and $result.cleanup.vmRemoved) {
+        foreach ($job in @($guestJobs.ToArray())) {
+            try { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction Stop }
+            catch { $cleanupErrors.Add('guest-job-cleanup-failed') }
+        }
+    }
     try {
         if ($nativeUnsettled -or -not $result.cleanup.vmRemoved) { throw 'disk-may-still-be-in-use' }
         if (Test-Path -LiteralPath $vhdPath) {

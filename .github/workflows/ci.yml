@@ -4,6 +4,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      kernel_probe:
+        description: Explicit disposable guest signing and RAM mapping experiment
+        type: boolean
+        required: false
+        default: false
       ewdk_build:
         description: Explicit isolated EWDK build-only validation without driver loading
         type: boolean
@@ -28,7 +33,7 @@ permissions:
   contents: read
 jobs:
   check:
-    if: ${{ !inputs.runner_probe && !inputs.guest_boot && !inputs.ewdk_build }}
+    if: ${{ !inputs.runner_probe && !inputs.guest_boot && !inputs.ewdk_build && !inputs.kernel_probe }}
     strategy:
       fail-fast: false
       matrix:
@@ -91,7 +96,7 @@ jobs:
           python3 examples/compare.py --binary target/release/sprig "${args[@]}"
 
   projection:
-    if: ${{ !inputs.runner_probe && !inputs.guest_boot && !inputs.ewdk_build }}
+    if: ${{ !inputs.runner_probe && !inputs.guest_boot && !inputs.ewdk_build && !inputs.kernel_probe }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -123,7 +128,7 @@ jobs:
           if-no-files-found: ignore
 
   windows-probe:
-    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe && !inputs.guest_boot && !inputs.ewdk_build
+    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe && !inputs.guest_boot && !inputs.ewdk_build && !inputs.kernel_probe
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -139,7 +144,7 @@ jobs:
           if-no-files-found: error
 
   windows-guest-boot:
-    if: github.event_name == 'workflow_dispatch' && inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume && !inputs.ewdk_build
+    if: github.event_name == 'workflow_dispatch' && inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume && !inputs.ewdk_build && !inputs.kernel_probe
     runs-on: windows-2025
     timeout-minutes: 75
     steps:
@@ -164,7 +169,7 @@ jobs:
           if-no-files-found: error
 
   windows-ewdk-build:
-    if: github.event_name == 'workflow_dispatch' && inputs.ewdk_build && !inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume
+    if: github.event_name == 'workflow_dispatch' && inputs.ewdk_build && !inputs.kernel_probe && !inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume
     runs-on: windows-2025
     timeout-minutes: 65
     steps:
@@ -191,4 +196,49 @@ jobs:
             ewdk-result.json
             ewdk-compile-result.json
             ewdk-logs/*.txt
+          if-no-files-found: error
+
+  windows-kernel-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.kernel_probe && !inputs.ewdk_build && !inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume
+    runs-on: windows-2025
+    timeout-minutes: 125
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse all scripts before downloads or guest changes
+        shell: pwsh
+        run: |
+          foreach ($file in @('windows_ewdk_build.ps1', 'windows_ewdk_compile.ps1', 'windows_signing_guard_smoke.ps1', 'windows_guest_boot.ps1', 'windows_guest_probe_payload.ps1')) {
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile("$PWD/tests/$file", [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          }
+      - name: Validate signing veto for the host-side build
+        shell: pwsh
+        run: ./tests/windows_signing_guard_smoke.ps1
+      - name: Build and test only in the isolated guest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $payload='D:\sprig-kernel-payload-'+[Guid]::NewGuid().ToString('N')
+          $payloadOwned=$false
+          try {
+            ./tests/windows_ewdk_build.ps1 -AllowBuildOnly -GuestPayloadDirectory $payload
+            $payloadOwned=$true
+            ./tests/windows_guest_boot.ps1 -AllowGuestBoot -AllowKernelProbe -KernelPayloadDirectory $payload
+          } finally {
+            if($payloadOwned -and (Test-Path -LiteralPath $payload)) {
+              if((Get-Item -LiteralPath $payload).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Payload cleanup refused reparse point.' }
+              Remove-Item -LiteralPath $payload -Recurse -Force
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-probe-result
+          path: |
+            ewdk-result.json
+            ewdk-compile-result.json
+            ewdk-logs/*.txt
+            guest-boot-result.json
+            guest-boot-events.json
           if-no-files-found: error

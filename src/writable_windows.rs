@@ -53,6 +53,7 @@ struct Shared {
     core: Arc<WritableCas>,
     file_security: SecurityDescriptor,
     directory_security: SecurityDescriptor,
+    default_creation_owner: Option<SecurityDescriptor>,
     // Covers callbacks and the controller's gate/busy/sync operations together.
     operation: Mutex<()>,
     state: Mutex<State>,
@@ -255,11 +256,31 @@ impl WindowsCas {
         core: Arc<WritableCas>,
         file_security: SecurityDescriptor,
         directory_security: SecurityDescriptor,
+        default_creation_owner: Option<SecurityDescriptor>,
     ) -> io::Result<Self> {
         if file_security.is_empty() || directory_security.is_empty() {
             return Err(unsupported(
                 "restricted current-user security descriptor required",
             ));
+        }
+        if let Some(default_owner) = &default_creation_owner {
+            let checked = CheckedSecurity::new(default_owner.as_bytes()).map_err(nt_error)?;
+            let mut owner = std::ptr::null_mut();
+            let mut defaulted = 0;
+            // SAFETY: checked owns an aligned, bounded, validated descriptor.
+            if unsafe {
+                windows_sys::Win32::Security::GetSecurityDescriptorOwner(
+                    checked.ptr(),
+                    &mut owner,
+                    &mut defaulted,
+                )
+            } == 0
+                || owner.is_null()
+            {
+                return Err(unsupported(
+                    "captured creation-owner descriptor requires a valid owner SID",
+                ));
+            }
         }
         let mut inodes = BTreeSet::new();
         for (name, attr) in core.paths()? {
@@ -275,6 +296,7 @@ impl WindowsCas {
             core,
             file_security,
             directory_security,
+            default_creation_owner,
             operation: Mutex::new(()),
             state: Mutex::new(State {
                 accepting: true,
@@ -339,7 +361,15 @@ impl WindowsCas {
         }
     }
     fn same_security(&self, proposed: &SecurityDescriptor, directory: bool) -> Result<bool> {
-        equivalent_security(self.security(directory).as_bytes(), proposed.as_bytes())
+        let fixed = self.security(directory).as_bytes();
+        match &self.0.default_creation_owner {
+            Some(default_owner) => equivalent_creation_security(
+                fixed,
+                proposed.as_bytes(),
+                Some(default_owner.as_bytes()),
+            ),
+            None => equivalent_security(fixed, proposed.as_bytes()),
+        }
     }
     fn parent(&self, name: &str) -> Result<(u64, String)> {
         if name.is_empty() {
@@ -636,11 +666,19 @@ fn report_acl_mismatch(label: &str, fixed: &CheckedAcl, request: &CheckedAcl) {
     }
 }
 fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
+    equivalent_creation_security(left, right, None)
+}
+fn equivalent_creation_security(
+    left: &[u8],
+    right: &[u8],
+    default_owner: Option<&[u8]>,
+) -> Result<bool> {
     use windows_sys::Win32::Security::{
         EqualSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
     };
     let left = CheckedSecurity::new(left)?;
     let right = CheckedSecurity::new(right)?;
+    let default_owner = default_owner.map(CheckedSecurity::new).transpose()?;
     // Creation canonicalizes onto our immutable fixed ACL. Owner/group origin
     // and DACL protection/auto-inheritance provenance do not alter the matched
     // access ACEs. No future parent ACL change can occur: SetSecurity is rejected.
@@ -715,9 +753,36 @@ fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
             }
         // SAFETY: non-null SIDs belong to the validated, still-live descriptors.
         } else if unsafe { EqualSid(a, b) } == 0 {
+            // Creation-only immutable-policy normalization, not caller identity
+            // authentication: accept only the captured token-default owner with
+            // explicit default-mechanism provenance. The descriptor we expose
+            // remains fixed to TokenUser; this SID never gains an ACE/ownership.
+            // A changed client/impersonation default owner still fails closed.
+            if owner
+                && right.control & 0x0001 != 0
+                && let Some(default_owner) = &default_owner
+            {
+                let mut captured = std::ptr::null_mut();
+                let mut ignored_defaulted = 0;
+                // SAFETY: all pointers belong to still-live validated SDs.
+                if unsafe {
+                    GetSecurityDescriptorOwner(
+                        default_owner.ptr(),
+                        &mut captured,
+                        &mut ignored_defaulted,
+                    )
+                } == 0
+                {
+                    return Err(STATUS_INVALID_SECURITY_DESCR);
+                }
+                if !captured.is_null() && unsafe { EqualSid(captured, b) } != 0 {
+                    continue;
+                }
+            }
             eprintln!(
-                "Windows owned security mismatch: {} SID differs",
-                if owner { "owner" } else { "group" }
+                "Windows owned security mismatch: {} SID differs; request_owner_defaulted={}",
+                if owner { "owner" } else { "group" },
+                right.control & 0x0001 != 0
             );
             return Ok(false);
         }
@@ -1256,7 +1321,7 @@ mod tests {
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;OICI;FA;;;SY)")).unwrap();
         (
             root,
-            WindowsCas::new(core, security, directory_security).unwrap(),
+            WindowsCas::new(core, security, directory_security, None).unwrap(),
         )
     }
     #[test]
@@ -1408,6 +1473,47 @@ mod tests {
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;SY)S:(AU;SA;FA;;;SY)"))
                 .unwrap();
         assert!(!adapter.same_security(&audit, false).unwrap());
+        // A different token-default owner is only a creation input alias.
+        // Never expose it as owner or change any DACL/group/SACL requirement.
+        let canonical_adapter = WindowsCas::new(
+            adapter.0.core.clone(),
+            adapter.0.file_security.clone(),
+            adapter.0.directory_security.clone(),
+            Some(owner.clone()),
+        )
+        .unwrap();
+        let fixed = adapter.0.file_security.as_bytes();
+        let alternate = owner.as_bytes();
+        assert!(!equivalent_creation_security(fixed, alternate, Some(alternate)).unwrap());
+        let mut defaulted_alternate = alternate.to_vec();
+        defaulted_alternate[2] |= 0x01;
+        assert!(
+            equivalent_creation_security(fixed, &defaulted_alternate, Some(alternate)).unwrap()
+        );
+        let unknown_owner =
+            SecurityDescriptor::from_wstr(u16cstr!("O:WDG:SYD:P(A;;FA;;;SY)")).unwrap();
+        let mut unknown_owner = unknown_owner.as_bytes().to_vec();
+        unknown_owner[2] |= 0x01;
+        assert!(!equivalent_creation_security(fixed, &unknown_owner, Some(alternate)).unwrap());
+        let changed_dacl =
+            SecurityDescriptor::from_wstr(u16cstr!("O:BAG:SYD:P(A;;FR;;;SY)")).unwrap();
+        let mut changed_dacl = changed_dacl.as_bytes().to_vec();
+        changed_dacl[2] |= 0x01;
+        assert!(!equivalent_creation_security(fixed, &changed_dacl, Some(alternate)).unwrap());
+        adapter
+            .0
+            .core
+            .create_file(ROOT_INODE, "security-owner", 0o644)
+            .unwrap();
+        let (_, returned_security, _) = canonical_adapter
+            .get_security_by_name(u16cstr!("\\security-owner"), || None)
+            .unwrap();
+        assert_eq!(
+            returned_security,
+            canonical_adapter.0.file_security.as_ptr()
+        );
+        assert_eq!(canonical_adapter.0.file_security, adapter.0.file_security);
+        drop(canonical_adapter);
         let bytes = adapter.0.file_security.as_bytes();
         let mut null_dacl = bytes.to_vec();
         null_dacl[16..20].fill(0);

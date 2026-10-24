@@ -915,7 +915,10 @@ The mounted view accepts regular files and directories with Windows-representabl
 names and timestamps. It rejects hardlink aliases, symlinks, named streams,
 custom ACL changes and unsupported metadata instead of silently converting them.
 Creation canonicalizes inherited ACL provenance only when the effective fixed
-account, rights and inheritance policy are unchanged.
+account, rights and inheritance policy are unchanged. A creation request marked
+with the mount token's default owner is normalized to the fixed current-user
+owner when every other security component matches; it never grants that default
+owner additional access. Other ownership requests are rejected.
 The native and unmounted SDK backends retain their hardlink support. This is not
 full NTFS or Linux filesystem parity. The mounted security descriptor is fixed
 for the current account; keep the backing Store private to that account.

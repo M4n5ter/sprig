@@ -331,7 +331,7 @@ pub(crate) fn serve(
         );
     }
     winfsp_wrs::init().map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e.to_string()))?;
-    let sddl = current_user_sddl()?;
+    let (sddl, default_owner_sddl) = current_security_sddl()?;
     let security =
         SecurityDescriptor::from_wstr(&U16CString::from_str(&sddl).map_err(io::Error::other)?)
             .map_err(io::Error::other)?;
@@ -340,7 +340,18 @@ pub(crate) fn serve(
         &U16CString::from_str(sddl.replace("(A;;", "(A;OICI;")).map_err(io::Error::other)?,
     )
     .map_err(io::Error::other)?;
-    let adapter = WindowsCas::new(core, security, directory_security)?;
+    // The creation input may carry the elevated token's default owner. This
+    // descriptor is only a comparison witness; exposed ownership stays TokenUser.
+    let default_creation_owner = SecurityDescriptor::from_wstr(
+        &U16CString::from_str(default_owner_sddl).map_err(io::Error::other)?,
+    )
+    .map_err(io::Error::other)?;
+    let adapter = WindowsCas::new(
+        core,
+        security,
+        directory_security,
+        Some(default_creation_owner),
+    )?;
     let record = session::begin(generation, revision)
         .map_err(|e| uncertain(format!("begin Windows mount session: {e}")))?;
     let mut params = Params::default();
@@ -352,6 +363,8 @@ pub(crate) fn serve(
         .set_case_sensitive_search(true)
         .set_case_preserved_names(true)
         .set_unicode_on_disk(true)
+        // Re-query our canonical security policy; never cache creation input SDs.
+        .set_allow_open_in_kernel_mode(false)
         .set_persistent_acls(false)
         .set_hard_links(false)
         .set_reparse_point(false)
@@ -643,6 +656,9 @@ fn private_new_with_share(path: &Path, share: u32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 fn current_user_sddl() -> io::Result<String> {
+    current_security_sddl().map(|(fixed, _)| fixed)
+}
+fn current_security_sddl() -> io::Result<(String, String)> {
     let mut token = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
@@ -650,7 +666,11 @@ fn current_user_sddl() -> io::Result<String> {
     let token = unsafe { File::from_raw_handle(token) };
     let user = token_sid(&token, 1)?; // TokenUser.
     let group = token_sid(&token, 5)?; // TokenPrimaryGroup; no ACE grants group access.
-    Ok(format!("O:{user}G:{group}D:P(A;;FA;;;{user})"))
+    let default_owner = token_sid(&token, 4)?; // TokenOwner; comparison only, no granted ACE.
+    Ok((
+        format!("O:{user}G:{group}D:P(A;;FA;;;{user})"),
+        format!("O:{default_owner}G:{group}D:P(A;;FA;;;{user})"),
+    ))
 }
 fn token_sid(token: &File, information_class: u32) -> io::Result<String> {
     let mut needed = 0;
@@ -680,7 +700,7 @@ fn token_sid(token: &File, information_class: u32) -> io::Result<String> {
     {
         return Err(io::Error::last_os_error());
     }
-    let sid = data[0] as *mut c_void; // Both TOKEN_USER and TOKEN_PRIMARY_GROUP begin with their SID pointer.
+    let sid = data[0] as *mut c_void; // TOKEN_USER, TOKEN_OWNER and TOKEN_PRIMARY_GROUP begin with their SID pointer.
     let mut sid_text = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
         return Err(io::Error::last_os_error());

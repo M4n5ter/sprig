@@ -124,9 +124,11 @@ pub(crate) fn take_start_lock(generation: &Path) -> Result<File> {
     // SAFETY: the internal launch protocol passes ownership of one inherited
     // handle. No pointer is dereferenced; Windows validates the handle below.
     let file = unsafe { File::from_raw_handle(raw as *mut c_void) };
-    platform::file_metadata(&file)?;
+    platform::file_metadata(&file)
+        .map_err(|e| uncertain(format!("startup handle metadata: {e}")))?;
     let expected = generation.canonicalize()?.join(CONTROL);
-    let actual = final_name(&file, 0)?;
+    let actual =
+        final_name(&file, 0).map_err(|e| uncertain(format!("startup handle path: {e}")))?;
     if Path::new(&actual) != expected {
         return Err(invalid("startup lock identity mismatch").into());
     }
@@ -336,7 +338,8 @@ pub(crate) fn serve(
     )
     .map_err(io::Error::other)?;
     let adapter = WindowsCas::new(core, security, directory_security)?;
-    let record = session::begin(generation, revision)?;
+    let record = session::begin(generation, revision)
+        .map_err(|e| uncertain(format!("begin Windows mount session: {e}")))?;
     let mut params = Params::default();
     params
         .volume_params
@@ -362,8 +365,10 @@ pub(crate) fn serve(
         .map_err(|code| uncertain(format!("WinFsp start failed with NTSTATUS {code:#x}")))?;
     // No FileSystem layout assumptions or private FSP_FILE_SYSTEM pointers.
     let ready = {
-        let root = open_mount_root(&generation.join("tree"))?;
-        let (nt_volume, volume_serial, filesystem) = identity(&root)?;
+        let root = open_mount_root(&generation.join("tree"))
+            .map_err(|e| uncertain(format!("open mounted root: {e}")))?;
+        let (nt_volume, volume_serial, filesystem) =
+            identity(&root).map_err(|e| uncertain(format!("identify mounted root: {e}")))?;
         ReadyRecord {
             session: record.clone(),
             nt_volume,
@@ -376,7 +381,8 @@ pub(crate) fn serve(
     }
     // This raw-volume handle does not create a filesystem file context. Keep
     // it alive for FlushFileBuffers while dispatch remains operational.
-    let volume = open_volume(&ready.nt_volume)?;
+    let volume = open_volume(&ready.nt_volume)
+        .map_err(|e| uncertain(format!("open volume flush handle: {e}")))?;
     write_json(generation, READY, &ready)?;
     verify_record(generation, &ready, Some(revision))?;
     {
@@ -524,7 +530,8 @@ fn valid_nt_volume(value: &str) -> bool {
         .is_some_and(|v| v.len() == 36 && v.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
 }
 fn identity(root: &File) -> io::Result<(String, u32, String)> {
-    let path = final_name(root, 2)?; // VOLUME_NAME_NT, normalized file name.
+    let path =
+        final_name(root, 2).map_err(|e| io::Error::other(format!("query final NT path: {e}")))?; // VOLUME_NAME_NT, normalized file name.
     let volume = path
         .strip_suffix('\\')
         .ok_or_else(|| invalid("mount handle is not a volume root"))?;
@@ -546,7 +553,10 @@ fn identity(root: &File) -> io::Result<(String, u32, String)> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::other(format!(
+            "query volume information: {}",
+            io::Error::last_os_error()
+        )));
     }
     let end = filesystem
         .iter()

@@ -315,8 +315,11 @@ impl Store {
             pending: None,
         };
         let path = store.root.join("native").join(generation);
-        let startup = writable_mount::take_start_lock(&path)?;
-        let core = store.writable_core(&workspace)?;
+        let startup = writable_mount::take_start_lock(&path)
+            .map_err(|e| failure(&format!("Windows daemon startup lease: {e}")))?;
+        let core = store
+            .writable_core(&workspace)
+            .map_err(|e| failure(&format!("Windows daemon journal open: {e}")))?;
         writable_mount::serve(std::sync::Arc::new(core), &path, revision, startup)
     }
 

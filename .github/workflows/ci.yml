@@ -78,6 +78,7 @@ jobs:
             ${{ runner.temp }}/sprig-winfsp-*/result.json
             ${{ runner.temp }}/sprig-winfsp-*/install.log
             ${{ runner.temp }}/sprig-winfsp-*/mount-result.json
+            ${{ runner.temp }}/sprig-winfsp-*/fixture-*/store/native/*/writable-windows-*.log
           if-no-files-found: warn
       - name: Build optimized example binary
         if: runner.os != 'Windows'

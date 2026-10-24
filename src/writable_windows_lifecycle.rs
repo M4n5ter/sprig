@@ -413,6 +413,12 @@ pub(crate) fn serve(
         }
         if session::read_stop(generation, &record)? {
             adapter.gate_new_opens()?;
+            // Drain pending cached writes while callbacks and their contexts are
+            // still alive. This is not a quiescence proof: a live mapping may
+            // write again, so final Close and the second flush remain mandatory.
+            if unsafe { FlushFileBuffers(volume.as_raw_handle()) } == 0 {
+                return Err(uncertain(io::Error::last_os_error()).into());
+            }
             // WinFsp queues final Close asynchronously. In particular our own
             // just-closed root attestation handle may not have reached Close yet.
             // Keep dispatch alive, release all callback locks, and wait briefly.

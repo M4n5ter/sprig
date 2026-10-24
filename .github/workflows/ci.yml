@@ -4,6 +4,16 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      vss_compile:
+        description: 'Compile the isolated VSS requester without executing it'
+        type: boolean
+        required: false
+        default: false
+      vss_volume:
+        description: 'Explicitly create the approved 4 GiB NTFS / 512 MiB VSS fixture'
+        type: boolean
+        required: false
+        default: false
       refs_volume:
         description: 'Explicitly create a disposable 4 GiB ReFS VHDX for this run'
         type: boolean
@@ -13,6 +23,7 @@ permissions:
   contents: read
 jobs:
   check:
+    if: ${{ !inputs.vss_compile && !inputs.vss_volume }}
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +86,7 @@ jobs:
           python3 examples/compare.py --binary target/release/sprig "${args[@]}"
 
   projection:
+    if: ${{ !inputs.vss_compile && !inputs.vss_volume }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -104,3 +116,51 @@ jobs:
             projection-result.json
             writable-result.json
           if-no-files-found: ignore
+
+  vss_experiment:
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.vss_compile || inputs.vss_volume) }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect and compile the isolated requester
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ inputs.refs_volume }}' -eq 'true' -or ('${{ inputs.vss_compile }}' -eq 'true' -and '${{ inputs.vss_volume }}' -eq 'true')) { throw 'Choose exactly one isolated experiment mode.' }
+          $source = Join-Path $env:GITHUB_WORKSPACE 'experiments\windows-vss'
+          python -m py_compile "$source\fixture.py"
+          if ($LASTEXITCODE -ne 0) { throw 'Python source validation failed.' }
+          $tokens = $null; $errors = $null
+          [Management.Automation.Language.Parser]::ParseFile("$source\run_vss_fixture.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs -or $LASTEXITCODE -ne 0) { throw 'Existing C++ toolchain unavailable; no installation attempted.' }
+          $output = Join-Path $env:RUNNER_TEMP ('sprig-vss-build-' + [guid]::NewGuid().ToString('N'))
+          if (Test-Path -LiteralPath $output) { throw 'Build directory already exists.' }
+          New-Item -ItemType Directory -Path $output | Out-Null
+          "SPRIG_VSS_BUILD=$output" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $command = 'call "' + $vs + '\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 && cl /nologo /W4 /EHsc /std:c++17 /DUNICODE /D_UNICODE /DSPRIG_VSS_ENABLE_RUNTIME=1 "' + $source + '\vss_requester.cpp" /Fe:"' + $output + '\requester.exe" /Fo:"' + $output + '\requester.obj" /link VssApi.lib Ole32.lib OleAut32.lib Advapi32.lib'
+          & $env:ComSpec /d /c $command 2>&1 | Tee-Object -FilePath "$output\compile.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Requester compilation failed.' }
+          Get-FileHash "$output\requester.exe" -Algorithm SHA256 | Select-Object Algorithm, Hash | ConvertTo-Json | Set-Content "$output\compile-result.json"
+      - name: Build the existing Sprig CLI only for explicit runtime acceptance
+        if: inputs.vss_volume
+        run: cargo build --release --locked
+      - name: Run the explicitly approved synthetic storage snapshot acceptance
+        if: inputs.vss_volume
+        shell: pwsh
+        run: |
+          ./experiments/windows-vss/run_vss_fixture.ps1 -AllowSyntheticVolume -Requester "$env:SPRIG_VSS_BUILD\requester.exe" -Sprig "$env:GITHUB_WORKSPACE\target\release\sprig.exe"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vss-experiment-evidence
+          path: |
+            ${{ runner.temp }}/sprig-vss-build-*/compile.log
+            ${{ runner.temp }}/sprig-vss-build-*/compile-result.json
+            ${{ runner.temp }}/sprig-vss-evidence-*/result.json
+            ${{ runner.temp }}/sprig-vss-evidence-*/*.log
+            ${{ runner.temp }}/sprig-vss-evidence-*/capture-*.json
+          if-no-files-found: warn

@@ -140,6 +140,16 @@ def stable_info(info):
             info.st_mtime_ns, getattr(info, "st_file_attributes", 0))
 
 
+def require_stable(path, before, relative, phase):
+    after = stable_info(tree_node(path))
+    if after != before:
+        fields = ("device", "inode", "mode", "size", "nlink", "mtime_ns", "attributes")
+        changes = {name: {"before": old, "after": new}
+                   for name, old, new in zip(fields, before, after) if old != new}
+        raise FixtureError("Cargo entry changed " + phase + ": " + relative
+                           + "; stat differences=" + json.dumps(changes, sort_keys=True))
+
+
 def inventory(root):
     """Hash every byte and compare supported metadata and hardlink topology.
 
@@ -180,8 +190,7 @@ def inventory(root):
             entry.update(size=before.st_size, sha256=base.file_hash(path))
             key = (before.st_dev, before.st_ino)
             identities.setdefault(key, []).append(relative)
-        require(stable_info(tree_node(path)) == stable_info(before),
-                "Cargo entry changed while reading: " + relative)
+        require_stable(path, stable_info(before), relative, "while reading")
         entries[relative] = entry
     groups = []
     for names in identities.values():
@@ -193,8 +202,7 @@ def inventory(root):
             groups.append(names)
     # Retain/recheck all identities after the traversal, not only each local read.
     for relative, (path, before) in observations.items():
-        require(stable_info(tree_node(path)) == before,
-                "Cargo entry changed during the complete inventory: " + relative)
+        require_stable(path, before, relative, "during the complete inventory")
     return {"entries": dict(sorted(entries.items())), "hardlink_groups": sorted(groups),
             "logical_bytes": logical, "files": files, "entry_count": len(entries),
             "limits": {"tree_bytes": MAX_TREE_BYTES, "file_bytes": MAX_FILE_BYTES,
@@ -852,6 +860,16 @@ def selftest():
         write_new(tool, b"not executed\n")
         os.link(tool, root / "tool-artifact.exe")
         require(executable(tool) == tool, "Trusted tool hardlink was mistaken for fixture data")
+        observed = stable_info(tree_node(tool))
+        changed = list(observed)
+        changed[3] += 1
+        try:
+            require_stable(tool, tuple(changed), "tool.exe", "while reading")
+        except FixtureError as error:
+            require('"size"' in str(error) and '"before"' in str(error)
+                    and '"after"' in str(error), "Stat mismatch lost its bounded field diagnostic")
+        else:
+            raise FixtureError("Stat mismatch was accepted")
         before = inventory(live)
         require(inventory(live) == before, "Repeated oracle selftest differs")
         edit_source(live, 0, 1)

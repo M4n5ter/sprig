@@ -4,6 +4,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      guest_boot:
+        description: Explicit one-time isolated Windows Server evaluation guest boot test
+        type: boolean
+        required: false
+        default: false
       runner_probe:
         description: Read-only Windows virtualization and diagnostic capability probe
         type: boolean
@@ -18,7 +23,7 @@ permissions:
   contents: read
 jobs:
   check:
-    if: ${{ !inputs.runner_probe }}
+    if: ${{ !inputs.runner_probe && !inputs.guest_boot }}
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +86,7 @@ jobs:
           python3 examples/compare.py --binary target/release/sprig "${args[@]}"
 
   projection:
-    if: ${{ !inputs.runner_probe }}
+    if: ${{ !inputs.runner_probe && !inputs.guest_boot }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -113,7 +118,7 @@ jobs:
           if-no-files-found: ignore
 
   windows-probe:
-    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe
+    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe && !inputs.guest_boot
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -126,4 +131,29 @@ jobs:
         with:
           name: windows-runner-capabilities
           path: runner-capabilities.json
+          if-no-files-found: error
+
+  windows-guest-boot:
+    if: github.event_name == 'workflow_dispatch' && inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse the isolated guest test before any execution
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/tests/windows_guest_boot.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+      - name: Explicitly install and boot only the isolated evaluation guest
+        shell: pwsh
+        run: ./tests/windows_guest_boot.ps1 -AllowGuestBoot
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-guest-boot-result
+          path: |
+            guest-boot-result.json
+            guest-boot-events.json
           if-no-files-found: error

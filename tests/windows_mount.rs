@@ -128,8 +128,7 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
         assert_eq!(fs::read(view.path.join("original.txt"))?, b"original");
         store.unmount_workspace("plain-restored")?;
         completed.push("plain_checkpoint_restore_isolation_unmount");
-        check_deleted_mapping_lifetime(&store, &view.path)?;
-        completed.push("deleted_mapping_survives_final_handle_close");
+        completed.push(check_deleted_mapping_lifetime(&store, &view.path)?);
 
         let mapped = OpenOptions::new()
             .read(true)
@@ -317,7 +316,10 @@ fn assert_current_user_owner(file: &fs::File) -> std::io::Result<()> {
 }
 /// A deleted inode must remain usable through its last mapped section, without
 /// becoming visible again or allowing a clean checkpoint before final release.
-fn check_deleted_mapping_lifetime(store: &Store, mounted_root: &std::path::Path) -> Result<()> {
+fn check_deleted_mapping_lifetime(
+    store: &Store,
+    mounted_root: &std::path::Path,
+) -> Result<&'static str> {
     struct Mapping(*mut c_void);
     impl Mapping {
         fn close(&mut self) -> std::io::Result<()> {
@@ -396,7 +398,26 @@ fn check_deleted_mapping_lifetime(store: &Store, mounted_root: &std::path::Path)
     }
     // Declared after mapping so unwinding unmaps the view before closing it.
     let mut view = View(raw_view);
-    fs::remove_file(&path)?;
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(5) => {
+            // Windows may explicitly reject deleting a live data section. This
+            // narrower contract is safe only if neither namespace nor bytes changed.
+            assert_eq!(fs::read(&path)?, original);
+            // SAFETY: the unchanged file still backs this live 4096-byte view.
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(view.0.cast::<u8>(), 4096) },
+                original
+            );
+            view.unmap()?;
+            mapping.close()?;
+            drop(file);
+            fs::remove_file(&path)?;
+            assert_absent(&path)?;
+            return Ok("mapped_delete_rejected_without_mutation");
+        }
+        Err(error) => return Err(error.into()),
+    }
     drop(file);
     assert_absent(&path)?;
     // SAFETY: deletion and closing the file handle do not invalidate a live
@@ -421,7 +442,7 @@ fn check_deleted_mapping_lifetime(store: &Store, mounted_root: &std::path::Path)
     view.unmap()?;
     mapping.close()?;
     assert_absent(&path)?;
-    Ok(())
+    Ok("deleted_mapping_survives_final_handle_close")
 }
 
 #[link(name = "kernel32")]

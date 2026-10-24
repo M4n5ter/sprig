@@ -926,6 +926,8 @@ for the current account; keep the backing Store private to that account.
 Checkpoint gates new opens and refuses live descriptors or mapped sections;
 normal stop flushes the volume and journal before certifying the exact session.
 Cleanup is not final Close: pending paging I/O keeps its file context alive.
+Windows may reject deletion of a file with a live mapped section; close and unmap
+it before deleting. Ordinary delete-open handles are supported.
 An interrupted or failed session retains its journal and blocks ordinary writes
 and checkpoint until explicit recovery to another workspace. No forced detach,
 process kill, driver installation or reboot is performed by the CLI.

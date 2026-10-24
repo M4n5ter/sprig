@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fs::{self, File, FileTimes};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
@@ -413,21 +413,8 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
                     platform::hard_link(first, &path)?;
                     continue;
                 }
-                let mut output = platform::create_new(&path, 0o600)?;
-                let mut written = 0_u64;
-                for hash in chunks {
-                    let bytes = reader.read(hash)?;
-                    written = written
-                        .checked_add(bytes.len() as u64)
-                        .ok_or_else(|| io::Error::other("file size overflow"))?;
-                    if written > *size {
-                        return invalid(format!("chunk lengths exceed file size: {relative}"));
-                    }
-                    output.write_all(&bytes)?;
-                }
-                if written != *size {
-                    return invalid(format!("chunk lengths do not match file size: {relative}"));
-                }
+                let output =
+                    crate::file_cache::materialize(&reader, chunks, *size, objects, &path)?;
                 platform::set_mode(&output, entry.mode)?;
                 output
                     .set_times(FileTimes::new().set_modified(modified_time(entry.modified_ns)?))?;
@@ -727,7 +714,7 @@ fn normalized_root(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn ensure_directory_chain(path: &Path) -> Result<()> {
+pub(crate) fn ensure_directory_chain(path: &Path) -> Result<()> {
     let path = normalized_root(path)?;
     let mut current = PathBuf::new();
     for component in path.components() {

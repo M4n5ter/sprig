@@ -19,6 +19,7 @@ pub(crate) const CACHE_BYTES: usize = 16 * 1024 * 1024;
 /// following symlinks. Published objects must remain immutable. Cache entries
 /// contain only bytes already verified against their content address.
 pub(crate) struct ObjectStore {
+    _lease: crate::packed::ReadLease,
     objects: File,
     snapshot: crate::packed::Snapshot,
 }
@@ -47,10 +48,12 @@ impl ObjectStore {
                 }
             }
         }
+        let lease = crate::packed::ReadLease::acquire(path).map_err(io::Error::other)?;
         let snapshot =
             crate::packed::Snapshot::load_with(|name| open_at(&directory, OsStr::new(name), false))
                 .map_err(io::Error::other)?;
         Ok(Self {
+            _lease: lease,
             objects: directory,
             snapshot,
         })

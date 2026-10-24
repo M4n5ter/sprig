@@ -394,7 +394,8 @@ drop workspace|branch NAME
 recover TOKEN NAME
 doctor
 recover-state GENERATION
-gc [--dry-run]
+gc [--dry-run | --apply PLAN_ID] [--max-extra-bytes BYTES]
+retention [--keep-backups N] [--forget-branch-trash TOKEN] [--apply PLAN_ID]
 stats
 backend
 ```
@@ -515,9 +516,30 @@ its committed revision; dropped workspace recovery preserves its retained tree.
 
 `doctor` checks metadata and referenced content hashes and reports orphaned
 revisions, workspace generations and staging entries. It does not repair or delete.
-`gc` is **dry-run only**, even without `--dry-run`. Its conservative roots include
-branch heads, workspace bases, immutable projection lowers, pending candidates,
-trash, revision ancestors and metadata backups. There is no permanent purge command.
+`gc` defaults to a non-destructive plan. Its roots include branch heads, workspace
+bases, immutable lower/owned pins, pending candidates, trash, all ancestors and
+metadata backups, including unpublished generation pins. `gc --apply PLAN_ID`
+rechecks the exact state, roots, backups and catalog, rewrites live chunks into
+verified compressed packs, atomically publishes the index, then permanently
+reclaims unreferenced payloads only while no reader holds an older snapshot.
+A busy reader defers deletion, not index publication: mounted views can therefore
+make compaction temporarily increase space. Close readers, unmount normally and
+request a fresh plan before another collection. Unknown files and incomplete
+preparations are retained. Never blindly retry an uncertain publication.
+
+Old and new packs coexist during compaction. The plan reports a conservative
+additional-space bound; apply defaults to a 1 GiB budget, adjustable with
+`--max-extra-bytes`. This is not a reservation against other processes consuming
+disk space: I/O failure retains the prior or newly published valid index and data.
+
+`retention --keep-backups N` separately plans retirement of old metadata backups
+(at least two remain); `--forget-branch-trash TOKEN` selects dropped branch refs.
+Repeat the same options with `--apply PLAN_ID` to permanently retire exactly that
+plan. Retention never deletes working generations, dirty journals, conflicts or
+unknown publication pins. These conservative roots can prevent collection; this
+is not automatic history truncation or a promise to reclaim every retained byte.
+The low-level object API does not create Store roots: callers must publish through
+the Store transaction protocol, not leave an unrooted batch racing explicit GC.
 
 `recover-state GENERATION` restores a validated metadata backup, even if current
 metadata cannot be opened, while retaining the current state bytes for inspection.
@@ -534,6 +556,7 @@ STORE/
   native/GENERATION/  # Native/projection trees or owned journals, pins and leases
   staging/            # Unpublished data and retained recovery records
   backups/            # Compressed previous metadata generations
+  file-cache/         # Disposable, bounded verified whole-file clone sources
 ```
 
 Revision manifests are canonical sorted JSON streams split into content-defined
@@ -543,8 +566,7 @@ across history. A small revision envelope records parents, clock, message and th
 typed page root. Its canonical JSON hash identifies the revision. Reads verify
 encoded objects, page and root domain-separated hashes, lengths, canonical order,
 unique paths and CDC boundaries before reconstructing the public manifest.
-Metadata backups remain compressed complete Store states. No history or recovery
-roots are discarded to save space.
+Metadata backups remain compressed complete Store states. Roots are retained unless explicitly retired by the retention command.
 
 Current limits are 64 MiB canonical manifest bytes, one million entries and 4,096
 pages. Native capture still scans files; page sharing is a storage representation,
@@ -553,16 +575,21 @@ Complete manifest reads decode pages and may cost more than a single compressed
 document. Ordinary reads pin one point index; graph inspection, doctor and GC
 reuse a fully validated object-index snapshot. GC protects metadata pages as well
 as file chunks. Workspace observations and Store backups are not a shared tree.
-The current `state.json` stays uncompressed. A batch with exactly one new chunk
-publishes a loose object; two or more new chunks share an immutable payload pack.
-Content addresses and CDC boundaries do not change. Publication syncs the pack
-and its directory before an atomic, checksummed index replacement, then completes
-the index publication barriers before any revision/head can reference it. These
-namespace barriers have the weaker Windows guarantees described below. Reads still verify every chunk hash. A separate object-writer lock
-also serializes low-level `ObjectBatch` users; concurrent writers receive an error.
-An interrupted batch can leave an unreferenced pack, never a valid partial chunk.
-No published pack is deleted automatically.
-
+The current `state.json` stays uncompressed. `init --no-compression` chooses raw
+payloads for a new store when compression CPU cost matters more than space; the
+default is selective compression, reported by `stats.payload_compression`. This
+policy is fixed at initialization, not changed under active readers. New payload chunks use independent,
+checksummed Zstandard frames only when compression saves at least 32 bytes and
+6.25%; otherwise they remain raw. Addresses always hash decoded bytes. Both raw
+and decoded chunks are bounded to 256 KiB, and decompression has a bounded window
+and rejects trailing frames/data. A single new incompressible chunk remains loose;
+compressible or multi-chunk batches use immutable packs. Metadata pages already
+have their own encoding and naturally fall back to raw when recompression is not useful.
+Publication syncs payload files and their directory before atomic checksummed
+index replacement, then completes index barriers before revision/head publication.
+Windows retains its weaker namespace guarantee below. Readers hold shared leases
+for exact index generations; explicit reclamation requires an exclusive lease.
+No background process deletes packs.
 The current index is rewritten when a pack is added and is limited to 64 MiB
 on disk. Ordinary file reads pin one index generation and binary-search bounded
 records, validate the matching pack reference and extent, then verify the requested
@@ -573,26 +600,45 @@ fallback must independently verify the requested hash; it is not proof that an
 unused packed alias is healthy. Writers, doctor, GC, bulk readers and projection
 metadata planning still validate the full index. Bulk operations share a validated
 snapshot; catalog metadata is expanded only when needed. These are explicit
-capacity and growth costs, not constant-time update claims. Single-new-chunk
-batches do not rewrite the index.
-The object store reads both loose chunks and packed payloads. GC counts packed
-bytes as reclaimable only when the
-whole pack is unreachable; it does not pretend dead slices can be freed in place.
+capacity and growth costs, not constant-time update claims. Single-new-incompressible-chunk batches do not rewrite the index.
+Compaction rewrites partially live packs rather than pretending their dead slices
+can be freed in place. Its reports distinguish live logical bytes, new pack bytes,
+retired pack bytes and actually removed bytes.
+
+A cold `branch NAME REVISION` is only a CAS ref. Use `--writable checkout BRANCH NAME`
+for a portable unmounted logical workspace with no full payload materialization;
+ordinary tools require a supported mounted backend or native checkout.
+Native materialization can retain verified whole files in `file-cache` only when
+an actual APFS/Linux clone succeeds. Later checkouts verify every chunk of the
+cached file, then clone into a separate inode. This reduces writes, not full-file
+verification, and is not constant-time checkout. Copy-only filesystems do not
+retain extra whole files. Cache failures fall back to CAS before target creation;
+an uncertain partially created target is never overwritten. Cache entries publish
+through synced temporary files, are rebuildable, and use a 256 MiB charge budget
+(maximum of logical/referenced allocated bytes plus per-entry overhead), with a
+4,096-entry limit. Whole-store reporting includes the cache and its directory.
+
 Native capture reuses one 256 KiB I/O buffer across files, not their contents:
 every file is still read and every existing chunk verified, even when size and
 mtime match. Projected capture uses the lower-provenance checks described above.
 
-`stats.object_bytes` totals unique indexed/loose payload bytes, including
+`stats.object_bytes` totals unique decoded indexed/loose object bytes, including
 unreferenced objects. `object_storage_bytes` includes all object-directory files,
 including index, lock, orphan packs and temporary files. On Unix,
 `object_allocated_bytes` sums their reported allocated blocks; it is not exclusive
 physical usage on shared/CoW storage. Windows reports that field as null.
 `reachable_logical_bytes` sums file lengths across protected revisions; repeated
-content counts in each revision. None is whole-store physical usage: retained
-trees, revision records and backups also consume space. `doctor` lists all object
-store entries so retained orphan/temporary files are visible.
+content counts in each revision. `storage` breaks down every top-level area;
+`store_logical_bytes` and `store_allocated_bytes` include native trees, upper,
+journals, logs, revisions, backups, cache and orphan files. Virtual mounted lower
+and merged views are excluded because their backing bytes are already counted.
+Hardlink aliases count once per area. Allocation uses Unix blocks or Windows
+`FILE_STANDARD_INFO`, not exclusive physical extents on shared/CoW volumes; it
+also does not measure kernel/RAM caches or filesystem-global metadata. Statistics
+are not an atomic snapshot of externally modified native trees; quiesce writers
+for reproducible measurements. `doctor` lists orphan/temporary entries.
 
-The current storage schema is **8**.
+The current storage schema is **9**.
 
 ## Guarantees and boundaries
 

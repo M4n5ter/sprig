@@ -205,7 +205,11 @@ fn copy_entry(
 }
 
 #[cfg(target_os = "linux")]
-fn native_clone(source: &File, _source_path: &Path, target: &Path) -> io::Result<Option<File>> {
+pub(crate) fn native_clone(
+    source: &File,
+    _source_path: &Path,
+    target: &Path,
+) -> io::Result<Option<File>> {
     use std::os::fd::AsRawFd;
     let output = OpenOptions::new()
         .write(true)
@@ -237,7 +241,11 @@ fn native_clone(source: &File, _source_path: &Path, target: &Path) -> io::Result
 }
 
 #[cfg(target_os = "macos")]
-fn native_clone(source: &File, _source_path: &Path, target: &Path) -> io::Result<Option<File>> {
+pub(crate) fn native_clone(
+    source: &File,
+    _source_path: &Path,
+    target: &Path,
+) -> io::Result<Option<File>> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -281,7 +289,11 @@ pub(crate) fn set_symlink_permissions(path: &Path, mode: u32) -> io::Result<()> 
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn native_clone(_source: &File, _source_path: &Path, _target: &Path) -> io::Result<Option<File>> {
+pub(crate) fn native_clone(
+    _source: &File,
+    _source_path: &Path,
+    _target: &Path,
+) -> io::Result<Option<File>> {
     Ok(None)
 }
 

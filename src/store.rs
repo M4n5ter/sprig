@@ -1,5 +1,7 @@
 //! One atomic state file publishes branch heads and workspace generations together.
 
+mod collection;
+mod storage;
 mod writable;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -27,7 +29,7 @@ use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 8;
+const STORAGE_SCHEMA: u32 = 9;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 #[derive(Serialize, Deserialize)]
@@ -465,12 +467,22 @@ impl Store {
     }
 
     pub fn init(path: &Path) -> Result<Self> {
+        Self::init_with_compression(path, true)
+    }
+
+    /// Select the immutable payload encoding policy for a newly created store.
+    pub fn init_with_compression(path: &Path, enabled: bool) -> Result<Self> {
         platform::create_dir(path, 0o700)?;
         let root = path.canonicalize()?;
         for area in AREAS {
             fs::create_dir(root.join(area))?;
             sync_directory(&root.join(area))?;
         }
+        write_new(
+            &root.join("objects").join(".compression"),
+            if enabled { b"auto\n" } else { b"never\n" },
+        )?;
+        sync_directory(&root.join("objects"))?;
         write_new(&root.join("lock"), b"")?;
         let state = State {
             version: STORAGE_SCHEMA,
@@ -1071,6 +1083,7 @@ impl Store {
         Ok(self.workspace_result(name, &workspace))
     }
 
+    /// Creates only a committed CAS reference, never a materialized working tree.
     pub fn branch(&self, name: &str, reference: &str) -> Result<BranchResult> {
         let _lock = self.lock()?;
         let mut state = self.state()?;
@@ -1736,6 +1749,10 @@ impl Store {
     /// work nor previously published history silently becomes collectible.
     pub fn gc(&self) -> Result<GcPlan> {
         let _lock = self.lock()?;
+        self.gc_locked()
+    }
+
+    fn gc_locked(&self) -> Result<GcPlan> {
         let state = self.state()?;
         let reachable = self.ancestors(&self.protected_roots(&state)?)?;
         let mut objects = BTreeSet::new();
@@ -1782,7 +1799,23 @@ impl Store {
                 reclaimable_bytes += size;
             }
         }
-        Ok(GcPlan { dry_run: true, generation: state.generation, unreachable_objects, unreachable_revisions, orphan_workspaces, reclaimable_bytes, note: "No files deleted. All heads, workspace bases, projection lowers, trash, parents and state backups are protected. Packed bytes count as reclaimable only when their entire pack is unreachable; index and temporary/orphan files are retained. No permanent purge API is provided.".to_owned() })
+        let compaction_upper_bound_bytes = objects
+            .iter()
+            .try_fold(64 * 1024 * 1024_u64, |total, hash| {
+                total.checked_add(catalog[hash])
+            })
+            .ok_or_else(|| failure("compaction size overflow"))?;
+        Ok(GcPlan {
+            plan_id: self.gc_fingerprint(&state, &objects)?,
+            compaction_upper_bound_bytes,
+            dry_run: true,
+            generation: state.generation,
+            unreachable_objects,
+            unreachable_revisions,
+            orphan_workspaces,
+            reclaimable_bytes,
+            note: "No files deleted. Heads, workspace bases, immutable lowers, trash, parents and backups remain protected. Apply the exact plan to compact and reclaim unreferenced payloads. Open readers defer deletion. Working generations and unknown files are never pruned.".into(),
+        })
     }
 
     pub fn stats(&self) -> Result<Stats> {
@@ -1819,7 +1852,21 @@ impl Store {
                 }
             }
         }
+        let storage = self.storage_usage()?;
+        let store_logical_bytes = storage.values().map(|usage| usage.logical_bytes).sum();
+        let store_allocated_bytes = storage.values().try_fold(0_u64, |total, usage| {
+            total.checked_add(usage.allocated_bytes?)
+        });
         Ok(Stats {
+            payload_compression: if packed::compression_enabled(&self.objects())? {
+                "auto"
+            } else {
+                "never"
+            }
+            .into(),
+            storage,
+            store_logical_bytes,
+            store_allocated_bytes,
             revisions: revisions.len(),
             objects: objects.len(),
             object_bytes,

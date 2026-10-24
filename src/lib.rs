@@ -8,6 +8,7 @@ compile_error!("Sprig supports Linux, macOS and Windows");
 pub mod blame;
 pub mod content;
 pub mod copy_tree;
+mod file_cache;
 mod manifest_pages;
 pub mod merge;
 mod metadata;

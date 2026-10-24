@@ -133,7 +133,11 @@ enum Command {
     /// Normally unmount an orphan generation reported by doctor; retain its data.
     UnmountGeneration { generation: String },
     /// Initialize a store at a new directory; existing paths are not replaced.
-    Init,
+    Init {
+        /// Keep payload chunks raw to trade storage for lower compression CPU cost.
+        #[arg(long)]
+        no_compression: bool,
+    },
     /// Import a source directory into a new workspace and its initial history.
     Import { source: PathBuf, name: String },
     /// Fork a workspace into an independent native working tree.
@@ -224,11 +228,25 @@ enum Command {
     Doctor,
     /// Restore a validated state backup, preserving current metadata for inspection.
     RecoverState { generation: u64 },
-    /// Show a garbage-collection plan only. No objects are removed.
+    /// Plan collection, or apply an exact plan after revalidating all protected roots.
     Gc {
-        /// Explicitly request the only supported mode: a non-destructive plan.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "apply")]
         dry_run: bool,
+        /// Permanently reclaim unreferenced payloads from this exact plan.
+        #[arg(long, value_name = "PLAN_ID")]
+        apply: Option<String>,
+        /// Upper bound for additional compaction bytes while old packs are retained.
+        #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+        max_extra_bytes: u64,
+    },
+    /// Explicit retention for metadata backups and dropped branch refs, never working data.
+    Retention {
+        #[arg(long, default_value_t = 32)]
+        keep_backups: usize,
+        #[arg(long)]
+        forget_branch_trash: Vec<String>,
+        #[arg(long, value_name = "PLAN_ID")]
+        apply: Option<String>,
     },
     /// Show logical and stored content statistics.
     Stats,
@@ -439,8 +457,8 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             "--json is not supported with exec because the child inherits standard output",
         ));
     }
-    if matches!(cli.command, Command::Init) {
-        Store::init(&cli.store)?;
+    if let Command::Init { no_compression } = &cli.command {
+        Store::init_with_compression(&cli.store, !no_compression)?;
         return result(json!({"initialized": true, "store": cli.store}));
     }
     if let Command::RecoverState { generation } = &cli.command {
@@ -455,7 +473,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         cli.copy_mode.into()
     };
     match &cli.command {
-        Command::Init | Command::RecoverState { .. } => {
+        Command::Init { .. } | Command::RecoverState { .. } => {
             unreachable!("initialization and state recovery are handled before opening the store")
         }
         Command::ProjectionServe { .. } | Command::WritableServe { .. } => {
@@ -586,7 +604,19 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             }
             Ok(output)
         }
-        Command::Gc { .. } => result(store.gc()?),
+        Command::Gc {
+            apply,
+            max_extra_bytes,
+            ..
+        } => match apply {
+            Some(plan) => result(store.gc_apply_with_budget(plan, *max_extra_bytes)?),
+            None => result(store.gc()?),
+        },
+        Command::Retention {
+            keep_backups,
+            forget_branch_trash,
+            apply,
+        } => result(store.retention(*keep_backups, forget_branch_trash, apply.as_deref())?),
         Command::Stats => result(store.stats()?),
         Command::Backend => result(store.backend()?),
         Command::Write {

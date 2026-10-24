@@ -362,6 +362,24 @@ pub(crate) fn validate_capture_metadata(path: &Path, metadata: &Metadata) -> io:
     Ok(())
 }
 
+/// Referenced allocated bytes, not exclusive physical extents on CoW filesystems.
+pub(crate) fn allocated_bytes(path: &Path, metadata: &Metadata) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        metadata
+            .blocks()
+            .checked_mul(512)
+            .ok_or_else(|| io::Error::other("allocation overflow"))
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        windows::allocation(path)
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -523,6 +541,43 @@ mod windows {
             device: info.volume as u64,
             inode: (info.index_high as u64) << 32 | info.index_low as u64,
         })
+    }
+
+    pub(super) fn allocation(path: &Path) -> io::Result<u64> {
+        #[repr(C)]
+        #[derive(Default)]
+        struct StandardInfo {
+            allocation_size: i64,
+            end_of_file: i64,
+            number_of_links: u32,
+            delete_pending: u8,
+            directory: u8,
+        }
+        const _: () = {
+            assert!(std::mem::size_of::<StandardInfo>() == 24);
+            assert!(std::mem::offset_of!(StandardInfo, allocation_size) == 0);
+            assert!(std::mem::offset_of!(StandardInfo, end_of_file) == 8);
+            assert!(std::mem::offset_of!(StandardInfo, number_of_links) == 16);
+            assert!(std::mem::offset_of!(StandardInfo, delete_pending) == 20);
+            assert!(std::mem::offset_of!(StandardInfo, directory) == 21);
+        };
+        let file = open_node(path, READ_ATTRIBUTES)?;
+        let mut info = StandardInfo::default();
+        // SAFETY: class FileStandardInfo (1) expects this repr(C) layout;
+        // the initialized buffer and owned no-follow handle remain live.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                1,
+                (&mut info as *mut StandardInfo).cast(),
+                std::mem::size_of::<StandardInfo>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        u64::try_from(info.allocation_size)
+            .map_err(|_| io::Error::other("negative file allocation"))
     }
 
     fn require_ntfs(file: &File) -> io::Result<()> {

@@ -157,6 +157,9 @@ pub struct DoctorReport {
 
 #[derive(Debug, Serialize)]
 pub struct GcPlan {
+    pub plan_id: String,
+    /// Conservative additional payload plus maximum index bytes while old packs remain.
+    pub compaction_upper_bound_bytes: u64,
     pub dry_run: bool,
     pub generation: u64,
     pub unreachable_objects: Vec<String>,
@@ -167,7 +170,19 @@ pub struct GcPlan {
 }
 
 #[derive(Debug, Serialize)]
+pub struct StorageUsage {
+    pub files: u64,
+    pub logical_bytes: u64,
+    /// Referenced allocation, not exclusive physical extents on CoW volumes.
+    pub allocated_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Stats {
+    pub payload_compression: String,
+    pub storage: BTreeMap<String, StorageUsage>,
+    pub store_logical_bytes: u64,
+    pub store_allocated_bytes: Option<u64>,
     pub revisions: usize,
     pub objects: usize,
     pub object_bytes: u64,
@@ -259,4 +274,27 @@ pub struct ProjectionBackendInfo {
     pub requires_root: bool,
     pub fuse_device_present: bool,
     pub note: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GcResult {
+    pub plan_id: String,
+    pub compacted_objects: u64,
+    pub compacted_logical_bytes: u64,
+    pub retired_pack_bytes: u64,
+    pub written_pack_bytes: u64,
+    pub removed_files: u64,
+    pub removed_bytes: u64,
+    pub readers_busy: bool,
+}
+
+/// Retention is explicit; working trees, journals, conflicts and pins are never pruned.
+#[derive(Debug, Serialize)]
+pub struct RetentionPlan {
+    pub plan_id: String,
+    pub applied: bool,
+    pub generation: u64,
+    pub keep_backups: usize,
+    pub backups: Vec<String>,
+    pub forgotten_branch_trash: Vec<String>,
 }

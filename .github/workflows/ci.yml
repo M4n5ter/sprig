@@ -136,6 +136,8 @@ jobs:
           $tokens = $null; $errors = $null
           $ast = [Management.Automation.Language.Parser]::ParseFile("$source\run_vss_fixture.ps1", [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw ($errors | Out-String) }
+          $rootEntry = '{"status":"passed","entries":{"":{"kind":"directory"}}}' | ConvertFrom-Json -AsHashtable
+          if ($rootEntry.status -ne 'passed' -or $rootEntry.entries[''].kind -ne 'directory') { throw 'Empty relative-root JSON key was not preserved.' }
           $pathGuard = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PlainPath' }, $false)
           if ($null -eq $pathGuard) { throw 'Path guard missing.' }
           . ([scriptblock]::Create($pathGuard.Extent.Text))

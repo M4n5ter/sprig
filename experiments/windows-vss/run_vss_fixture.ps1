@@ -163,7 +163,7 @@ if ($CargoWorkload) {
     $result.payload_file_mib = $null; $result.payload_files = $null
     $result.budget_plan.capture_count = 1
     $result.budget_plan.fixture_file_bytes_ceiling = 32MB
-    $result.budget_plan.limitation = 'One dependency-free Cargo tree, at most 32 MiB summed path lengths and 512 entries, one capture and one restored continuation. Existing larger external allowance retained conservatively; fixed commands and byte-capped logs. Not an OS quota. Compiler/toolchain installation is not part of this experiment.'
+    $result.budget_plan.limitation = 'One dependency-free Cargo tree, at most 32 MiB summed file lengths and 512 entries, one capture and one restored continuation. Existing larger external allowance retained conservatively; fixed commands and byte-capped logs. Not an OS quota. Compiler/toolchain installation is not part of this experiment.'
 }
 $mountAttempted = $false
 $runtimeUncertain = $false
@@ -427,7 +427,7 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
     $captureReportPath = Join-Path $captureWork 'capture.json'
     $captureReport = $null
     if (Test-Path -LiteralPath $captureReportPath -PathType Leaf) {
-        $captureReport = Get-Content -LiteralPath $captureReportPath -Raw | ConvertFrom-Json
+        $captureReport = Get-Content -LiteralPath $captureReportPath -Raw | ConvertFrom-Json -AsHashtable
         $captureEntry.fixture = $captureReport
     }
     # Failed content assertions do not negate separately established job drain
@@ -546,7 +546,7 @@ try {
         $script:runtimeUncertain = $true
         [void](Invoke-OwnedProcess $Python @($cargoFixture, 'prepare', '--live-root', $liveRoot,
             '--work-root', $prepareWork, '--cargo', $cargo) 'cargo-prepare' 600)
-        $result.cargo_prepare = Get-Content -LiteralPath (Join-Path $prepareWork 'prepare.json') -Raw | ConvertFrom-Json
+        $result.cargo_prepare = Get-Content -LiteralPath (Join-Path $prepareWork 'prepare.json') -Raw | ConvertFrom-Json -AsHashtable
         if ($result.cargo_prepare.status -ne 'passed' -or $result.cargo_prepare.stage -ne 'prepare' -or
             $result.cargo_prepare.cleanup_safe -ne $true -or $result.cargo_prepare.all_direct_children_exited -ne $true -or
             $result.cargo_prepare.all_direct_child_pipes_drained -ne $true) { throw 'Cargo preparation child lifetime is unverified; retain volume.' }
@@ -560,7 +560,7 @@ try {
         [void](Invoke-OwnedProcess $Python @($cargoFixture, 'finalize', '--capture-report', $cargoCapture,
             '--prepare-report', (Join-Path $prepareWork 'prepare.json'), '--work-root', $finalWork,
             '--cargo', $cargo) 'cargo-finalize' 600)
-        $result.cargo_finalize = Get-Content -LiteralPath (Join-Path $finalWork 'finalize.json') -Raw | ConvertFrom-Json
+        $result.cargo_finalize = Get-Content -LiteralPath (Join-Path $finalWork 'finalize.json') -Raw | ConvertFrom-Json -AsHashtable
         if ($result.cargo_finalize.status -ne 'passed' -or $result.cargo_finalize.stage -ne 'finalize' -or
             $result.cargo_finalize.cleanup_safe -ne $true -or $result.cargo_finalize.all_direct_children_exited -ne $true -or
             $result.cargo_finalize.all_direct_child_pipes_drained -ne $true) { throw 'Restored Cargo child lifetime is unverified; retain volume.' }

@@ -101,6 +101,19 @@ def check_node(path, directory=False):
     return info
 
 
+def restore_drive_path(value):
+    """Normalize only Rust's verbatim local-drive result, never device/UNC paths."""
+    require(isinstance(value, str), "Restore path must be a string")
+    if value.startswith("\\\\?\\"):
+        require(re.match(r"^\\\\\?\\[A-Za-z]:\\", value) is not None,
+                "Restore path is not a verbatim local drive path")
+        value = value[4:]
+        require("/" not in value, "Verbatim path must use canonical separators")
+        require(all(part and part not in (".", "..") and not part.endswith((".", " "))
+                    for part in value[3:].split("\\")), "Ambiguous verbatim path component")
+    return value
+
+
 def ordinary_path(path, must_exist=True):
     """Reject aliases and reparse ancestors for writable ordinary local paths."""
     path = Path(os.path.abspath(path))
@@ -722,7 +735,7 @@ def capture(args):
         restored = cli.run("--copy", "restore", revision, name + "-restore")
         require(restored.get("backend", {}).get("kind") == "native"
                 and restored.get("mount_state") == "native", "Restore is not native materialization")
-        restore = ordinary_path(restored["path"])
+        restore = ordinary_path(restore_drive_path(restored["path"]))
         require(store in restore.parents, "Sprig restore path is outside the owned store")
         outside_volume(live, restore)
         require(inventory(restore) == expected, "Native CAS restore bytes/mtime/mode differ from snapshot")

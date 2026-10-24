@@ -383,6 +383,18 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
         $captureReport = Get-Content -LiteralPath $captureReportPath -Raw | ConvertFrom-Json
         $captureEntry.fixture = $captureReport
     }
+    # Failed content assertions do not negate separately established job drain
+    # and exact VSS cleanup. Keep the trial failed, but allow normal own-disk
+    # detach only after the independent state check and finally's process guards.
+    if ($requestReport.version -eq 1 -and $requestReport.ok -eq $false -and
+        $requestReport.cleanup_safe -eq $true -and $requestReport.volume -eq $volumeGuid -and
+        $requestReport.provider_id -eq '{b5946137-7b9f-4925-af80-51abd60b20d5}' -and
+        $requestReport.child_drained -eq $true -and
+        $requestReport.snapshot_cleanup -eq 'confirmed' -and $requestReport.diff_area_cleanup -eq 'confirmed') {
+        Assert-NoOwnVssState
+        $script:runtimeUncertain = $false
+        throw "Capture $Label failed its operation, but exact snapshot/diff cleanup and child drain were confirmed."
+    }
     # A rejected preflight is a failed trial, but can still prove that no VSS
     # mutation or collector was started. Corroborate with independent CIM before
     # allowing normal detach; never infer this from the process exit code alone.

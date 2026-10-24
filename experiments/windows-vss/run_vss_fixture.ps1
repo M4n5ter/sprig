@@ -89,7 +89,7 @@ $result = [ordered]@{
     min_diff_area_file_size_mib = $minimumMiB; image_os = $env:ImageOS
     operating_system = ($os | Select-Object Caption, Version, BuildNumber)
     created = $false; mounted = $false; formatted = $false; cleanup = 'not-mounted'
-    captures = @(); storage_checkpoints = @(); errors = @()
+    captures = @(); storage_checkpoints = @(); storage_measurement = @(); errors = @()
 }
 $mountAttempted = $false
 $runtimeUncertain = $false
@@ -190,6 +190,41 @@ function Invoke-OwnedProcess([string] $File, [string[]] $Arguments, [string] $La
     if ($exitCode -ne 0) { throw "Process $Label exited $exitCode; see its retained logs." }
     return $record
 }
+function Record-StorageMeasurement([string] $Phase) {
+    # Bounded point-in-time read only. Measure source separately, but sum host
+    # consumption as VHDX + outside-volume work + evidence, each exactly once.
+    # Do not add live source bytes or VSS diff bytes again: both are in the VHDX.
+    $record = Invoke-OwnedProcess $Python @($Fixture, 'measure', $liveRoot, $image, $hostWork, $evidence) ('storage-' + $Phase) 120
+    if ((Get-Item -LiteralPath $record.Stdout).Length -gt 1MB) { throw 'Storage measurement JSON exceeds its bounded report size.' }
+    $measurement = Get-Content -LiteralPath $record.Stdout -Raw | ConvertFrom-Json -AsHashtable
+    if ($measurement.schema_version -ne 1 -or $measurement.paths.Count -ne 4) { throw 'Unexpected storage measurement schema.' }
+    foreach ($path in @($liveRoot, $image, $hostWork, $evidence)) {
+        if (-not $measurement.paths.ContainsKey($path)) { throw 'Storage measurement omitted an expected exact path.' }
+    }
+    $hostLogical = [uint64]0
+    $hostAllocated = [uint64]0
+    $logicalComplete = $true
+    $allocationComplete = $true
+    foreach ($path in @($image, $hostWork, $evidence)) {
+        $entry = $measurement.paths[$path]
+        if ($entry.exists -ne $true -or $null -eq $entry.logical_bytes) { $logicalComplete = $false }
+        else { $hostLogical += [uint64]$entry.logical_bytes }
+        if ($entry.exists -ne $true -or $null -eq $entry.allocated_bytes) { $allocationComplete = $false }
+        else { $hostAllocated += [uint64]$entry.allocated_bytes }
+    }
+    $result.storage_measurement += [ordered]@{
+        phase = $Phase; observed_at_utc = [DateTime]::UtcNow.ToString('o')
+        live_source = $measurement.paths[$liveRoot]; image = $measurement.paths[$image]
+        host_work = $measurement.paths[$hostWork]; evidence = $measurement.paths[$evidence]
+        host_total_logical_bytes = $(if ($logicalComplete) { $hostLogical } else { $null })
+        host_total_allocated_bytes = $(if ($allocationComplete) { $hostAllocated } else { $null })
+        allocation_complete = $allocationComplete
+        note = 'Checkpoint sample, not a continuous or lifetime peak. Host total sums image, host work and evidence once; live/diff bytes are not added again. Subsequent report emission and host filesystem metadata are excluded.'
+    }
+    if ($allocationComplete -and $hostAllocated -gt ($maximumAddedBytes - $budgetReserveBytes)) {
+        throw 'Measured host file allocation exhausted the conservative 2 GiB budget; no further capture is permitted.'
+    }
+}
 function Get-MappedDisk {
     $mapped = @(Get-DiskImage -ImagePath $image | Get-Disk)
     if ($mapped.Count -ne 1) { throw 'Exact image must map to one disk.' }
@@ -270,18 +305,25 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
     $script:runtimeUncertain = $true
     $record = Start-OwnedProcess $Requester $arguments ('requester-' + $Label)
     $exitCode = Wait-OwnedProcess $record 600
-    Copy-CaptureEvidence $captureWork $Label
     $lines = @(Get-Content -LiteralPath $record.Stdout | Where-Object { $_.StartsWith('SPRIG_VSS_RESULT ') })
     if ($lines.Count -ne 1) { throw 'Missing or ambiguous requester final result; retain the image.' }
     $requestReport = $lines[0].Substring('SPRIG_VSS_RESULT '.Length) | ConvertFrom-Json
+    # Preserve the requester's exact result before looking for an optional child
+    # report: the requester can fail before it ever starts the collector.
+    $captureEntry = [ordered]@{ label = $Label; requester_exit_code = $exitCode; requester = $requestReport; fixture = $null }
+    $result.captures += $captureEntry
+    Copy-CaptureEvidence $captureWork $Label
     $captureReportPath = Join-Path $captureWork 'capture.json'
-    $captureReport = Get-Content -LiteralPath $captureReportPath -Raw | ConvertFrom-Json
-    $result.captures += [ordered]@{ label = $Label; requester = $requestReport; fixture = $captureReport }
+    $captureReport = $null
+    if (Test-Path -LiteralPath $captureReportPath -PathType Leaf) {
+        $captureReport = Get-Content -LiteralPath $captureReportPath -Raw | ConvertFrom-Json
+        $captureEntry.fixture = $captureReport
+    }
     if ($exitCode -ne 0 -or $requestReport.version -ne 1 -or $requestReport.ok -ne $true -or
         $requestReport.cleanup_safe -ne $true -or $requestReport.volume -ne $volumeGuid -or
         $requestReport.provider_id -ne '{b5946137-7b9f-4925-af80-51abd60b20d5}' -or
         $requestReport.child_drained -ne $true -or $requestReport.child_exit_code -ne 0 -or
-        $requestReport.snapshot_cleanup -ne 'confirmed' -or $requestReport.diff_area_cleanup -ne 'confirmed' -or
+        $requestReport.snapshot_cleanup -ne 'confirmed' -or $requestReport.diff_area_cleanup -ne 'confirmed' -or $null -eq $captureReport -or
         $captureReport.cleanup_safe -ne $true) {
         throw "Capture $Label did not prove successful cleanup; retain the image."
     }
@@ -293,7 +335,7 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
 try {
     $before = @(Get-Disk | Select-Object Number, UniqueId)
     if (Test-Path -LiteralPath $image) { throw 'Image must not exist before creation.' }
-    $createScript = Join-Path $directory 'create-vhd.txt'
+    $createScript = Join-Path $hostWork 'create-vhd.txt'
     "create vdisk file=`"$image`" maximum=4096 type=expandable`nexit" | Set-Content -LiteralPath $createScript -Encoding ascii
     [void](Invoke-OwnedProcess (Join-Path $env:SystemRoot 'System32\diskpart.exe') @('/s', $createScript) 'diskpart-create' 90)
     if (-not (Test-Path -LiteralPath $image -PathType Leaf)) { throw 'VHDX creation failed; no retry.' }
@@ -350,6 +392,7 @@ try {
     $liveRoot = Join-Path $volumeRoot 'fixture'
     [void](Invoke-OwnedProcess $Python @($Fixture, 'prepare', '--live-root', $liveRoot, '--file-mib', '8') 'fixture-prepare' 120)
     [void](Assert-OutputBudget 'prepared')
+    Record-StorageMeasurement 'prepared'
     $env:SPRIG_VSS_ENABLE_RUNTIME = '1'
     [void](Invoke-Capture 'initial')
     $writer = Start-OwnedProcess $Python @($Fixture, 'writer', '--live-root', $liveRoot, '--seconds', '300',
@@ -360,11 +403,12 @@ try {
         Start-Sleep -Milliseconds 100
     }
     [void](Invoke-Capture 'live-concurrent')
+    Record-StorageMeasurement 'after-live-concurrent'
     [IO.File]::WriteAllText($writerStop, 'stop', [Text.ASCIIEncoding]::new())
     if ((Wait-OwnedProcess $writer 320) -ne 0) { throw 'Concurrent writer failed to stop cleanly.' }
     $settledReport = Invoke-Capture 'settled'
     [void](Invoke-Capture 'repeated' $settledReport)
-    [void](Invoke-OwnedProcess $Python @($Fixture, 'measure', $liveRoot, $hostWork) 'fixture-measure' 120)
+    Record-StorageMeasurement 'completed-before-detach'
     [void](Assert-OutputBudget 'complete')
     $result.ok = $true
 } catch {

@@ -36,7 +36,10 @@ explicitly approved disposable-runner test scope:
   to the snapshot set.
 - Delete only the recorded snapshot ID without force; remove only the newly
   owned association after confirming snapshots are gone. Unknown cleanup is
-  reported and never converted into forced volume removal.
+  reported and never converted into forced volume removal. Nonpersistent snapshots
+  can still auto-release when the requester object/process exits; that is not
+  proof of cleanup, and this experiment does not promise an unknown child can
+  continue reading such a snapshot. The live source is not rolled back or deleted.
 - No driver install, test signing, certificate, boot/security setting change,
   application suspension, or service-wide VSS stop.
 
@@ -81,5 +84,5 @@ space improvement is claimed before actual measurements.
 首次仅验合成普通文件，使用固定微软 provider、无应用 writer 的非持久快照。
 测试仅格式化本次新建且已核身份的最大 4 GiB 虚拟盘，差分区只在该卷内部、上限 512 MiB。
 CAS、暂存和恢复目录在卷外，额外合成输出上限 2 GiB。不改变已有卷、注册表、启动设置或信任配置。
-仅清理本次精确快照及新关联；不确定状态拒绝强制卸载。
+仅显式清理本次精确快照及新关联；不确定状态拒绝强制卸载。非持久快照仍可能随 requester 退出自动释放，不能把这种释放当成已核清理或承诺异常子进程可继续读取。
 当前收录需要显式暂存，成本全部统计，不冒称生产直读快路径或已实现全场景加速、省空间。

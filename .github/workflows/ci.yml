@@ -2,6 +2,13 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      refs_volume:
+        description: 'Explicitly create a disposable 1 GiB ReFS VHDX for this run'
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 jobs:
@@ -42,6 +49,18 @@ jobs:
       - name: Test Windows native-copy semantics
         if: runner.os == 'Windows'
         run: cargo test --locked
+      - name: Explicit synthetic ReFS runtime validation
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.refs_volume
+        shell: pwsh
+        run: ./tests/refs_vhd_workflow.ps1 -AllowSyntheticVolume
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.refs_volume
+        with:
+          name: refs-runtime-result
+          path: |
+            ${{ runner.temp }}/sprig-refs-*/result.json
+            ${{ runner.temp }}/sprig-refs-*/diskpart.log
+          if-no-files-found: warn
       - name: Build optimized example binary
         if: runner.os != 'Windows'
         run: cargo build --release --locked

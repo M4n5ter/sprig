@@ -802,6 +802,14 @@ mod windows {
         source_path: &Path,
         target: &Path,
     ) -> io::Result<Option<File>> {
+        // A volume that cannot clone needs no pathname walks or extra opens.
+        // This returns no data and creates no target; the caller's ordinary
+        // copy path still performs its regular no-follow/create-new checks.
+        let original_volume = volume_info(original_source)?;
+        if original_volume.name != "ReFS" || original_volume.flags & SUPPORTS_BLOCK_REFCOUNTING == 0
+        {
+            return Ok(None);
+        }
         validate_ancestors(source_path)?;
         validate_ancestors(target)?;
         require_absent(target)?;

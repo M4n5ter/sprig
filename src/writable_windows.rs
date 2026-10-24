@@ -460,6 +460,20 @@ impl WindowsCas {
     pub(crate) fn active_handles(&self) -> io::Result<usize> {
         Ok(self.state().map_err(nt_error)?.contexts.len())
     }
+    pub(crate) fn report_busy_contexts(&self) -> io::Result<()> {
+        let state = self.state().map_err(nt_error)?;
+        eprintln!(
+            "Windows owned stop remains busy: {} final-close contexts",
+            state.contexts.len()
+        );
+        for (token, context) in state.contexts.iter().take(8) {
+            eprintln!(
+                "Windows owned pending Close: token={token} inode={}",
+                context.inode
+            );
+        }
+        Ok(())
+    }
     /// Call only AFTER the OS volume flush has succeeded, with dispatcher alive.
     pub(crate) fn sync_for_stop(&self) -> io::Result<()> {
         let _op = self.lock().map_err(nt_error)?;

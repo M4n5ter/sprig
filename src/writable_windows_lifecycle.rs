@@ -413,7 +413,16 @@ pub(crate) fn serve(
         }
         if session::read_stop(generation, &record)? {
             adapter.gate_new_opens()?;
+            // WinFsp queues final Close asynchronously. In particular our own
+            // just-closed root attestation handle may not have reached Close yet.
+            // Keep dispatch alive, release all callback locks, and wait briefly.
+            // A live user handle/mapping is still busy; never substitute Cleanup.
+            let close_deadline = Instant::now() + Duration::from_secs(1);
+            while adapter.active_handles()? != 0 && Instant::now() < close_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             if adapter.active_handles()? != 0 {
+                adapter.report_busy_contexts()?;
                 session::cancel_stop(generation, &record)?;
                 write_json(generation, BUSY, &record)?;
                 adapter.ungate_new_opens()?;

@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       refs_volume:
-        description: 'Explicitly create a disposable 1 GiB ReFS VHDX for this run'
+        description: 'Explicitly create a disposable 4 GiB ReFS VHDX for this run'
         type: boolean
         required: false
         default: false

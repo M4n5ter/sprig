@@ -23,7 +23,7 @@ $image = Join-Path $directory 'synthetic.vhdx'
 if (Test-Path -LiteralPath $image) { throw 'Image must not already exist.' }
 $script = Join-Path $directory 'create.txt'
 $diskpartLog = Join-Path $directory 'diskpart.log'
-$result = [ordered]@{ image = $image; maximumBytes = 1073741824; created = $false; mounted = $false; formatted = $false; testExitCode = $null; cleanup = 'not-mounted' }
+$result = [ordered]@{ image = $image; maximumBytes = 4294967296; created = $false; mounted = $false; formatted = $false; testExitCode = $null; cleanup = 'not-mounted' }
 $startedAt = Get-Date
 $before = @(Get-Disk | Select-Object -ExpandProperty Number)
 $oldRoot = $env:SPRIG_REFS_TEST_ROOT
@@ -39,7 +39,7 @@ function Assert-FormatTarget {
     $mapped = @(Get-DiskImage -ImagePath $image -ErrorAction Stop | Get-Disk -ErrorAction Stop)
     if ($mapped.Count -ne 1) { throw 'Image mapping is not unique.' }
     $d = $mapped[0]
-    if ($d.UniqueId -ne $initializedIdentity -or $d.Number -ne $partition.DiskNumber -or $d.Size -ne 1073741824 -or $d.PartitionStyle -ne 'GPT' -or $d.IsBoot -or $d.IsSystem) { throw 'Format image identity changed.' }
+    if ($d.UniqueId -ne $initializedIdentity -or $d.Number -ne $partition.DiskNumber -or $d.Size -ne 4294967296 -or $d.PartitionStyle -ne 'GPT' -or $d.IsBoot -or $d.IsSystem) { throw 'Format image identity changed.' }
     $letters = @(Get-Partition -DriveLetter $partition.DriveLetter -ErrorAction Stop)
     if ($letters.Count -ne 1) { throw 'Format drive letter is not unique.' }
     $p = $letters[0]
@@ -48,7 +48,7 @@ function Assert-FormatTarget {
 try {
     # DiskPart creates only this nonexistent file; attach and format are separate,
     # so every consequential step can bind to the exact returned image object.
-    "create vdisk file=`"$image`" maximum=1024 type=expandable`nexit" | Set-Content -LiteralPath $script -Encoding ascii
+    "create vdisk file=`"$image`" maximum=4096 type=expandable`nexit" | Set-Content -LiteralPath $script -Encoding ascii
     & diskpart.exe /s $script 2>&1 | Tee-Object -FilePath $diskpartLog
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $image -PathType Leaf)) { throw 'VHDX creation failed; no retry.' }
     if (((Get-Item -LiteralPath $image -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Image unexpectedly became a reparse point.' }
@@ -59,7 +59,7 @@ try {
     $disks = @(Get-DiskImage -ImagePath $image -ErrorAction Stop | Get-Disk -ErrorAction Stop)
     if ($disks.Count -ne 1) { throw 'Image must identify exactly one disk.' }
     $disk = $disks[0]
-    if ($before -contains $disk.Number -or $disk.IsBoot -or $disk.IsSystem -or $disk.PartitionStyle -ne 'RAW' -or $disk.Size -ne 1073741824) {
+    if ($before -contains $disk.Number -or $disk.IsBoot -or $disk.IsSystem -or $disk.PartitionStyle -ne 'RAW' -or $disk.Size -ne 4294967296) {
         throw 'Refusing to initialize a preexisting, boot, system, nonblank or unexpected-size disk.'
     }
     $unique = $disk.UniqueId
@@ -67,7 +67,7 @@ try {
     $freshDisks = @(Get-DiskImage -ImagePath $image | Get-Disk)
     if ($freshDisks.Count -ne 1) { throw 'Image no longer maps to one disk.' }
     $fresh = $freshDisks[0]
-    if ($fresh.UniqueId -ne $unique -or $fresh.Number -ne $disk.Number -or $fresh.Size -ne 1073741824 -or $fresh.PartitionStyle -ne 'RAW' -or $fresh.IsBoot -or $fresh.IsSystem) { throw 'Image mapping changed.' }
+    if ($fresh.UniqueId -ne $unique -or $fresh.Number -ne $disk.Number -or $fresh.Size -ne 4294967296 -or $fresh.PartitionStyle -ne 'RAW' -or $fresh.IsBoot -or $fresh.IsSystem) { throw 'Image mapping changed.' }
     $initializedDisks = @($fresh | Initialize-Disk -PartitionStyle GPT -PassThru -Confirm:$false)
     if ($initializedDisks.Count -ne 1) { throw 'Expected one initialized disk.' }
     $initialized = $initializedDisks[0]
@@ -79,7 +79,7 @@ try {
     $freshDisks = @(Get-DiskImage -ImagePath $image | Get-Disk)
     if ($freshDisks.Count -ne 1) { throw 'Image no longer maps to one disk.' }
     $fresh = $freshDisks[0]
-    if ($fresh.UniqueId -ne $initializedIdentity -or $fresh.Number -ne $partition.DiskNumber -or $fresh.Size -ne 1073741824 -or $fresh.PartitionStyle -ne 'GPT' -or $fresh.IsBoot -or $fresh.IsSystem) { throw 'Image mapping changed before format.' }
+    if ($fresh.UniqueId -ne $initializedIdentity -or $fresh.Number -ne $partition.DiskNumber -or $fresh.Size -ne 4294967296 -or $fresh.PartitionStyle -ne 'GPT' -or $fresh.IsBoot -or $fresh.IsSystem) { throw 'Image mapping changed before format.' }
     try {
         $method = (Get-CimClass -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Volume -Amended).CimClassMethods['Format']
         $result.formatReturnMap = @($method.Qualifiers | Where-Object Name -in 'ValueMap', 'Values' | Select-Object Name, Value)

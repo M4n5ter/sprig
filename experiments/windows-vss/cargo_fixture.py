@@ -301,8 +301,14 @@ def new_work(raw, live):
 
 def executable(raw):
     path = base.ordinary_path(raw)
-    base.check_node(path)
-    require(path.is_file(), "Expected an already installed executable")
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            and not base.is_reparse(info) and info.st_nlink >= 1,
+            "Expected an already installed ordinary executable")
+    base.stream_check(path)
+    # Cargo may hardlink target/release/sprig.exe to its matching deps artifact.
+    # These trusted tool files are never captured or materialized as workspace
+    # content. Do not apply the six-file fixture's single-link data restriction.
     return path
 
 
@@ -842,6 +848,10 @@ def selftest():
                 "Unsafe path component accepted")
         live = root / "fixture"
         create_fixture(live)
+        tool = root / "tool.exe"
+        write_new(tool, b"not executed\n")
+        os.link(tool, root / "tool-artifact.exe")
+        require(executable(tool) == tool, "Trusted tool hardlink was mistaken for fixture data")
         before = inventory(live)
         require(inventory(live) == before, "Repeated oracle selftest differs")
         edit_source(live, 0, 1)

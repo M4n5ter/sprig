@@ -33,7 +33,9 @@ function Assert-PlainPath([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force
     while ($null -ne $item) {
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse-point path is not allowed.' }
-        $item = if ($item.PSIsContainer) { $item.Parent } else { $item.Directory }
+        if ($item -is [IO.DirectoryInfo]) { $item = $item.Parent }
+        elseif ($item -is [IO.FileInfo]) { $item = $item.Directory }
+        else { throw 'Expected a filesystem file or directory.' }
     }
 }
 function Resolve-LocalFile([string] $Path) {

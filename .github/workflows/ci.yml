@@ -132,8 +132,15 @@ jobs:
           python -m py_compile "$source\fixture.py"
           if ($LASTEXITCODE -ne 0) { throw 'Python source validation failed.' }
           $tokens = $null; $errors = $null
-          [Management.Automation.Language.Parser]::ParseFile("$source\run_vss_fixture.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          $ast = [Management.Automation.Language.Parser]::ParseFile("$source\run_vss_fixture.ps1", [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw ($errors | Out-String) }
+          $pathGuard = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PlainPath' }, $false)
+          if ($null -eq $pathGuard) { throw 'Path guard missing.' }
+          . ([scriptblock]::Create($pathGuard.Extent.Text))
+          Set-StrictMode -Version Latest
+          Assert-PlainPath "$source\run_vss_fixture.ps1"
+          Assert-PlainPath $source
+          Assert-PlainPath ([IO.Path]::GetPathRoot($source))
           $pump = [regex]::Match((Get-Content "$source\run_vss_fixture.ps1" -Raw), "(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
           if (-not $pump.Success) { throw 'Bounded pump source missing.' }
           Add-Type -TypeDefinition $pump.Groups[1].Value

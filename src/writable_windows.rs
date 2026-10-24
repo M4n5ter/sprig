@@ -213,6 +213,10 @@ fn check_options(options: CreateOptions) -> Result<()> {
         | CreateOptions::FILE_DELETE_ON_CLOSE.0
         | CreateOptions::FILE_OPEN_FOR_BACKUP_INTENT.0;
     if options.0 & !allowed != 0 {
+        eprintln!(
+            "Windows owned open rejected unsupported create options {:#x}",
+            options.0
+        );
         return Err(STATUS_NOT_SUPPORTED);
     }
     Ok(())

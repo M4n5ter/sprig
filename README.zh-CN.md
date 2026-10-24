@@ -375,7 +375,7 @@ STORE/
 
 `stats.object_bytes` 汇总索引和 loose 布局中唯一对象解码后的字节数（文件内容块和元数据页块），包括未引用对象。`object_storage_bytes` 包含对象目录中的所有文件，包括索引、锁、孤立数据包和临时文件。Unix 上的 `object_allocated_bytes` 累加这些文件报告的已分配块，并不代表共享/CoW 存储上的独占物理占用；Windows 返回 null。`reachable_logical_bytes` 累加受保护修订中的文件长度，相同内容在不同修订中会重复计入。`storage` 逐个顶层区域拆账，`store_logical_bytes` 与 `store_allocated_bytes` 包含原生树、upper、日志、修订、备份、缓存及孤立文件；虚拟挂载的 lower/merged 视图不重复计入，实际后备内容已经统计。硬链接别名在每个区域内只计一次。分配量来自 Unix blocks 或 Windows `FILE_STANDARD_INFO`，不代表共享/CoW 卷上的独占物理 extent，也不包含内核/RAM 缓存或文件系统全局元数据。外部正在修改的原生树统计不是原子快照，可复现测量需要先停止写入。`doctor` 列出孤立/临时条目。
 
-当前存储结构（schema）为 **9**。
+当前存储结构（schema）为 **10**。
 
 ## 保证与边界
 
@@ -389,13 +389,13 @@ STORE/
 
 ## 平台与开发
 
-仓库使用 **stable Rust**，包含 rustfmt 和 Clippy。Cargo 声明的最低 Rust 版本为 **1.89**，这不是固定的开发工具链版本。Linux 使用 `FICLONE`，macOS 使用 `fclonefileat`。两者都是逐文件克隆，不是整树快照或 Btrfs 子卷快照。是否支持克隆取决于文件系统。Windows 使用普通复制，限制见下文。
+仓库使用 **stable Rust**，包含 rustfmt 和 Clippy。Cargo 声明的最低 Rust 版本为 **1.89**，这不是固定的开发工具链版本。Linux 使用 `FICLONE`，macOS 使用 `fclonefileat`。两者都是逐文件克隆，不是整树快照或 Btrfs 子卷快照。是否支持克隆取决于文件系统。Windows 通过 `FSCTL_DUPLICATE_EXTENTS_TO_FILE` 尝试同卷 ReFS 块克隆；NTFS 使用普通复制，限制见下文。
 
 [CI](.github/workflows/ci.yml) 在 Linux 和 macOS 上运行 stable Rust。macOS 作业设置 `SPRIG_REQUIRE_REFLINK=1`，要求实际 APFS 克隆成功并验证写入隔离。Linux 测试普通路径与回退路径；通过测试不代表该运行环境支持 reflink。示例也在 CI 中执行，macOS 额外要求严格克隆。
 
 ### Windows 原生工作区
 
-Windows 后端支持**本地 NTFS 磁盘上的可写普通文件与目录**，使用普通复制；不支持其他 Windows 文件系统。构建需要 stable Rust 的 MSVC 工具链，以及包含 Windows SDK 的 Visual Studio C++ 构建工具；Zstandard 依赖需要 C 编译器。运行原生工作区不需要文件系统驱动或管理员权限。
+Windows 后端支持**本地 NTFS 和 ReFS 磁盘上的可写普通文件与目录**，不支持其他 Windows 文件系统。文件身份保留完整 128 位文件 ID 和 64 位卷序列号，不做截断。ReFS 克隆只共享存储 extent，不会在工作区之间共享可写 inode；对齐范围使用块克隆，簇尾不足部分普通复制。小于一个簇的文件在 `auto` 模式下普通复制；严格 `--copy-mode clone` 在文件无法克隆时失败。这不是整树快照，源文件必须保持静止。构建需要 stable Rust 的 MSVC 工具链，以及包含 Windows SDK 的 Visual Studio C++ 构建工具；Zstandard 依赖需要 C 编译器。运行原生工作区不需要文件系统驱动或管理员权限。
 
 在仓库根目录执行以下 PowerShell 示例：
 
@@ -418,14 +418,18 @@ s doctor
 Write-Output "Demo retained at: $Demo"
 ```
 
+ReFS 的硬链接能力取决于卷格式（3.5 或更新版本）；`backend` 的 `hardlink_support` 返回实际卷标志。不支持链接的卷不能还原包含别名的树，操作会失败而不是拆散链接。
+
+Windows CI 只枚举现有卷，不创建或格式化磁盘。如果存在健康且带盘符的 ReFS 卷，`SPRIG_REFS_TEST_ROOT` 指向该卷，运行严格克隆、非对齐 EOF、身份、检查点、恢复和写隔离测试。没有 ReFS 卷时明确报告缺少运行覆盖，不算克隆已验证；每次 Windows CI 仍独立运行 NTFS 测试。
+
 Windows 对不支持的行为明确报错，不做静默转换：
 
-- 不支持原生克隆、Linux 投影或 POSIX `chmod`。支持普通 `exec`，外部修改仍需显式创建检查点。
-- 拒绝重解析点，包括符号链接和目录联接，不跟随它们遍历。拒绝 UNC、设备与驱动器相对路径、保留名称、备用数据流路径语法以及不支持的路径别名。请使用普通本地 NTFS 路径和 UTF-8 名称。
-- 文件或目录若包含命名 NTFS 数据流，包括 `Zone.Identifier`，会在捕获或复制前被拒绝，不会静默丢弃这些数据流。
+- 不支持 Linux 投影或 POSIX `chmod`。支持普通 `exec`，外部修改仍需显式创建检查点。
+- 拒绝重解析点，包括符号链接和目录联接，不跟随它们遍历。拒绝 UNC、设备与驱动器相对路径、保留名称、备用数据流路径语法以及不支持的路径别名。请使用普通本地 NTFS 或 ReFS 路径和 UTF-8 名称。
+- 文件或目录若包含命名数据流，包括 `Zone.Identifier`，会在捕获或复制前被拒绝，不会静默丢弃这些数据流。
 - 捕获时目录记为 `0755`，可写文件记为 `0644`，只读文件会被拒绝。还原时拒绝其他权限模式或精度细于 100 ns 的时间戳，避免静默丢失已记录元数据，因此跨平台还原历史存在限制。
 - 新目录继承 Windows ACL；Unix 私有权限位不等于 ACL 安全保证。请将存储库放在仅自己的账户可访问的位置。
-- 普通文件会被刷新，元数据替换首先使用写穿重命名。对于仍被读者持有的不可变数据包索引，访问被拒绝时可回退到原子 POSIX 风格替换，并检查重命名前后的文件刷新结果。这要求 Windows 10 1607 或更新版本上的本地 NTFS；不支持时明确失败，不模拟替换。已有读者继续持有旧索引代际。该回退不等同于写穿重命名或目录 fsync，也不宣称与 Unix 后端具有相同的断电后目录命名空间持久性。
+- 普通文件会被刷新，元数据替换首先使用写穿重命名。对于仍被读者持有的不可变数据包索引，访问被拒绝时可回退到原子 POSIX 风格替换，并检查重命名前后的文件刷新结果。这要求 Windows 10 1607 或更新版本上的受支持本地卷；缺少所需替换操作时明确失败，不模拟替换。已有读者继续持有旧索引代际。该回退不等同于写穿重命名或目录 fsync，也不宣称与 Unix 后端具有相同的断电后目录命名空间持久性。
 
 Windows 的 `exec` 通过继承的独占访问文件句柄维持租约。在多线程 SDK 宿主中，若其他线程恰好在短暂的句柄继承窗口内绕过 Sprig 启动子进程，该子进程也可能保留租约，使 `workspace_busy` 持续更久。应等这些子进程退出；Sprig 不会强行解除租约，也不提供沙箱。
 

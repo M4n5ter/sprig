@@ -99,7 +99,7 @@ impl CaptureResult {
             .iter()
             .map(|(path, entry)| (path.clone(), entry.id.clone()))
             .collect();
-        let mut old_inodes: BTreeMap<(u64, u64), Vec<&Observation>> = BTreeMap::new();
+        let mut old_inodes: BTreeMap<(u64, u128), Vec<&Observation>> = BTreeMap::new();
         for (path, old) in previous_observed {
             if previous.get(path).is_some_and(|entry| entry.id == old.id) {
                 old_inodes
@@ -280,8 +280,8 @@ fn reconcile_link_groups(
         .filter(|entry| matches!(entry.kind, EntryKind::File { .. }))
         .map(|entry| (entry.id.as_str(), entry))
         .collect();
-    let mut group_inodes: BTreeMap<String, BTreeSet<(u64, u64)>> = BTreeMap::new();
-    let mut inode_groups: BTreeMap<(u64, u64), BTreeSet<String>> = BTreeMap::new();
+    let mut group_inodes: BTreeMap<String, BTreeSet<(u64, u128)>> = BTreeMap::new();
+    let mut inode_groups: BTreeMap<(u64, u128), BTreeSet<String>> = BTreeMap::new();
     for (path, entry) in manifest.iter() {
         if !matches!(entry.kind, EntryKind::File { .. }) {
             continue;
@@ -335,7 +335,7 @@ fn observe_manifest(merged: &Path, manifest: &Manifest) -> Result<Observed> {
                 id: entry.id.clone(),
                 link_group: entry.link_group.clone(),
                 device: metadata.dev(),
-                inode: metadata.ino(),
+                inode: u128::from(metadata.ino()),
             },
         );
     }
@@ -1811,7 +1811,7 @@ mod tests {
             assert_eq!(observed.len(), context.manifest.len());
             assert_eq!(
                 observed["new/file"].inode,
-                fs::symlink_metadata(merged.join("new/file")).unwrap().ino()
+                u128::from(fs::symlink_metadata(merged.join("new/file")).unwrap().ino())
             );
             CaptureResult {
                 observed,
@@ -2059,14 +2059,14 @@ mod tests {
                         id: entry.id.clone(),
                         link_group: entry.link_group.clone(),
                         device: 1,
-                        inode: index as u64 + 1,
+                        inode: index as u128 + 1,
                     },
                 )
             })
             .collect()
     }
 
-    fn observation(id: &str, device: u64, inode: u64) -> Observation {
+    fn observation(id: &str, device: u64, inode: u128) -> Observation {
         Observation {
             id: id.into(),
             link_group: None,

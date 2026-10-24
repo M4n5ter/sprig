@@ -37,7 +37,7 @@ hashing, metadata or retained native generations free.
 ## Build and try it
 
 Build with stable Rust and a C linker. The following examples use a POSIX shell
-on Linux or macOS; Windows has a [native-copy subset](#windows-native-workspaces)
+on Linux or macOS; Windows has a [native workspace subset](#windows-native-workspaces)
 with its own requirements below. Run this block from the repository. It creates its own tiny source
 project and a fresh store in a temporary directory; no existing project is needed.
 
@@ -639,7 +639,7 @@ also does not measure kernel/RAM caches or filesystem-global metadata. Statistic
 are not an atomic snapshot of externally modified native trees; quiesce writers
 for reproducible measurements. `doctor` lists orphan/temporary entries.
 
-The current storage schema is **9**.
+The current storage schema is **10**.
 
 ## Guarantees and boundaries
 
@@ -681,8 +681,9 @@ The current storage schema is **9**.
 The repository selects **stable Rust**, with rustfmt and Clippy. Cargo declares a
 minimum Rust version of **1.89**, not a pinned development toolchain. Linux uses
 `FICLONE`; macOS uses `fclonefileat`. Both clone individual files, not whole trees
-or Btrfs subvolumes. Clone support depends on the filesystem. Windows uses ordinary
-copying, with the restrictions below.
+or Btrfs subvolumes. Windows attempts same-volume ReFS block cloning through
+`FSCTL_DUPLICATE_EXTENTS_TO_FILE`; NTFS uses ordinary copying. Clone support
+depends on the volume and file, with the restrictions below.
 
 [CI](.github/workflows/ci.yml) runs stable Rust on Linux and macOS. The macOS job
 sets `SPRIG_REQUIRE_REFLINK=1` to require real APFS clones and test write isolation.
@@ -692,7 +693,13 @@ support on the runner. The example runs in CI too, with strict cloning on macOS.
 ### Windows native workspaces
 
 The Windows backend supports **writable regular files and directories on local
-NTFS disks**, using ordinary copies. Other Windows filesystems are unsupported.
+NTFS and ReFS disks**. Other Windows filesystems are unsupported. File identity
+uses the complete 128-bit file ID and 64-bit volume serial number, without
+truncation. ReFS cloning shares storage extents, never a writable inode across
+workspaces. Aligned ranges are cloned and any sub-cluster tail is copied; files
+smaller than one cluster use the ordinary-copy path in `auto` mode. Strict
+`--copy-mode clone` fails when a file cannot be cloned. This is not a whole-tree
+snapshot, and source files must remain quiescent.
 Build with stable Rust's MSVC toolchain and the Visual Studio C++ build tools,
 including the Windows SDK; the Zstandard dependency
 needs a C compiler. Running native workspaces needs no filesystem driver or
@@ -719,15 +726,25 @@ s doctor
 Write-Output "Demo retained at: $Demo"
 ```
 
+ReFS hardlink support depends on the volume format (3.5 or later); `backend`
+reports the actual `hardlink_support` volume flag. A volume without this capability
+cannot materialize linked aliases; it fails instead of splitting the link group.
+
+Windows CI enumerates existing volumes without creating or formatting disks.
+If a healthy drive-letter ReFS volume exists, `SPRIG_REFS_TEST_ROOT` selects it
+for strict clone, non-aligned EOF, identity, checkpoint, restore and write-isolation
+tests. An absent ReFS volume is reported as missing runtime coverage, not proof
+that block cloning works. NTFS tests run independently on every Windows job.
+
 Windows limitations are explicit rather than silent conversions:
 
-- Native cloning, Linux projection and POSIX `chmod` are unsupported. Ordinary
+- Linux projection and POSIX `chmod` are unsupported. Ordinary
   `exec` is supported, with the same requirement to checkpoint external edits.
 - Reparse points, including symlinks and junctions, are rejected without traversal.
   UNC, device and drive-relative paths, reserved names, alternate-stream path syntax
-  and unsupported path aliases are rejected. Use ordinary local NTFS paths and
+  and unsupported path aliases are rejected. Use ordinary local NTFS or ReFS paths and
   UTF-8 names.
-- Files and directories with named NTFS data streams, including `Zone.Identifier`,
+- Files and directories with named data streams, including `Zone.Identifier`,
   are rejected before capture or copying rather than silently dropping those streams.
 - Captures record `0755` for directories and `0644` for writable files. Read-only
   files are rejected. Materialization refuses other modes or timestamps finer than
@@ -739,7 +756,8 @@ Windows limitations are explicit rather than silent conversions:
   rename. For an immutable pack index held by existing readers, an access-denied
   result can fall back to atomic POSIX-style replacement with checked file flushes
   before and after the rename. This requires Windows 10 version 1607 or later on
-  local NTFS; unsupported systems fail rather than emulate replacement. Existing
+  a supported local volume; systems without the required replacement operation
+  fail rather than emulate it. Existing
   readers retain their old index generation. This fallback is not a write-through
   rename or a directory fsync. Equal power-loss namespace durability with the Unix
   backend is not claimed.

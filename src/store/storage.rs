@@ -43,12 +43,12 @@ impl Store {
 fn measure(
     path: &Path,
     usage: &mut StorageUsage,
-    seen: &mut BTreeSet<(u64, u64)>,
+    seen: &mut BTreeSet<(u64, u128)>,
     generations: bool,
     generation: bool,
 ) -> Result<()> {
     let metadata = platform::symlink_metadata(path)?;
-    if metadata.is_file() && !seen.insert((metadata.dev(), metadata.ino())) {
+    if metadata.is_file() && !seen.insert((metadata.dev(), platform::inode(&metadata))) {
         return Ok(());
     }
     usage.logical_bytes = usage

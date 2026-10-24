@@ -1,6 +1,8 @@
 //! Filesystem operations with explicit platform guarantees.
 //!
-//! Windows supports ordinary writable files and directories on local NTFS disks.
+//! Windows supports ordinary writable files and directories on local NTFS/ReFS
+//! disks. File identities retain all 128 bits on Windows; ReFS block clones
+//! share physical extents, never a mutable file identity.
 //! Existing reparse-point leaves and ancestors are rejected. Paths must stay
 //! trusted and quiescent: this is not a sandbox against concurrent ancestor
 //! replacement. Windows has no unprivileged
@@ -19,6 +21,18 @@ pub(crate) use std::fs::Metadata;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 pub(crate) use windows::Metadata;
+
+/// Full physical identity, widened losslessly on Unix and native 128-bit on Windows.
+pub(crate) fn inode(metadata: &Metadata) -> u128 {
+    #[cfg(unix)]
+    {
+        u128::from(std::os::unix::fs::MetadataExt::ino(metadata))
+    }
+    #[cfg(windows)]
+    {
+        metadata.ino()
+    }
+}
 
 pub(crate) fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
     #[cfg(unix)]
@@ -310,7 +324,7 @@ pub(crate) fn replace_immutable_file(source: &Path, target: &Path) -> io::Result
             Err(error) => return Err(error),
         }
         // These helpers check ancestors, reject reparse points, and require
-        // local NTFS. Keep the source handle through publication and its flush.
+        // local NTFS/ReFS. Keep the source handle through publication and its flush.
         let source_file = open_read_write(source)?;
         let source_metadata = file_metadata(&source_file)?;
         let target_metadata = symlink_metadata(target)?;
@@ -323,7 +337,7 @@ pub(crate) fn replace_immutable_file(source: &Path, target: &Path) -> io::Result
         if source_metadata.dev() != target_metadata.dev() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "immutable index replacement requires the same NTFS volume",
+                "immutable index replacement requires the same local volume",
             ));
         }
         source_file.sync_all()?;
@@ -380,13 +394,46 @@ pub(crate) fn allocated_bytes(path: &Path, metadata: &Metadata) -> io::Result<u6
     }
 }
 
+/// Attempts an independent ReFS block clone, preserving the supplied source
+/// handle's cursor. A subcluster tail is copied, never cloned beyond source EOF.
+/// Nonempty subcluster files are unsupported rather than counted as clones.
+/// `None` permits ordinary-copy fallback; operational/partial-clone errors do
+/// not. Targets are always create-new, including after a fallback.
+#[cfg(windows)]
+pub(crate) fn native_clone(
+    source: &File,
+    source_path: &Path,
+    target: &Path,
+) -> io::Result<Option<File>> {
+    windows::native_clone(source, source_path, target)
+}
+
+#[cfg(windows)]
+pub(crate) fn filesystem_name(path: &Path) -> io::Result<&'static str> {
+    let file = windows::open_node(path, windows::READ_ATTRIBUTES)?;
+    Ok(windows::volume_info(&file)?.name)
+}
+
+#[cfg(windows)]
+pub(crate) fn supports_hard_links(path: &Path) -> io::Result<bool> {
+    let file = windows::open_node(path, windows::READ_ATTRIBUTES)?;
+    Ok(windows::volume_info(&file)?.flags & 0x0040_0000 != 0)
+}
+
+#[cfg(windows)]
+pub(crate) fn supports_block_cloning(path: &Path) -> io::Result<bool> {
+    let file = windows::open_node(path, windows::READ_ATTRIBUTES)?;
+    let volume = windows::volume_info(&file)?;
+    Ok(volume.name == "ReFS" && volume.flags & 0x0800_0000 != 0)
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
     use std::ffi::c_void;
     use std::ops::Deref;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use std::path::{Component, Prefix};
 
@@ -397,27 +444,20 @@ mod windows {
     pub(super) const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const REPARSE_POINT: u32 = 0x0400;
+    const SPARSE_FILE: u32 = 0x0200;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const SHARE_READ: u32 = 1;
+    const SUPPORTS_BLOCK_REFCOUNTING: u32 = 0x0800_0000;
+    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
+    const FSCTL_GET_INTEGRITY_INFORMATION: u32 = 0x0009_027c;
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
     const EPOCH_TICKS: i128 = 116_444_736_000_000_000;
 
     #[repr(C)]
     #[derive(Default)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct HandleInfo {
-        attributes: u32,
-        creation: FileTime,
-        access: FileTime,
-        write: FileTime,
-        volume: u32,
-        size_high: u32,
-        size_low: u32,
-        links: u32,
-        index_high: u32,
-        index_low: u32,
+    struct FileIdInfo {
+        volume: u64,
+        identifier: [u8; 16],
     }
     #[repr(C)]
     #[derive(Default)]
@@ -430,6 +470,40 @@ mod windows {
     }
 
     #[repr(C)]
+    #[derive(Default)]
+    struct IntegrityInfo {
+        checksum_algorithm: u16,
+        reserved: u16,
+        flags: u32,
+        checksum_chunk_size: u32,
+        cluster_size: u32,
+    }
+
+    #[repr(C)]
+    struct DuplicateExtents {
+        source: *mut c_void,
+        source_offset: i64,
+        target_offset: i64,
+        byte_count: i64,
+    }
+
+    const _: () = {
+        assert!(std::mem::size_of::<FileIdInfo>() == 24);
+        assert!(std::mem::offset_of!(FileIdInfo, identifier) == 8);
+        assert!(std::mem::size_of::<IntegrityInfo>() == 16);
+        assert!(std::mem::offset_of!(IntegrityInfo, cluster_size) == 12);
+        assert!(std::mem::size_of::<DuplicateExtents>() == 32);
+        assert!(std::mem::offset_of!(DuplicateExtents, source_offset) == 8);
+        assert!(std::mem::offset_of!(DuplicateExtents, target_offset) == 16);
+        assert!(std::mem::offset_of!(DuplicateExtents, byte_count) == 24);
+    };
+
+    pub(super) struct VolumeInfo {
+        pub(super) name: &'static str,
+        pub(super) flags: u32,
+    }
+
+    #[repr(C)]
     struct StreamInfo {
         size: i64,
         name: [u16; 296], // MAX_PATH + 36, per WIN32_FIND_STREAM_DATA.
@@ -437,12 +511,27 @@ mod windows {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetFileInformationByHandle(handle: *mut c_void, info: *mut HandleInfo) -> i32;
         fn GetFileInformationByHandleEx(
             handle: *mut c_void,
             class: i32,
             info: *mut c_void,
             size: u32,
+        ) -> i32;
+        fn SetFileInformationByHandle(
+            handle: *mut c_void,
+            class: i32,
+            info: *const c_void,
+            size: u32,
+        ) -> i32;
+        fn DeviceIoControl(
+            handle: *mut c_void,
+            control: u32,
+            input: *const c_void,
+            input_size: u32,
+            output: *mut c_void,
+            output_size: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
         ) -> i32;
         fn MoveFileExW(source: *const u16, target: *const u16, flags: u32) -> i32;
         fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
@@ -469,7 +558,7 @@ mod windows {
     pub(crate) struct Metadata {
         inner: fs::Metadata,
         device: u64,
-        inode: u64,
+        inode: u128,
         modified_ns: i128,
         changed_ns: i128,
     }
@@ -483,7 +572,7 @@ mod windows {
         pub(crate) fn dev(&self) -> u64 {
             self.device
         }
-        pub(crate) fn ino(&self) -> u64 {
+        pub(crate) fn ino(&self) -> u128 {
             self.inode
         }
         pub(crate) fn mode(&self) -> u32 {
@@ -517,12 +606,19 @@ mod windows {
                 "Windows reparse points, symlinks and junctions are not supported",
             ));
         }
-        require_ntfs(file)?;
-        let mut info = HandleInfo::default();
+        volume_info(file)?;
+        let mut info = FileIdInfo::default();
         let mut basic = BasicInfo::default();
         // SAFETY: both outputs have the documented Win32 layout and remain
         // writable; the File keeps its HANDLE alive throughout both calls.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                18, // FileIdInfo; legacy BY_HANDLE_FILE_INFORMATION truncates ReFS IDs.
+                (&mut info as *mut FileIdInfo).cast(),
+                std::mem::size_of::<FileIdInfo>() as u32,
+            )
+        } == 0
             || unsafe {
                 GetFileInformationByHandleEx(
                     file.as_raw_handle(),
@@ -538,8 +634,8 @@ mod windows {
             modified_ns: (basic.write as i128 - EPOCH_TICKS) * 100,
             changed_ns: (basic.change as i128 - EPOCH_TICKS) * 100,
             inner,
-            device: info.volume as u64,
-            inode: (info.index_high as u64) << 32 | info.index_low as u64,
+            device: info.volume,
+            inode: u128::from_le_bytes(info.identifier),
         })
     }
 
@@ -580,8 +676,9 @@ mod windows {
             .map_err(|_| io::Error::other("negative file allocation"))
     }
 
-    fn require_ntfs(file: &File) -> io::Result<()> {
+    pub(super) fn volume_info(file: &File) -> io::Result<VolumeInfo> {
         let mut filesystem = [0u16; 32];
+        let mut flags = 0;
         // SAFETY: File owns the live handle, the filesystem-name buffer is
         // writable, and all unused optional output pointers are null.
         if unsafe {
@@ -591,7 +688,7 @@ mod windows {
                 0,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut flags,
                 filesystem.as_mut_ptr(),
                 filesystem.len() as u32,
             )
@@ -603,15 +700,328 @@ mod windows {
             .iter()
             .position(|&unit| unit == 0)
             .unwrap_or(filesystem.len());
-        if filesystem[..length] != [78, 84, 70, 83] {
-            // ReFS requires 128-bit file identities; truncating those to the
-            // schema's 64-bit inode field could incorrectly identify renames.
+        let name = match &filesystem[..length] {
+            [78, 84, 70, 83] => "NTFS",
+            [82, 101, 70, 83] => "ReFS",
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the Windows native backend requires local NTFS or ReFS",
+                ));
+            }
+        };
+        Ok(VolumeInfo { name, flags })
+    }
+
+    fn same_snapshot(left: &Metadata, right: &Metadata) -> bool {
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.is_file() == right.is_file()
+            && left.len() == right.len()
+            && left.mode() == right.mode()
+            && left.modified_ns == right.modified_ns
+            && left.changed_ns == right.changed_ns
+    }
+
+    fn unsupported_clone(error: &io::Error) -> bool {
+        // ERROR_INVALID_FUNCTION and ERROR_NOT_SUPPORTED explicitly report a
+        // missing filesystem operation. INVALID_PARAMETER is deliberately not
+        // accepted: it can indicate a bug in offsets, alignment or handles.
+        // Access, sharing/lock, quota, space and I/O failures must propagate.
+        matches!(error.raw_os_error(), Some(1 | 50))
+    }
+
+    fn integrity_info(file: &File) -> io::Result<IntegrityInfo> {
+        let mut info = IntegrityInfo::default();
+        let mut returned = 0;
+        // SAFETY: synchronous live file handle, no input, and a correctly sized
+        // FSCTL_GET_INTEGRITY_INFORMATION_BUFFER output with its documented ABI.
+        if unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_GET_INTEGRITY_INFORMATION,
+                std::ptr::null(),
+                0,
+                (&mut info as *mut IntegrityInfo).cast(),
+                std::mem::size_of::<IntegrityInfo>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if returned != std::mem::size_of::<IntegrityInfo>() as u32
+            || !info.cluster_size.is_power_of_two()
+        {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the Windows native backend currently requires NTFS",
+                io::ErrorKind::InvalidData,
+                "invalid ReFS integrity or cluster-size information",
             ));
         }
-        Ok(())
+        Ok(info)
+    }
+
+    fn require_absent(path: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "clone target already exists",
+            )),
+        }
+    }
+
+    /// Deletes only our create-new handle, not a potentially replaced pathname.
+    /// Failure is fatal: the caller must never overwrite a leftover target.
+    fn discard_clone(output: File, target: &Path) -> io::Result<Option<File>> {
+        let delete_file: u8 = 1; // FILE_DISPOSITION_INFO.DeleteFile is BOOLEAN.
+        // SAFETY: the owned handle has DELETE access, and FileDispositionInfo
+        // (4) takes this one-byte BOOLEAN. No unrelated path is deleted.
+        if unsafe {
+            SetFileInformationByHandle(
+                output.as_raw_handle(),
+                4,
+                (&delete_file as *const u8).cast(),
+                1,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        drop(output);
+        // Another still-open reader can delay final deletion. Do not authorize
+        // fallback until the old target really is gone, even in that case.
+        require_absent(target)?;
+        Ok(None)
+    }
+
+    pub(super) fn native_clone(
+        original_source: &File,
+        source_path: &Path,
+        target: &Path,
+    ) -> io::Result<Option<File>> {
+        validate_ancestors(source_path)?;
+        validate_ancestors(target)?;
+        require_absent(target)?;
+        let before = metadata(original_source)?;
+        if !before.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clone source must be a regular file",
+            ));
+        }
+        // User-tree capture rejects read-only inputs at its boundary. The
+        // primitive also serves immutable cache files, which may be read-only.
+        reject_named_streams(source_path)?;
+
+        // A separate open, not try_clone(), preserves the caller's cursor:
+        // Windows FileExt::seek_read changes its handle's shared file pointer.
+        // Keep normal sharing for freshly hydrated cache sources whose writer
+        // is still open. The existing trusted, quiescent tree contract applies.
+        let source = open_node(source_path, GENERIC_READ)?;
+        if !same_snapshot(&before, &metadata(&source)?) {
+            return Err(io::Error::other(
+                "source changed while opening clone handle",
+            ));
+        }
+        let source_volume = volume_info(&source)?;
+        if source_volume.name != "ReFS" || source_volume.flags & SUPPORTS_BLOCK_REFCOUNTING == 0 {
+            return Ok(None);
+        }
+        let parent_path = target
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = open_node(parent_path, READ_ATTRIBUTES)?;
+        let parent_metadata = metadata(&parent)?;
+        if !parent_metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "clone target parent must be a directory",
+            ));
+        }
+        let target_volume = volume_info(&parent)?;
+        if target_volume.name != "ReFS"
+            || target_volume.flags & SUPPORTS_BLOCK_REFCOUNTING == 0
+            || before.dev() != parent_metadata.dev()
+        {
+            return Ok(None);
+        }
+        let source_integrity = match integrity_info(&source) {
+            Ok(info) => info,
+            Err(error) if unsupported_clone(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let cluster_size = u64::from(source_integrity.cluster_size);
+        let length = before.len();
+        let aligned_length = length - length % cluster_size;
+        if length != 0 && aligned_length == 0 {
+            return Ok(None);
+        }
+        // Every FSCTL range must fit LARGE_INTEGER, and each request is strictly
+        // smaller than 4 GiB. No rounded-up request may pass the source EOF.
+        if length > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "clone source exceeds signed Windows file offsets",
+            ));
+        }
+        let max_extent = (u64::from(u32::MAX) / cluster_size) * cluster_size;
+        if max_extent == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ReFS cluster size exceeds the block-clone request limit",
+            ));
+        }
+
+        // DELETE is solely for safe fallback cleanup by this exact handle.
+        // Denying write/delete sharing pins this fresh target until returned;
+        // no existing file, reparse point or stream can be overwritten.
+        let output = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
+            .create_new(true)
+            .share_mode(SHARE_READ)
+            .custom_flags(OPEN_REPARSE_POINT)
+            .open(target)?;
+        let output_metadata = metadata(&output)?;
+        if !output_metadata.is_file()
+            || output_metadata.dev() != before.dev()
+            || output_metadata.ino() == before.ino()
+            || volume_info(&output)?.name != "ReFS"
+        {
+            return Err(io::Error::other("clone target changed during creation"));
+        }
+        let target_integrity = match integrity_info(&output) {
+            Ok(info) => info,
+            Err(error) if unsupported_clone(&error) => return discard_clone(output, target),
+            Err(error) => return Err(error),
+        };
+        if source_integrity.checksum_algorithm != target_integrity.checksum_algorithm
+            || source_integrity.flags != target_integrity.flags
+            || source_integrity.checksum_chunk_size != target_integrity.checksum_chunk_size
+            || source_integrity.cluster_size != target_integrity.cluster_size
+        {
+            // Do not change either file's integrity policy merely to clone it.
+            return discard_clone(output, target);
+        }
+        if before.file_attributes() & SPARSE_FILE != 0 {
+            let mut returned = 0;
+            // SAFETY: FSCTL_SET_SPARSE with NULL input marks only this freshly
+            // created destination sparse, as required for a sparse source.
+            if unsafe {
+                DeviceIoControl(
+                    output.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                return if unsupported_clone(&error) {
+                    discard_clone(output, target)
+                } else {
+                    Err(error)
+                };
+            }
+        }
+        output.set_len(length)?;
+        let mut offset = 0;
+        while offset < aligned_length {
+            let byte_count = (aligned_length - offset).min(max_extent);
+            let request = DuplicateExtents {
+                source: source.as_raw_handle(),
+                source_offset: offset as i64,
+                target_offset: offset as i64,
+                byte_count: byte_count as i64,
+            };
+            let mut returned = 0;
+            // SAFETY: both handles and the documented repr(C) request stay
+            // live throughout this synchronous call. Checked cluster-aligned
+            // ranges fit both files' EOF and each request is less than 4 GiB.
+            if unsafe {
+                DeviceIoControl(
+                    output.as_raw_handle(),
+                    FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                    (&request as *const DuplicateExtents).cast(),
+                    std::mem::size_of::<DuplicateExtents>() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                return if offset == 0 && unsupported_clone(&error) {
+                    // NOT_SUPPORTED can also report a range beyond a source
+                    // that was concurrently truncated. That is not capability
+                    // absence and must not be hidden by copy fallback.
+                    if !same_snapshot(&before, &metadata(&source)?)
+                        || !same_snapshot(&before, &metadata(original_source)?)
+                        || !same_snapshot(&before, &super::symlink_metadata(source_path)?)
+                    {
+                        return Err(io::Error::other("source changed during block clone"));
+                    }
+                    discard_clone(output, target)
+                } else {
+                    // A failed later extent is never converted into a copy.
+                    Err(error)
+                };
+            }
+            offset += byte_count;
+        }
+        // Exact-byte tail handling also works with 64 KiB clusters and sparse
+        // sources. Neither file is extended to a rounded-up cluster boundary.
+        let mut buffer = [0u8; 64 * 1024];
+        while offset < length {
+            let count = (length - offset).min(buffer.len() as u64) as usize;
+            let read = loop {
+                match source.seek_read(&mut buffer[..count], offset) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "source shortened while copying clone tail",
+                ));
+            }
+            let mut written = 0;
+            while written < read {
+                let count = match output.seek_write(&buffer[written..read], offset + written as u64)
+                {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if count == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write clone tail",
+                    ));
+                }
+                written += count;
+            }
+            offset += read as u64;
+        }
+        if !same_snapshot(&before, &metadata(&source)?)
+            || !same_snapshot(&before, &metadata(original_source)?)
+            || !same_snapshot(&before, &super::symlink_metadata(source_path)?)
+            || metadata(&output)?.len() != length
+        {
+            return Err(io::Error::other("source changed during block clone"));
+        }
+        reject_named_streams(source_path)?;
+        Ok(Some(output))
     }
 
     pub(super) fn reject_named_streams(path: &Path) -> io::Result<()> {
@@ -653,7 +1063,7 @@ mod windows {
             if info.name[..length] != [58, 58, 36, 68, 65, 84, 65] {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "named NTFS data streams are not supported and will not be silently discarded",
+                    "named Windows data streams are not supported and will not be silently discarded",
                 ));
             }
             // SAFETY: the live search handle owns this enumeration and output

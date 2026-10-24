@@ -29,7 +29,7 @@ use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 9;
+const STORAGE_SCHEMA: u32 = 10;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 #[derive(Serialize, Deserialize)]
@@ -2530,7 +2530,7 @@ fn observe_manifest(tree: &Path, manifest: &Manifest) -> Result<Observed> {
                 id: entry.id.clone(),
                 link_group: entry.link_group.clone(),
                 device: metadata.dev(),
-                inode: metadata.ino(),
+                inode: platform::inode(&metadata),
             },
         );
     }
@@ -2678,7 +2678,7 @@ fn apply_mutation(tree: &Path, observed: &mut Observed, mutation: &Mutation) -> 
 fn copy_subtree(
     source: &Path,
     target: &Path,
-    links: &mut BTreeMap<(u64, u64), PathBuf>,
+    links: &mut BTreeMap<(u64, u128), PathBuf>,
 ) -> Result<()> {
     let metadata = platform::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
@@ -2704,7 +2704,7 @@ fn copy_subtree(
             .set_times(fs::FileTimes::new().set_modified(metadata.modified()?))?;
         sync_directory(target)?;
     } else if metadata.is_file() {
-        let identity = (metadata.dev(), metadata.ino());
+        let identity = (metadata.dev(), platform::inode(&metadata));
         if let Some(previous) = links.get(&identity) {
             platform::hard_link(previous, target)?;
         } else {
@@ -2797,14 +2797,14 @@ fn resolution_path(tree: &Path, relative: &str) -> Result<PathBuf> {
     Ok(current)
 }
 
-type SyncedInodes = BTreeMap<(u64, u64), (u64, i64, i64, i64, i64)>;
+type SyncedInodes = BTreeMap<(u64, u128), (u64, i64, i64, i64, i64)>;
 
 fn sync_inode_once(
     path: &Path,
     metadata: &platform::Metadata,
     synced: &mut SyncedInodes,
 ) -> Result<()> {
-    let key = (metadata.dev(), metadata.ino());
+    let key = (metadata.dev(), platform::inode(metadata));
     let fingerprint = (
         metadata.len(),
         metadata.mtime(),
@@ -2821,7 +2821,7 @@ fn sync_inode_once(
     platform::sync_file(path)?;
     let after = platform::symlink_metadata(path)?;
     if !after.is_file()
-        || (after.dev(), after.ino()) != key
+        || (after.dev(), platform::inode(&after)) != key
         || (
             after.len(),
             after.mtime(),

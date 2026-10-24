@@ -314,3 +314,86 @@ fn windows_native_copy_history_and_leases() -> Result<()> {
     assert!(store.doctor()?.healthy);
     Ok(())
 }
+
+/// Runs only against an explicitly supplied, already existing ReFS volume.
+/// It never creates or formats a disk and removes only its own new fixture.
+#[test]
+fn refs_block_clone_roundtrip_and_isolation() -> Result<()> {
+    let Some(root) = std::env::var_os("SPRIG_REFS_TEST_ROOT") else {
+        eprintln!("ReFS runtime test not exercised: SPRIG_REFS_TEST_ROOT is unset");
+        return Ok(());
+    };
+    let root = PathBuf::from(root).canonicalize()?;
+    assert_eq!(
+        sprig::copy_tree::native_backend_info(&root)?.filesystem,
+        "ReFS"
+    );
+    let temporary = root.join(format!(
+        "sprig-refs-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    fs::create_dir(&temporary)?;
+    let fixture = Fixture(temporary.canonicalize()?);
+    let source = fixture.0.join("source");
+    fs::create_dir(&source)?;
+    let payload: Vec<u8> = (0..1_048_593)
+        .map(|i| ((i * 17 + i / 4096) % 251) as u8)
+        .collect();
+    fs::write(source.join("data"), &payload)?;
+    let other_root = std::env::temp_dir().canonicalize()?;
+    if sprig::copy_tree::native_backend_info(&other_root)?.filesystem == "NTFS" {
+        let other = other_root.join(format!(
+            "sprig-refs-cross-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&other)?;
+        let other = Fixture(other.canonicalize()?);
+        fs::write(other.0.join("data"), &payload)?;
+        let cross = fixture.0.join("cross-volume");
+        let stats = sprig::copy_tree::copy_tree(&other.0, &cross, CopyMode::Auto)?;
+        assert_eq!(stats.cloned, 0);
+        assert_eq!(stats.copied, 1);
+        assert_eq!(fs::read(cross.join("data"))?, payload);
+        assert_eq!(fs::read(other.0.join("data"))?, payload);
+    }
+    let target = fixture.0.join("clone");
+    let copied = sprig::copy_tree::copy_tree(&source, &target, CopyMode::Clone)?;
+    assert_eq!(copied.cloned, 1);
+    assert_eq!(copied.copied, 0);
+    assert_eq!(fs::read(target.join("data"))?, payload);
+    assert!(sprig::copy_tree::copy_tree(&source, &target, CopyMode::Clone).is_err());
+    assert_eq!(fs::read(target.join("data"))?, payload);
+    let objects = fixture.0.join("objects");
+    let (_, original_ids) = content::capture(&source, &objects, &Observed::new())?;
+    let (_, clone_ids) = content::capture(&target, &objects, &Observed::new())?;
+    assert_ne!(original_ids["data"].inode, clone_ids["data"].inode);
+    assert_eq!(original_ids["data"].device, clone_ids["data"].device);
+    fs::write(target.join("data"), b"private edit")?;
+    assert_eq!(fs::read(source.join("data"))?, payload);
+    if sprig::copy_tree::native_backend_info(&source)?.hardlink_support == Some(true) {
+        fs::hard_link(source.join("data"), source.join("alias"))?;
+        let linked = fixture.0.join("linked-clone");
+        let stats = sprig::copy_tree::copy_tree(&source, &linked, CopyMode::Clone)?;
+        assert_eq!(stats.cloned, 1);
+        assert_eq!(stats.hardlinks, 1);
+        fs::write(linked.join("alias"), b"shared inside this copy")?;
+        assert_eq!(fs::read(linked.join("data"))?, b"shared inside this copy");
+        assert_eq!(fs::read(source.join("data"))?, payload);
+    }
+    let store = Store::init(&fixture.0.join("store"))?;
+    let imported = store.import(&source, "main", CopyMode::Clone)?;
+    assert_eq!(imported.copy_stats.as_ref().unwrap().cloned, 1);
+    let forked = store.fork("main", "fork", CopyMode::Clone)?;
+    fs::write(forked.path.join("data"), b"fork edit")?;
+    store.checkpoint("fork", "edit", None)?;
+    assert_eq!(fs::read(imported.path.join("data"))?, payload);
+    let restored = store.restore(&imported.base_revision, "restored")?;
+    assert_eq!(fs::read(restored.path.join("data"))?, payload);
+    assert!(store.doctor()?.healthy);
+    println!(
+        "ReFS actual strict block clone, nonaligned EOF, capture identity, checkpoint, restore and write isolation passed"
+    );
+    Ok(())
+}

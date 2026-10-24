@@ -64,7 +64,30 @@ pub struct Observation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_group: Option<String>,
     pub device: u64,
-    pub inode: u64,
+    #[serde(with = "physical_inode")]
+    pub inode: u128,
+}
+
+// Encode the complete identity without JSON's usual 64-bit integer limitation.
+// This also keeps Value-based state inspection/recovery lossless.
+mod physical_inode {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{value:032x}"))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(serde::de::Error::custom("invalid physical file identity"));
+        }
+        u128::from_str_radix(&value, 16).map_err(serde::de::Error::custom)
+    }
 }
 
 struct CapturedFile {
@@ -112,7 +135,7 @@ fn capture_entry(
     batch: &mut ObjectBatch,
     manifest: &mut Manifest,
     observed: &mut Observed,
-    files: &mut BTreeMap<(u64, u64), CapturedFile>,
+    files: &mut BTreeMap<(u64, u128), CapturedFile>,
 ) -> Result<()> {
     validate_path(relative)?;
     let metadata = platform::symlink_metadata(path)?;
@@ -129,7 +152,7 @@ fn capture_entry(
         if !unchanged(&metadata, &before) {
             return invalid(format!("source changed during capture: {}", path.display()));
         }
-        let key = (before.dev(), before.ino());
+        let key = (before.dev(), platform::inode(&before));
         let kind = if let Some(captured) = files.get(&key) {
             if !unchanged(&captured.metadata, &before) {
                 return invalid(format!(
@@ -175,7 +198,7 @@ fn capture_entry(
             id: String::new(),
             link_group: None,
             device: metadata.dev(),
-            inode: metadata.ino(),
+            inode: platform::inode(&metadata),
         },
     );
     if metadata.is_dir() {
@@ -221,7 +244,7 @@ fn assign_ids(manifest: &mut Manifest, observed: &mut Observed, previous: &Obser
             current.id.clone_from(&old.id);
         }
     }
-    let mut old_inodes: BTreeMap<(u64, u64), Vec<&Observation>> = BTreeMap::new();
+    let mut old_inodes: BTreeMap<(u64, u128), Vec<&Observation>> = BTreeMap::new();
     for old in previous.values() {
         old_inodes
             .entry((old.device, old.inode))
@@ -273,7 +296,7 @@ pub(crate) fn assign_link_groups(
     observed: &mut Observed,
     previous: &Observed,
 ) -> Result<()> {
-    let mut current_inodes: BTreeMap<(u64, u64), Vec<String>> = BTreeMap::new();
+    let mut current_inodes: BTreeMap<(u64, u128), Vec<String>> = BTreeMap::new();
     for (path, current) in observed.iter() {
         if matches!(manifest[path].kind, EntryKind::File { .. }) {
             current_inodes
@@ -282,9 +305,9 @@ pub(crate) fn assign_link_groups(
                 .push(path.clone());
         }
     }
-    let mut old_groups: BTreeMap<(u64, u64), BTreeSet<&str>> = BTreeMap::new();
-    let mut old_group_inodes: BTreeMap<&str, BTreeSet<(u64, u64)>> = BTreeMap::new();
-    let mut old_singletons: BTreeMap<(u64, u64), BTreeSet<&str>> = BTreeMap::new();
+    let mut old_groups: BTreeMap<(u64, u128), BTreeSet<&str>> = BTreeMap::new();
+    let mut old_group_inodes: BTreeMap<&str, BTreeSet<(u64, u128)>> = BTreeMap::new();
+    let mut old_singletons: BTreeMap<(u64, u128), BTreeSet<&str>> = BTreeMap::new();
     for old in previous.values() {
         if let Some(group) = old.link_group.as_deref().filter(|group| !group.is_empty()) {
             let key = (old.device, old.inode);
@@ -298,7 +321,7 @@ pub(crate) fn assign_link_groups(
         }
     }
     let mut used = BTreeSet::new();
-    let mut assigned: BTreeMap<(u64, u64), Option<String>> = BTreeMap::new();
+    let mut assigned: BTreeMap<(u64, u128), Option<String>> = BTreeMap::new();
     // Reserve surviving groups before replacements can claim their tokens.
     // This order must not depend on inode or pathname ordering.
     for key in current_inodes.keys() {
@@ -833,7 +856,7 @@ fn unchanged(left: &Metadata, right: &Metadata) -> bool {
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-fn unique_id(path: &str, device: u64, inode: u64) -> String {
+fn unique_id(path: &str, device: u64, inode: u128) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(
         &SystemTime::now()
@@ -860,6 +883,23 @@ mod tests {
 
     #[test]
     fn validates_paths_addresses_and_root_syntax() {
+        // Physical identities retain every ReFS bit through persisted observations.
+        let observed = Observation {
+            id: "full-width".to_owned(),
+            link_group: None,
+            device: u64::MAX,
+            inode: u128::MAX - 7,
+        };
+        let bytes = serde_json::to_vec(&observed).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Observation>(&bytes).unwrap(),
+            observed
+        );
+        let value = serde_json::to_value(&observed).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Observation>(value).unwrap(),
+            observed
+        );
         for path in ["/absolute", "a/../b", "a/./b", "a//b", "a/"] {
             assert!(validate_path(path).is_err());
         }

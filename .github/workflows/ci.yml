@@ -25,6 +25,20 @@ jobs:
         env:
           SPRIG_REQUIRE_REFLINK: '1'
         run: cargo test --locked
+      - name: Inspect existing Windows volumes for ReFS coverage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Output "Image: $env:ImageOS $env:ImageVersion; OS: $([Environment]::OSVersion.VersionString)"
+          $volumes = @(Get-Volume)
+          $volumes | Select-Object DriveLetter, FileSystem, FileSystemType, AllocationUnitSize, SizeRemaining, HealthStatus | ConvertTo-Json
+          $refs = $volumes | Where-Object { $_.FileSystem -eq 'ReFS' -and $_.DriveLetter -and $_.HealthStatus -eq 'Healthy' } | Select-Object -First 1
+          if ($refs) {
+            "SPRIG_REFS_TEST_ROOT=$($refs.DriveLetter):\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Output 'ReFS clone runtime coverage unavailable: no existing healthy drive-letter ReFS volume. No volume is created or formatted.'
+          }
       - name: Test Windows native-copy semantics
         if: runner.os == 'Windows'
         run: cargo test --locked

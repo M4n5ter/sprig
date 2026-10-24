@@ -44,18 +44,14 @@ pub struct NativeBackendInfo {
     pub platform: String,
     pub filesystem: String,
     pub clone_api: Option<String>,
+    /// Windows volume flag; other platforms report no authoritative probe here.
+    pub hardlink_support: Option<bool>,
+    pub block_clone_support: Option<bool>,
     pub whole_tree_snapshots: bool,
     pub note: String,
 }
 
 pub fn copy_tree(source: &Path, target: &Path, mode: CopyMode) -> io::Result<CopyStats> {
-    #[cfg(windows)]
-    if mode == CopyMode::Clone {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native file cloning is not supported on Windows",
-        ));
-    }
     let source = normalized_root(source)?;
     let target = normalized_root(target)?;
     let metadata = platform::symlink_metadata(&source)?;
@@ -97,7 +93,7 @@ fn copy_entry(
     target: &Path,
     mode: CopyMode,
     stats: &mut CopyStats,
-    files: &mut BTreeMap<(u64, u64), CopiedFile>,
+    files: &mut BTreeMap<(u64, u128), CopiedFile>,
 ) -> io::Result<()> {
     let metadata = platform::symlink_metadata(source)?;
     platform::validate_capture_metadata(source, &metadata)?;
@@ -140,7 +136,7 @@ fn copy_entry(
         if !before.is_file() || !unchanged(&metadata, &before) {
             return Err(io::Error::other("source changed type while copying"));
         }
-        let key = (before.dev(), before.ino());
+        let key = (before.dev(), platform::inode(&before));
         if let Some(copied) = files.get(&key) {
             if !unchanged(&copied.metadata, &before) {
                 return Err(io::Error::other("linked source changed while copying"));
@@ -288,13 +284,13 @@ pub(crate) fn set_symlink_permissions(path: &Path, mode: u32) -> io::Result<()> 
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
 pub(crate) fn native_clone(
-    _source: &File,
-    _source_path: &Path,
-    _target: &Path,
+    source: &File,
+    source_path: &Path,
+    target: &Path,
 ) -> io::Result<Option<File>> {
-    Ok(None)
+    platform::native_clone(source, source_path, target)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -370,10 +366,23 @@ pub fn native_backend_info(path: &Path) -> io::Result<NativeBackendInfo> {
         platform: std::env::consts::OS.to_owned(),
         filesystem: filesystem_name(path)?,
         clone_api: if cfg!(target_os = "linux") { Some("FICLONE".to_owned()) }
-            else if cfg!(target_os = "macos") { Some("fclonefileat".to_owned()) } else { None },
+            else if cfg!(target_os = "macos") { Some("fclonefileat".to_owned()) }
+            else if cfg!(windows) { Some("FSCTL_DUPLICATE_EXTENTS_TO_FILE (ReFS)".to_owned()) } else { None },
+        hardlink_support: {
+            #[cfg(windows)]
+            { Some(platform::supports_hard_links(path)?) }
+            #[cfg(unix)]
+            { None }
+        },
+        block_clone_support: {
+            #[cfg(windows)]
+            { Some(platform::supports_block_cloning(path)?) }
+            #[cfg(unix)]
+            { None }
+        },
         whole_tree_snapshots: false,
         note: if cfg!(windows) {
-            "Windows uses ordinary copies on NTFS only; clone mode and projection are unsupported. Reparse points and read-only files are rejected. ACLs are inherited, not reproduced. File flushes and write-through replacement do not provide POSIX directory-fsync power-loss guarantees."
+            "Windows supports local NTFS and ReFS. Same-volume ReFS files may use block cloning; other supported files use ordinary copies. Linux projection is unsupported. Reparse points and read-only files are rejected. ACLs are inherited, not reproduced. File flushes and write-through replacement do not provide POSIX directory-fsync power-loss guarantees."
         } else {
             "Per-file copy-on-write clones are attempted at copy time; filesystem detection alone does not guarantee support. No whole-tree native snapshot is used."
         }.to_owned(),
@@ -425,8 +434,7 @@ fn filesystem_name(path: &Path) -> io::Result<String> {
 
 #[cfg(windows)]
 fn filesystem_name(path: &Path) -> io::Result<String> {
-    platform::symlink_metadata(path)?;
-    Ok("NTFS".to_owned())
+    platform::filesystem_name(path).map(str::to_owned)
 }
 
 fn normalized_root(path: &Path) -> io::Result<PathBuf> {

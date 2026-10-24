@@ -111,9 +111,9 @@ CAS、暂存和恢复目录在卷外，额外合成输出上限 2 GiB。不改�
 基线四轮已通过，但其 GetCompressedFileSizeW 字段对普通文件实际是逻辑长度口径，428.675 MiB 不代表物理峰值。
 新测量改用 FILE_STANDARD_INFO.AllocationSize，仍不等于卷级独占占用或连续峰值；不冒称全场景加速、省空间。
 
-## Bounded Cargo acceptance (candidate, not yet runtime verified)
+## Bounded Cargo acceptance (experimental, one verified run)
 
-The next explicit runtime dispatch uses a dependency-free Rust library and its
+The explicit runtime dispatch uses a dependency-free Rust library and its
 real Cargo target directory, not the six-file benchmark. Development and test
 profiles retain incremental compilation, disable debug information, and use one
 codegen unit. Clean, no-op and fixed-edit tests precede one storage snapshot.
@@ -151,3 +151,42 @@ Cargo 校验通过只读、不跟随重解析点的句柄统一读取 Windows �
 属性位，变化即拒绝，不屏蔽未知位。已知的 `NOT_CONTENT_INDEXED` 是内容索引提示，
 允许读取但不持久化，与归档提示相同；此能力不是完整 Windows 元数据备份，
 不承诺恢复 ACL、所有者或索引策略。
+
+### Verified Cargo run
+
+[Run 40106838648](https://github.com/M4n5ter/sprig/actions/runs/40106838648)
+validated source commit `05a3ffdcd8873112bbb9b8732b2f51203679a627` on
+Windows Server 2025 with Cargo 1.99.1. The settled source and target contained
+41 entries, 27 files and 4,549,356 logical bytes. This particular tree had no
+hardlink groups; hardlink validation is covered separately by component tests.
+
+Clean/no-op/edited tests passed. The restored target had a different absolute
+path, yet Cargo explicitly reported `Fresh`, did not invoke rustc, and passed
+the test without changing the restored inventory. A subsequent real source edit
+compiled and passed; the original live tree stayed unchanged. No fingerprints,
+dep-info or timestamps were patched to manufacture freshness. Full snapshot and
+native-restore byte/mode/mtime/topology checks passed without a staging tree.
+
+Single-run timings were 78 ms for VSS creation, 94 ms for CAS import, and 156 ms
+for the restore CLI (266 ms including its verification work). Clean/no-op/edit
+Cargo commands took 484/62/469 ms; restored no-op and continued edit took
+78/266 ms. These are small-fixture observations, not comparative speed claims.
+The imported store used 1,656,088 bytes of referenced file allocation. The final
+pre-detach sample, including VHDX, outside work and evidence once, was 212,075,832
+bytes (202.25 MiB); this includes the native restored copy and VHDX overhead,
+not a net-savings result or continuous physical peak. VSS diff allocation was
+64 MiB inside the VHDX and is not added again. Exact snapshot/diff cleanup and
+normal detach were confirmed, with every child drained. Strict checkpoint and
+production main remain unchanged; this is not a general-purpose VSS product API.
+
+已验证一次真实 Cargo 流程：上述运行使用 Server 2025、Cargo 1.99.1，完整源码和
+编译产物共 41 项、27 文件、约 4.34 MiB。恢复到不同绝对路径后，Cargo 实际输出
+`Fresh`，未调用 rustc，测试通过且恢复树未变；继续改源码后重新编译和测试通过，
+原工作树保持不变。没有修改指纹、dep-info 或时间戳来制造 Fresh。本次树没有硬链接组，
+不能据此宣称真实 Cargo 已覆盖非空硬链接拓扑；相关语义另有组件测试。
+
+单次 VSS 创建、CAS 收录和纯恢复 CLI 分别为 78、94、156 毫秒；这些小负载数字不代表
+普适加速。收录后 Store 的引用文件分配约 1.58 MiB，全试验结束前采样约 202.25 MiB，
+包含测试虚拟盘、CAS、恢复副本和日志，不是净节省或连续峰值。没有 staging 副本；
+子进程排空、精确快照和差分关联清理、正常卸载均确认。严格 checkpoint 和生产 main
+未改，此功能仍是受限实验，不是正式通用 VSS 接口。

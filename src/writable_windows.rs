@@ -201,6 +201,13 @@ fn info(attr: &NodeAttr) -> Result<FileInfo> {
     Ok(out)
 }
 fn check_options(options: CreateOptions) -> Result<()> {
+    // WinFsp v2.1 forwards the NT create disposition in the upper byte
+    // (src/dll/fsop.c FspFileSystemOpCreate). It is not an option flag;
+    // WinFsp has already selected Create/Open/Overwrite from this value.
+    if options.0 >> 24 > 5 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let option_bits = options.0 & 0x00ff_ffff;
     let allowed = CreateOptions::FILE_DIRECTORY_FILE.0
         | CreateOptions::FILE_NON_DIRECTORY_FILE.0
         | CreateOptions::FILE_WRITE_THROUGH.0
@@ -212,7 +219,7 @@ fn check_options(options: CreateOptions) -> Result<()> {
         | CreateOptions::FILE_NO_EA_KNOWLEDGE.0
         | CreateOptions::FILE_DELETE_ON_CLOSE.0
         | CreateOptions::FILE_OPEN_FOR_BACKUP_INTENT.0;
-    if options.0 & !allowed != 0 {
+    if option_bits & !allowed != 0 {
         eprintln!(
             "Windows owned open rejected unsupported create options {:#x}",
             options.0
@@ -1177,6 +1184,16 @@ mod tests {
     }
     #[test]
     fn preflight_and_filetime_are_checked() {
+        for disposition in 0..=5 {
+            assert!(check_options(CreateOptions((disposition << 24) | 0x21)).is_ok());
+        }
+        assert!(check_options(CreateOptions(6 << 24)).is_err());
+        assert!(
+            check_options(CreateOptions(
+                (1 << 24) | CreateOptions::FILE_OPEN_BY_FILE_ID.0
+            ))
+            .is_err()
+        );
         for name in [
             "CON", "com1.txt", "LPT²", "a:b", "a\\b", "trail.", "trail ", "..", "a\0b",
         ] {

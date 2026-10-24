@@ -57,6 +57,39 @@ pub(crate) struct State {
     pub branches: BTreeMap<String, String>,
     pub workspaces: BTreeMap<String, Workspace>,
     pub trash: BTreeMap<String, TrashItem>,
+    pub operation_receipts: BTreeMap<String, OperationReceipt>,
+    pub receipt_recovery_blocked: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationRequest {
+    pub nonce: String,
+    pub name: String,
+    pub expected_generation: u64,
+    pub candidate_revision: String,
+    pub request_digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum OperationResult {
+    Reserved,
+    Committed {
+        publication_generation: u64,
+        directory: String,
+    },
+    Aborted {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationReceipt {
+    pub request: OperationRequest,
+    pub reservation_generation: u64,
+    pub result: OperationResult,
 }
 
 #[derive(Debug, Serialize)]

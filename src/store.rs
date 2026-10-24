@@ -1,6 +1,7 @@
 //! One atomic state file publishes branch heads and workspace generations together.
 
 mod collection;
+mod receipts;
 mod storage;
 mod writable;
 
@@ -29,7 +30,7 @@ use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 10;
+const STORAGE_SCHEMA: u32 = 11;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 #[derive(Serialize, Deserialize)]
@@ -490,6 +491,8 @@ impl Store {
             branches: BTreeMap::new(),
             workspaces: BTreeMap::new(),
             trash: BTreeMap::new(),
+            operation_receipts: BTreeMap::new(),
+            receipt_recovery_blocked: false,
         };
         write_new(&root.join("state.json"), &serde_json::to_vec(&state)?)?;
         sync_directory(&root)?;
@@ -536,6 +539,7 @@ impl Store {
             require_file(&backup)?;
             let (mut restored, _): (State, _) = metadata::read(&backup)?;
             validate_state(&restored)?;
+            store.merge_recovery_receipts(&mut restored)?;
             let roots = store.protected_roots(&restored)?;
             let reader = packed::Reader::open(&store.objects())?;
             for id in store.ancestors(&roots)? {
@@ -614,6 +618,7 @@ impl Store {
             restored.generation = highest
                 .checked_add(1)
                 .ok_or_else(|| failure("metadata generation exhausted"))?;
+            validate_state(&restored)?;
             let retained = store
                 .root
                 .join("staging")
@@ -1640,7 +1645,7 @@ impl Store {
     pub fn doctor(&self) -> Result<DoctorReport> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let mut errors = Vec::new();
+        let mut errors = self.diagnose_receipt_generations(&state)?;
         let roots = self.protected_roots(&state)?;
         let reachable = match self.ancestors(&roots) {
             Ok(ids) => ids,
@@ -2105,7 +2110,11 @@ impl Store {
             .join("staging")
             .join(format!("state-{}.json", new_id()?));
         write_new(&staged, &serde_json::to_vec(state)?)?;
+        #[cfg(test)]
+        receipts::fail_save(receipts::SaveFault::BeforeRename)?;
         platform::rename(&staged, &self.root.join("state.json"))?;
+        #[cfg(test)]
+        receipts::fail_save(receipts::SaveFault::AfterRename)?;
         // An error after rename has an uncertain publication outcome. Inspect
         // generation/head before retrying; never blindly repeat a mutation.
         sync_directory(&self.root)?;
@@ -2257,6 +2266,12 @@ impl Store {
         states.push(state.clone());
         let mut roots = BTreeSet::new();
         for state in states {
+            roots.extend(
+                state
+                    .operation_receipts
+                    .values()
+                    .map(|receipt| receipt.request.candidate_revision.clone()),
+            );
             roots.extend(state.branches.into_values());
             for workspace in state.workspaces.into_values() {
                 if let WorkspaceBackend::Projection { revision }
@@ -2309,6 +2324,12 @@ impl Store {
         states.push(state.clone());
         let mut directories = BTreeSet::new();
         for state in states {
+            for receipt in state.operation_receipts.values() {
+                if let crate::model::OperationResult::Committed { directory, .. } = &receipt.result
+                {
+                    directories.insert(directory.clone());
+                }
+            }
             directories.extend(
                 state
                     .workspaces
@@ -2384,6 +2405,7 @@ fn validate_state(state: &State) -> Result<()> {
     if state.version != STORAGE_SCHEMA {
         return Err(failure("unsupported store schema; store was not modified"));
     }
+    receipts::validate_receipts(state)?;
     for (name, revision) in &state.branches {
         validate_name(name)?;
         if !valid_hash(revision) {

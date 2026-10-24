@@ -413,8 +413,8 @@ from chunks, so the policy does not apply. Projected creation and projected
 workspace recovery do not use this policy. Managed edits prepare changes with
 automatic clone/copy before publishing the workspace backend.
 `backend` describes capabilities, not proof that a particular pair of paths can
-clone. Source and destination filesystem support still matters. Windows supports
-ordinary copying only: `auto` and `copy` work; strict `clone` fails.
+clone. Source and destination filesystem support still matters. Windows uses same-volume ReFS block cloning when supported and ordinary copying
+on NTFS; strict `clone` rejects files that cannot be cloned.
 
 ### Reading and inspecting history
 
@@ -610,7 +610,7 @@ A cold `branch NAME REVISION` is only a CAS ref. Use `--writable checkout BRANCH
 for a portable unmounted logical workspace with no full payload materialization;
 ordinary tools require a supported mounted backend or native checkout.
 Native materialization can retain verified whole files in `file-cache` only when
-an actual APFS/Linux clone succeeds. Later checkouts verify every chunk of the
+an actual APFS, Linux or ReFS clone succeeds. Later checkouts verify every chunk of the
 cached file, then clone into a separate inode. This reduces writes, not full-file
 verification, and is not constant-time checkout. Copy-only filesystems do not
 retain extra whole files. Cache failures fall back to CAS before target creation;
@@ -730,11 +730,16 @@ ReFS hardlink support depends on the volume format (3.5 or later); `backend`
 reports the actual `hardlink_support` volume flag. A volume without this capability
 cannot materialize linked aliases; it fails instead of splitting the link group.
 
-Windows CI enumerates existing volumes without creating or formatting disks.
+Ordinary Windows CI enumerates existing volumes without creating or formatting disks.
 If a healthy drive-letter ReFS volume exists, `SPRIG_REFS_TEST_ROOT` selects it
 for strict clone, non-aligned EOF, identity, checkpoint, restore and write-isolation
 tests. An absent ReFS volume is reported as missing runtime coverage, not proof
 that block cloning works. NTFS tests run independently on every Windows job.
+An explicitly opted-in [runtime validation](https://github.com/M4n5ter/sprig/actions/runs/40057192603)
+passed on Windows Server 2025 with a disposable 4 GiB ReFS VHDX and 4 KiB clusters,
+including strict block cloning, non-aligned tails, cross-volume fallback and
+workspace isolation. The image was normally detached. Synthetic-volume creation
+is disabled by default and requires the `refs_volume` workflow input.
 
 Windows limitations are explicit rather than silent conversions:
 

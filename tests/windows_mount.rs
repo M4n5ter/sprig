@@ -35,9 +35,15 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
         assert_eq!(fs::read(view.path.join("original.txt"))?, b"original");
         completed.push("read_original");
         let new = view.path.join("created.txt");
-        fs::write(&new, b"abcdefgh")?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&new)?;
+        file.write_all(b"abcdefgh")?;
         completed.push("created_regular_file");
-        let mut file = OpenOptions::new().read(true).write(true).open(&new)?;
+        assert_current_user_owner(&file)?;
+        completed.push("created_owner_is_current_user");
         file.set_len(3)?;
         file.set_len(8)?;
         file.seek(SeekFrom::Start(0))?;
@@ -199,6 +205,99 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
         )?,
     )?;
     result
+}
+/// Query the actual open WinFsp handle, not adapter-local metadata. This catches
+/// a kernel-side cached default owner differing from the fixed current-user view.
+fn assert_current_user_owner(file: &fs::File) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle as CloseToken, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: this guard exclusively owns a successful token handle.
+            unsafe {
+                CloseToken(self.0);
+            }
+        }
+    }
+    struct Descriptor(*mut c_void);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocates this descriptor with LocalAlloc;
+            // borrowed owner SID pointers are not freed independently.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    let mut token = 0;
+    // SAFETY: valid pseudo-process handle and writable token output storage.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = Token(token);
+    let mut needed = 0;
+    // SAFETY: the zero-length query requests only the required buffer length.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // usize alignment covers TOKEN_USER and the embedded SID returned by Win32.
+    let mut storage = vec![0_usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: buffer is aligned and has at least the requested capacity.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptor = std::ptr::null_mut();
+    let mut owner = std::ptr::null_mut();
+    // SAFETY: file remains open throughout the query and comparison. Win32 owns
+    // allocation of the returned descriptor; owner borrows from that allocation.
+    let error = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error as i32));
+    }
+    let _descriptor = Descriptor(descriptor);
+    if owner.is_null() {
+        return Err(std::io::Error::other("created file returned no owner SID"));
+    }
+    // SAFETY: successful TokenUser query initialized the aligned TOKEN_USER;
+    // both SID pointers remain live until after EqualSid returns.
+    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    assert!(
+        !user.User.Sid.is_null(),
+        "process token returned no user SID"
+    );
+    let same = unsafe { EqualSid(owner, user.User.Sid) } != 0;
+    assert!(same, "created file owner is not the process TokenUser");
+    Ok(())
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {

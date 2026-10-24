@@ -360,13 +360,19 @@ impl WindowsCas {
             &self.0.file_security
         }
     }
-    fn same_security(&self, proposed: &SecurityDescriptor, directory: bool) -> Result<bool> {
+    fn same_security(
+        &self,
+        proposed: &SecurityDescriptor,
+        directory: bool,
+        original_creator_descriptor_absent: bool,
+    ) -> Result<bool> {
         let fixed = self.security(directory).as_bytes();
         match &self.0.default_creation_owner {
             Some(default_owner) => equivalent_creation_security(
                 fixed,
                 proposed.as_bytes(),
                 Some(default_owner.as_bytes()),
+                original_creator_descriptor_absent,
             ),
             None => equivalent_security(fixed, proposed.as_bytes()),
         }
@@ -666,12 +672,13 @@ fn report_acl_mismatch(label: &str, fixed: &CheckedAcl, request: &CheckedAcl) {
     }
 }
 fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
-    equivalent_creation_security(left, right, None)
+    equivalent_creation_security(left, right, None, false)
 }
 fn equivalent_creation_security(
     left: &[u8],
     right: &[u8],
     default_owner: Option<&[u8]>,
+    original_creator_descriptor_absent: bool,
 ) -> Result<bool> {
     use windows_sys::Win32::Security::{
         EqualSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
@@ -754,12 +761,13 @@ fn equivalent_creation_security(
         // SAFETY: non-null SIDs belong to the validated, still-live descriptors.
         } else if unsafe { EqualSid(a, b) } == 0 {
             // Creation-only immutable-policy normalization, not caller identity
-            // authentication: accept only the captured token-default owner with
-            // explicit default-mechanism provenance. The descriptor we expose
+            // authentication: accept only the captured token-default owner when
+            // the ORIGINAL runtime request omitted its descriptor. A caller-set
+            // SE_OWNER_DEFAULTED bit is not trusted evidence. The SD we expose
             // remains fixed to TokenUser; this SID never gains an ACE/ownership.
             // A changed client/impersonation default owner still fails closed.
             if owner
-                && right.control & 0x0001 != 0
+                && original_creator_descriptor_absent
                 && let Some(default_owner) = &default_owner
             {
                 let mut captured = std::ptr::null_mut();
@@ -780,8 +788,9 @@ fn equivalent_creation_security(
                 }
             }
             eprintln!(
-                "Windows owned security mismatch: {} SID differs; request_owner_defaulted={}",
+                "Windows owned security mismatch: {} SID differs; original_descriptor_absent={}; request_owner_defaulted={}",
                 if owner { "owner" } else { "group" },
+                original_creator_descriptor_absent,
                 right.control & 0x0001 != 0
             );
             return Ok(false);
@@ -853,7 +862,12 @@ impl FileSystemInterface for WindowsCas {
             eprintln!("Windows owned create rejected reparse or extra metadata");
             return Err(STATUS_NOT_SUPPORTED);
         }
-        if !self.same_security(&security, directory)? {
+        // SAFETY: WinFsp invokes this method synchronously on its dispatch
+        // thread. Direct callback unit tests must exercise the pure comparator,
+        // not this runtime context query. Unknown context never grants fallback.
+        let original_descriptor_absent =
+            unsafe { winfsp_wrs::current_create_uses_default_security() }.unwrap_or(false);
+        if !self.same_security(&security, directory, original_descriptor_absent)? {
             eprintln!("Windows owned create rejected a different fixed security policy");
             return Err(STATUS_NOT_SUPPORTED);
         }
@@ -1441,38 +1455,38 @@ mod tests {
         let (root, adapter) = fixture();
         assert!(
             adapter
-                .same_security(&adapter.0.file_security, false)
+                .same_security(&adapter.0.file_security, false, false)
                 .unwrap()
         );
         let other = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;WD)")).unwrap();
-        assert!(!adapter.same_security(&other, false).unwrap());
+        assert!(!adapter.same_security(&other, false, false).unwrap());
         let less = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FR;;;SY)")).unwrap();
-        assert!(!adapter.same_security(&less, false).unwrap());
+        assert!(!adapter.same_security(&less, false, false).unwrap());
         let owner = SecurityDescriptor::from_wstr(u16cstr!("O:BAG:SYD:P(A;;FA;;;SY)")).unwrap();
-        assert!(!adapter.same_security(&owner, false).unwrap());
+        assert!(!adapter.same_security(&owner, false, false).unwrap());
         let inheritance =
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;OICI;FA;;;SY)")).unwrap();
-        assert!(!adapter.same_security(&inheritance, false).unwrap());
+        assert!(!adapter.same_security(&inheritance, false, false).unwrap());
         let unprotected =
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:(A;;FA;;;SY)")).unwrap();
-        assert!(adapter.same_security(&unprotected, false).unwrap());
+        assert!(adapter.same_security(&unprotected, false, false).unwrap());
         let extra =
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")).unwrap();
-        assert!(!adapter.same_security(&extra, false).unwrap());
+        assert!(!adapter.same_security(&extra, false, false).unwrap());
         let inherit_only =
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;OIIO;FA;;;SY)")).unwrap();
-        assert!(!adapter.same_security(&inherit_only, false).unwrap());
+        assert!(!adapter.same_security(&inherit_only, false, false).unwrap());
         assert!(
             adapter
-                .same_security(&adapter.0.directory_security, true)
+                .same_security(&adapter.0.directory_security, true, false)
                 .unwrap()
         );
         let group = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:BAD:P(A;;FA;;;SY)")).unwrap();
-        assert!(!adapter.same_security(&group, false).unwrap());
+        assert!(!adapter.same_security(&group, false, false).unwrap());
         let audit =
             SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;SY)S:(AU;SA;FA;;;SY)"))
                 .unwrap();
-        assert!(!adapter.same_security(&audit, false).unwrap());
+        assert!(!adapter.same_security(&audit, false, false).unwrap());
         // A different token-default owner is only a creation input alias.
         // Never expose it as owner or change any DACL/group/SACL requirement.
         let canonical_adapter = WindowsCas::new(
@@ -1484,22 +1498,34 @@ mod tests {
         .unwrap();
         let fixed = adapter.0.file_security.as_bytes();
         let alternate = owner.as_bytes();
-        assert!(!equivalent_creation_security(fixed, alternate, Some(alternate)).unwrap());
+        assert!(!equivalent_creation_security(fixed, alternate, Some(alternate), false).unwrap());
         let mut defaulted_alternate = alternate.to_vec();
         defaulted_alternate[2] |= 0x01;
+        // Spoofing the derived descriptor flag cannot override an explicit
+        // creator descriptor. Conversely, real absence needs no DEFAULTED bit.
         assert!(
-            equivalent_creation_security(fixed, &defaulted_alternate, Some(alternate)).unwrap()
+            !equivalent_creation_security(fixed, &defaulted_alternate, Some(alternate), false)
+                .unwrap()
+        );
+        assert!(equivalent_creation_security(fixed, alternate, Some(alternate), true).unwrap());
+        assert!(
+            equivalent_creation_security(fixed, &defaulted_alternate, Some(alternate), true)
+                .unwrap()
         );
         let unknown_owner =
             SecurityDescriptor::from_wstr(u16cstr!("O:WDG:SYD:P(A;;FA;;;SY)")).unwrap();
         let mut unknown_owner = unknown_owner.as_bytes().to_vec();
         unknown_owner[2] |= 0x01;
-        assert!(!equivalent_creation_security(fixed, &unknown_owner, Some(alternate)).unwrap());
+        assert!(
+            !equivalent_creation_security(fixed, &unknown_owner, Some(alternate), true).unwrap()
+        );
         let changed_dacl =
             SecurityDescriptor::from_wstr(u16cstr!("O:BAG:SYD:P(A;;FR;;;SY)")).unwrap();
         let mut changed_dacl = changed_dacl.as_bytes().to_vec();
         changed_dacl[2] |= 0x01;
-        assert!(!equivalent_creation_security(fixed, &changed_dacl, Some(alternate)).unwrap());
+        assert!(
+            !equivalent_creation_security(fixed, &changed_dacl, Some(alternate), true).unwrap()
+        );
         adapter
             .0
             .core

@@ -915,10 +915,10 @@ The mounted view accepts regular files and directories with Windows-representabl
 names and timestamps. It rejects hardlink aliases, symlinks, named streams,
 custom ACL changes and unsupported metadata instead of silently converting them.
 Creation canonicalizes inherited ACL provenance only when the effective fixed
-account, rights and inheritance policy are unchanged. A creation request marked
-with the mount token's default owner is normalized to the fixed current-user
-owner when every other security component matches; it never grants that default
-owner additional access. Other ownership requests are rejected.
+account, rights and inheritance policy are unchanged. When the original create request supplies no security descriptor, Windows'
+resolved mount-token default owner is normalized to the fixed current-user owner
+only if every other security component matches. This never grants that default
+owner additional access; explicitly requested different ownership is rejected.
 The native and unmounted SDK backends retain their hardlink support. This is not
 full NTFS or Linux filesystem parity. The mounted security descriptor is fixed
 for the current account; keep the backing Store private to that account.
@@ -937,7 +937,7 @@ component and mounted lifecycle tests. Default CI does not install it.
 WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 ([upstream](https://github.com/winfsp/winfsp)). WinFsp retains its own
 [license and FLOSS exception](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/License.txt).
-The optional `winfsp_wrs` binding is MIT-licensed and is vendored with a small
-read-only descriptor accessor; its license and patch provenance are preserved
+The optional `winfsp_wrs` binding is MIT-licensed and is vendored with small
+read-only descriptor and callback-context accessors; its license and patch provenance are preserved
 in `vendor/winfsp_wrs`. Sprig's MIT license does not
 relicense the runtime or replace its terms.

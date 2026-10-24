@@ -257,7 +257,10 @@ pub(crate) fn start(
     let attempt = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    let log = private_new(&generation.join(format!("writable-windows-{attempt}.log")))?;
+    let log = private_new_with_share(
+        &generation.join(format!("writable-windows-{attempt}.log")),
+        1,
+    )?;
     let mut command = Command::new(executable);
     command
         .current_dir(store_root)
@@ -468,6 +471,12 @@ pub(crate) fn stop(generation: &Path) -> Result<()> {
                 Ok(lease) => {
                     fs::remove_file(generation.join(READY))?;
                     platform::sync_directory(generation)?;
+                    // Restore only the now-absent, exactly owned mount target.
+                    // This is an empty placeholder, never a journal data tree.
+                    if absent(&target)? {
+                        platform::create_dir(&target, 0o700)?;
+                        platform::sync_directory(generation)?;
+                    }
                     session::finish_stop(generation, &record)?;
                     drop(lease);
                     return Ok(());
@@ -585,6 +594,9 @@ struct SecurityAttributes {
     inherit: i32,
 }
 fn private_new(path: &Path) -> io::Result<File> {
+    private_new_with_share(path, 0)
+}
+fn private_new_with_share(path: &Path, share: u32) -> io::Result<File> {
     // The parent is validated before creation; a protected DACL prevents
     // inherited world/group write access to lifecycle control and log files.
     checked_directory(
@@ -614,7 +626,7 @@ fn private_new(path: &Path) -> io::Result<File> {
         CreateFileW(
             name.as_ptr(),
             0xc0000000,
-            0,
+            share,
             &attributes,
             1,
             0x00200000,

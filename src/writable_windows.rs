@@ -712,7 +712,12 @@ impl FileSystemInterface for WindowsCas {
         let directory = request
             .create_options
             .is(CreateOptions::FILE_DIRECTORY_FILE);
-        if reparse || !buffer.is_empty() || !self.same_security(&security, directory)? {
+        if reparse || !buffer.is_empty() {
+            eprintln!("Windows owned create rejected reparse or extra metadata");
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        if !self.same_security(&security, directory)? {
+            eprintln!("Windows owned create rejected a different fixed security policy");
             return Err(STATUS_NOT_SUPPORTED);
         }
         if !self.state()?.accepting {

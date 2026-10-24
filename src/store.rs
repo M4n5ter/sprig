@@ -548,7 +548,6 @@ impl Store {
             let protected_directories = store.protected_directories(&restored)?;
             for directory in &protected_directories {
                 require_directory(&store.root.join("native").join(directory))?;
-                require_directory(&store.tree(directory))?;
             }
             // Active command leases must not be detached by metadata recovery.
             let mut held_leases = Vec::new();
@@ -603,6 +602,11 @@ impl Store {
                         store.stop_projection(workspace)?;
                     }
                 }
+            }
+            // Stop validated mounted generations first, then require ordinary
+            // empty placeholders/native trees before changing authoritative state.
+            for directory in &protected_directories {
+                require_directory(&store.tree(directory))?;
             }
             let highest = store
                 .historical_states()?
@@ -1677,7 +1681,7 @@ impl Store {
             Err(error) => errors.push(format!("object index: {error}")),
         }
         for (name, workspace) in &state.workspaces {
-            if let Err(error) = require_directory(&self.tree(&workspace.directory)) {
+            if let Err(error) = self.require_workspace_tree(workspace) {
                 errors.push(format!("workspace {name}: {error}"));
             }
             if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
@@ -2057,10 +2061,35 @@ impl Store {
         Ok(file)
     }
 
-    fn lease(&self, workspace: &Workspace) -> Result<File> {
+    /// Only a session-bound owned Windows junction can replace a real tree.
+    /// All native paths and unverified reparse points retain strict rejection.
+    fn require_workspace_tree(&self, workspace: &Workspace) -> Result<()> {
         let directory = self.root.join("native").join(&workspace.directory);
         require_directory(&directory)?;
-        require_directory(&directory.join("tree"))?;
+        #[cfg(all(windows, feature = "windows-mount"))]
+        let attested_mount = if let WorkspaceBackend::Writable { revision } = &workspace.backend {
+            if crate::writable_windows_lifecycle::inspect(&directory)?
+                == crate::writable_windows_lifecycle::MountState::Mounted
+            {
+                crate::writable_windows_lifecycle::verify_binding(&directory, revision)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        #[cfg(not(all(windows, feature = "windows-mount")))]
+        let attested_mount = false;
+        if !attested_mount {
+            require_directory(&directory.join("tree"))?;
+        }
+        Ok(())
+    }
+
+    fn lease(&self, workspace: &Workspace) -> Result<File> {
+        let directory = self.root.join("native").join(&workspace.directory);
+        self.require_workspace_tree(workspace)?;
         let path = directory.join("lease");
         let file = platform::open_lease(&path)
             .map_err(|error| failure(&format!("workspace_busy: {error}")))?;
@@ -2097,7 +2126,7 @@ impl Store {
             .ok_or_else(|| failure("metadata generation exhausted"))?;
         validate_state(state)?;
         for workspace in state.workspaces.values() {
-            require_directory(&self.tree(&workspace.directory))?;
+            self.require_workspace_tree(workspace)?;
             sync_directory(&self.root.join("native").join(&workspace.directory))?;
         }
         let staged = self

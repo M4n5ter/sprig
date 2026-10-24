@@ -31,9 +31,12 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
     let mut completed = Vec::<&str>::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let view = store.mount_workspace("main")?;
+        completed.push("mounted");
         assert_eq!(fs::read(view.path.join("original.txt"))?, b"original");
+        completed.push("read_original");
         let new = view.path.join("created.txt");
         fs::write(&new, b"abcdefgh")?;
+        completed.push("created_regular_file");
         let mut file = OpenOptions::new().read(true).write(true).open(&new)?;
         file.set_len(3)?;
         file.set_len(8)?;
@@ -186,6 +189,9 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
             )
         })
         .collect();
+    eprintln!(
+        "Windows mounted checks completed: {completed:?}; result: {result:?}; cleanup: {cleanup:?}"
+    );
     fs::write(
         parent.join("mount-result.json"),
         serde_json::to_vec_pretty(

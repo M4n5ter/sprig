@@ -115,6 +115,22 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
         drop(directory);
         completed.push("share_modes_rename_open_delete_open_directory_busy");
 
+        // Establish the ordinary closed-handle lifecycle independently of mmap.
+        let plain = store.checkpoint("main", "plain Windows changes", None)?;
+        store.restore_writable(&plain.revision, "plain-restored")?;
+        let plain_restored = store.mount_workspace("plain-restored")?;
+        assert_eq!(
+            fs::read(plain_restored.path.join("renamed.txt"))?,
+            b"Abc\0\0\0\0Z"
+        );
+        fs::write(plain_restored.path.join("original.txt"), b"plain-isolated")?;
+        let view = store.mount_workspace("main")?;
+        assert_eq!(fs::read(view.path.join("original.txt"))?, b"original");
+        store.unmount_workspace("plain-restored")?;
+        completed.push("plain_checkpoint_restore_isolation_unmount");
+        check_deleted_mapping_lifetime(&store, &view.path)?;
+        completed.push("deleted_mapping_survives_final_handle_close");
+
         let mapped = OpenOptions::new()
             .read(true)
             .write(true)
@@ -183,7 +199,7 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
     });
     // Retain all evidence. Normal unmount only; a busy/unknown mount is never
     // removed or recursively deleted by fixture cleanup.
-    let cleanup: Vec<_> = ["restored", "main"]
+    let cleanup: Vec<_> = ["restored", "plain-restored", "main"]
         .iter()
         .map(|name| {
             (
@@ -299,6 +315,115 @@ fn assert_current_user_owner(file: &fs::File) -> std::io::Result<()> {
     assert!(same, "created file owner is not the process TokenUser");
     Ok(())
 }
+/// A deleted inode must remain usable through its last mapped section, without
+/// becoming visible again or allowing a clean checkpoint before final release.
+fn check_deleted_mapping_lifetime(store: &Store, mounted_root: &std::path::Path) -> Result<()> {
+    struct Mapping(*mut c_void);
+    impl Mapping {
+        fn close(&mut self) -> std::io::Result<()> {
+            if !self.0.is_null() {
+                // SAFETY: this guard exclusively owns a valid mapping handle.
+                if unsafe { CloseHandle(self.0) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                self.0 = std::ptr::null_mut();
+            }
+            Ok(())
+        }
+    }
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            let _ = self.close();
+        }
+    }
+    struct View(*mut c_void);
+    impl View {
+        fn unmap(&mut self) -> std::io::Result<()> {
+            if !self.0.is_null() {
+                // SAFETY: this guard exclusively owns this mapped view.
+                if unsafe { UnmapViewOfFile(self.0) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                self.0 = std::ptr::null_mut();
+            }
+            Ok(())
+        }
+    }
+    impl Drop for View {
+        fn drop(&mut self) {
+            let _ = self.unmap();
+        }
+    }
+    fn assert_absent(path: &std::path::Path) -> std::io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(std::io::Error::other(
+                "deleted mapped file reappeared in the namespace",
+            )),
+        }
+    }
+
+    let path = mounted_root.join("deleted-mapped.bin");
+    let original = vec![0x4d_u8; 4096];
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all(&original)?;
+    file.sync_all()?;
+    // SAFETY: the synthetic file has exactly 4096 initialized bytes. Mapping
+    // and view guards remain live for every pointer access and unwind safely.
+    let raw_mapping = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle(),
+            std::ptr::null(),
+            4,
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if raw_mapping.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut mapping = Mapping(raw_mapping);
+    // SAFETY: mapping is live and requests the initialized file extent only.
+    let raw_view = unsafe { MapViewOfFile(mapping.0, 6, 0, 0, 4096) };
+    if raw_view.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // Declared after mapping so unwinding unmaps the view before closing it.
+    let mut view = View(raw_view);
+    fs::remove_file(&path)?;
+    drop(file);
+    assert_absent(&path)?;
+    // SAFETY: deletion and closing the file handle do not invalidate a live
+    // mapping; this assertion is the specific Windows lifetime contract tested.
+    let mapped_bytes = unsafe { std::slice::from_raw_parts(view.0.cast::<u8>(), 4096) };
+    assert_eq!(mapped_bytes, original.as_slice());
+    // SAFETY: offset 17 lies inside the live writable view. The preceding shared
+    // slice is no longer used, so no Rust reference overlaps this mutation.
+    unsafe { view.0.cast::<u8>().add(17).write(0x5a) };
+    // SAFETY: the same live view covers the full requested flush extent.
+    if unsafe { FlushViewOfFile(view.0, 4096) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: read back within the still-live view after the mapped write.
+    assert_eq!(unsafe { view.0.cast::<u8>().add(17).read() }, 0x5a);
+    assert!(
+        store
+            .checkpoint("main", "deleted mapped section remains busy", None)
+            .is_err(),
+        "checkpoint must reject a deleted inode with a live mapped section"
+    );
+    view.unmap()?;
+    mapping.close()?;
+    assert_absent(&path)?;
+    Ok(())
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateFileMappingW(

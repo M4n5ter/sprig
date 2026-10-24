@@ -371,7 +371,9 @@ pub(crate) fn serve(
         .set_named_streams(false)
         .set_extended_attributes(false)
         .set_volume_serial_number(serial(&record))
-        .set_flush_and_purge_on_cleanup(true);
+        // Preserve deleted-but-still-mapped data. Cleanup is not final Close;
+        // WinFsp documents that forcing purge here can discard such cached data.
+        .set_flush_and_purge_on_cleanup(false);
     let fs_name = U16CString::from_str("SprigCAS").map_err(io::Error::other)?;
     if params.volume_params.set_file_system_name(&fs_name).is_err() {
         return Err(invalid("invalid WinFsp filesystem name").into());

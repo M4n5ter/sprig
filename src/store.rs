@@ -30,7 +30,7 @@ use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 11;
+const STORAGE_SCHEMA: u32 = 12;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 #[derive(Serialize, Deserialize)]
@@ -486,6 +486,11 @@ impl Store {
         sync_directory(&root.join("objects"))?;
         write_new(&root.join("lock"), b"")?;
         let state = State {
+            store_id: blake3::hash(
+                format!("sprig-store-identity-v1:{root:?}:{}", new_id()?).as_bytes(),
+            )
+            .to_hex()
+            .to_string(),
             version: STORAGE_SCHEMA,
             generation: 0,
             branches: BTreeMap::new(),
@@ -2086,7 +2091,7 @@ impl Store {
 
     fn save(&self, state: &mut State) -> Result<()> {
         let current = self.state()?;
-        if current.generation != state.generation {
+        if current.generation != state.generation || current.store_id != state.store_id {
             return Err(failure(
                 "metadata generation changed; transaction not published",
             ));
@@ -2265,11 +2270,16 @@ impl Store {
         let mut states = self.historical_states()?;
         states.push(state.clone());
         let mut roots = BTreeSet::new();
+        let store_id = &state.store_id;
         for state in states {
+            if &state.store_id != store_id {
+                return Err(failure("backup Store identity mismatch"));
+            }
             roots.extend(
                 state
                     .operation_receipts
                     .values()
+                    .filter(|receipt| !matches!(&receipt.result, crate::model::OperationResult::Aborted { reason } if reason == "cancelled_before_reservation"))
                     .map(|receipt| receipt.request.candidate_revision.clone()),
             );
             roots.extend(state.branches.into_values());
@@ -2404,6 +2414,9 @@ fn valid_hash(value: &str) -> bool {
 fn validate_state(state: &State) -> Result<()> {
     if state.version != STORAGE_SCHEMA {
         return Err(failure("unsupported store schema; store was not modified"));
+    }
+    if !valid_hash(&state.store_id) {
+        return Err(failure("invalid Store identity"));
     }
     receipts::validate_receipts(state)?;
     for (name, revision) in &state.branches {

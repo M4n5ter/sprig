@@ -52,6 +52,7 @@ pub struct TrashItem {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct State {
+    pub store_id: String,
     pub version: u32,
     pub generation: u64,
     pub branches: BTreeMap<String, String>,
@@ -64,6 +65,7 @@ pub(crate) struct State {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperationRequest {
+    pub store_id: String,
     pub nonce: String,
     pub name: String,
     pub expected_generation: u64,

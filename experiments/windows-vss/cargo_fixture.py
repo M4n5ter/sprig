@@ -17,9 +17,11 @@ Windows / Python 3.9+ / an already installed Cargo and Rust toolchain:
            --work-root NEW_OUTSIDE_DIR
   selftest   # Tiny ordinary local files only; no Cargo, Sprig or VSS execution.
 
-Only the controlled import inherits the explicitly supplied directory HANDLE.
+Only candidate preparation inherits the explicitly supplied directory HANDLE.
 The snapshot pathname is a binding assertion and independent read-only oracle,
 not a substitute for that capability. There is no staged source copy.
+The complete request is persisted before commit. A deliberately discarded
+successful commit response is recovered by querying and replaying that request.
 Timed-out or undrained children are neither killed nor retried; retain state.
 """
 
@@ -568,7 +570,8 @@ def report_base(stage, live, work, commands):
             "work_root": str(work), "commands": commands.commands,
             "limits": {"source_and_target_bytes": MAX_TREE_BYTES, "file_bytes": MAX_FILE_BYTES,
                        "entries": MAX_ENTRIES, "log_bytes_per_stream": MAX_LOG_BYTES,
-                       "report_bytes": MIB, "cargo_home_bytes": MAX_CARGO_HOME_BYTES},
+                       "report_bytes": MIB, "cargo_home_bytes": MAX_CARGO_HOME_BYTES,
+                       "commands": MAX_COMMANDS},
             "limitations": ["Settled Cargo workload, not concurrent application atomicity.",
                 "No ACL, owner, creation-time or access-time equivalence claim.",
                 "Supported Windows mode, mtime, every byte and hardlink topology are checked.",
@@ -665,6 +668,148 @@ def sprig_result(commands, binary, store, *args, inherited_handle=None):
     result = envelope["result"]
     require(not isinstance(result, dict) or not result.get("mount_error"), "Partial Sprig mount outcome")
     return result
+
+
+def operation_request(value, name, nonce):
+    require(isinstance(value, dict) and set(value) ==
+            {"store_id", "nonce", "name", "expected_generation", "candidate_revision", "request_digest"},
+            "Unexpected snapshot operation request fields")
+    require(value["name"] == name and value["nonce"] == nonce,
+            "Prepared operation differs from the requested name/nonce")
+    require(all(isinstance(value[key], str) and re.fullmatch(r"[0-9a-f]{64}", value[key])
+                for key in ("store_id", "nonce", "candidate_revision", "request_digest")),
+            "Invalid snapshot operation hash identity")
+    require(type(value["expected_generation"]) is int
+            and 0 <= value["expected_generation"] < (1 << 64) - 1,
+            "Invalid expected snapshot metadata generation")
+    return value
+
+
+def committed_receipt(value, request):
+    """Validate a historical publication fact, never a current usable path."""
+    require(isinstance(value, dict) and set(value) ==
+            {"request", "reservation_generation", "result"},
+            "Unexpected snapshot operation receipt fields")
+    operation_request(value["request"], request["name"], request["nonce"])
+    require(value["request"] == request,
+            "Recovered snapshot receipt binds a different complete request")
+    require(type(value["reservation_generation"]) is int
+            and value["reservation_generation"] == request["expected_generation"] + 1,
+            "Invalid snapshot receipt reservation generation")
+    result = value["result"]
+    require(isinstance(result, dict) and set(result) ==
+            {"status", "publication_generation", "directory"}
+            and result["status"] == "committed",
+            "Snapshot receipt does not establish a committed publication")
+    require(type(result["publication_generation"]) is int
+            and value["reservation_generation"] < result["publication_generation"] < (1 << 64)
+            and plain_component(result["directory"]),
+            "Invalid snapshot receipt publication generation/directory identity")
+    return value
+
+
+def operation_status(value, request, receipt=None):
+    require(isinstance(value, dict) and isinstance(value.get("listing"), dict)
+            and type(value.get("generation")) is int,
+            "Missing snapshot operation state evidence")
+    listing = value["listing"]
+    require(isinstance(listing.get("branches"), dict) and isinstance(listing.get("workspaces"), dict)
+            and listing.get("trash") == []
+            and value.get("stale_workspaces") == [] and value.get("active_leases") == [],
+            "Unexpected entries or leases in the isolated snapshot store")
+    if receipt is None:
+        require(value["generation"] == request["expected_generation"]
+                and listing["branches"] == {} and listing["workspaces"] == {},
+                "Candidate preparation published a branch/workspace or changed the expected generation")
+    else:
+        name, revision = request["name"], request["candidate_revision"]
+        require(value["generation"] == receipt["result"]["publication_generation"]
+                and listing["branches"] == {name: revision}
+                and set(listing["workspaces"]) == {name},
+                "Committed operation did not publish exactly one expected branch/workspace")
+        workspace = listing["workspaces"][name]
+        require(isinstance(workspace, dict) and isinstance(workspace.get("backend"), dict)
+                and workspace["backend"].get("kind") == "writable"
+                and workspace.get("mount_state") == "unmounted"
+                and workspace.get("name") == workspace.get("branch") == name
+                and workspace.get("base_revision") == revision and not workspace.get("mount_error")
+                and workspace.get("pending_conflicts") == [],
+                "Committed publication is not the expected unmounted writable CAS workspace")
+    return value
+
+
+def publish_with_receipt_recovery(commands, binary, store, request_path, request, report, diagnostic):
+    """Simulate only response loss after clean child exit, not an unknown child.
+
+    Retain raw bounded logs and exit evidence, but do not assign, compare or use
+    the first decoded commit response. Query/replay use only the persisted full
+    request and never inherit the snapshot capability or reopen its source.
+    A timeout, undrained stream or other failure propagates without any retry.
+    """
+    persisted = bounded_json(request_path)
+    operation_request(persisted, request["name"], request["nonce"])
+    require(persisted == request, "Persisted snapshot operation request differs")
+    request_json = json.dumps(persisted, sort_keys=True, separators=(",", ":"))
+    require(len(request_json.encode("utf-8")) <= 4096,
+            "Snapshot request exceeds the inline CLI JSON limit")
+    diagnostic["call"] = "verify_candidate_not_published"
+    report["snapshot_operation_status_after_prepare"] = operation_status(
+        sprig_result(commands, binary, store, "status"), request)
+    report["snapshot_prepare_unpublished_verified"] = True
+    diagnostic["call"] = "snapshot_commit_experiment_discard_response"
+    # Keep publication outcome distinct from fixture verification/cleanup status.
+    # Failure after starting this child is unknown until a receipt proves otherwise.
+    report["snapshot_operation_outcome"] = "unknown"
+    started = time.monotonic()
+    sprig_result(commands, binary, store, "snapshot-commit-experiment", request_json)
+    report["snapshot_commit_seconds"] = time.monotonic() - started
+    report["snapshot_commit_response_discarded"] = True
+    report["snapshot_commit_response_loss_mode"] = "deliberate decoded-response discard after successful exited/drained child; raw bounded logs retained"
+    diagnostic["call"] = "snapshot_query_experiment_recover_receipt"
+    started = time.monotonic()
+    recovered = committed_receipt(sprig_result(commands, binary, store,
+                                  "snapshot-query-experiment", request_json), request)
+    report["snapshot_query_seconds"] = time.monotonic() - started
+    report["snapshot_receipt_recovered"] = recovered
+    report["snapshot_operation_outcome"] = "committed"
+    diagnostic["call"] = "verify_recovered_publication"
+    published = operation_status(sprig_result(commands, binary, store, "status"), request, recovered)
+    report["snapshot_operation_status_after_query"] = published
+    report["snapshot_receipt_recovery_verified"] = True
+    diagnostic["call"] = "snapshot_commit_experiment_exact_replay"
+    started = time.monotonic()
+    replayed = committed_receipt(sprig_result(commands, binary, store,
+                                 "snapshot-commit-experiment", request_json), request)
+    report["snapshot_replay_seconds"] = time.monotonic() - started
+    report["snapshot_receipt_replayed"] = replayed
+    require(replayed == recovered, "Exact commit replay did not return the same receipt")
+    diagnostic["call"] = "verify_exact_replay_did_not_publish_again"
+    replay_status = operation_status(sprig_result(commands, binary, store, "status"), request, replayed)
+    report["snapshot_operation_status_after_replay"] = replay_status
+    require(replay_status == published, "Exact commit replay changed metadata generation or listing")
+    report["snapshot_replay_no_duplicate_verified"] = True
+    return recovered
+
+
+def verify_post_cleanup_receipt(commands, binary, store, captured, report):
+    """The runner enters finalize only after confirmed requester/VSS cleanup.
+
+    A receipt cannot prove that cleanup happened. This checks that querying its
+    historical fact needs neither the source snapshot nor its inherited handle.
+    """
+    request = captured["snapshot_operation_request"]
+    operation_request(request, captured["import_name"], request["nonce"])
+    expected = committed_receipt(captured["snapshot_receipt_recovered"], request)
+    request_json = json.dumps(request, sort_keys=True, separators=(",", ":"))
+    require(len(request_json.encode("utf-8")) <= 4096,
+            "Snapshot request exceeds the inline CLI JSON limit")
+    started = time.monotonic()
+    recovered = committed_receipt(sprig_result(commands, binary, store,
+                                  "snapshot-query-experiment", request_json), request)
+    report.update(post_cleanup_receipt=recovered, snapshot_operation_outcome="committed",
+                  post_cleanup_query_seconds=time.monotonic() - started)
+    require(recovered == expected, "Post-cleanup query changed the historical committed receipt")
+    report["post_cleanup_receipt_verified"] = True
 
 
 def bind_snapshot_handle(handle, expected_root, expected_serial, diagnostic=None):
@@ -770,7 +915,7 @@ def capture(args):
                       prepare_report=str(base.ordinary_path(args.prepare_report)),
                       snapshot_root=args.snapshot_root, snapshot_fixture=str(snapshot),
                       cas_import_mode="inherited_snapshot_tree_capability", staging_mode="none",
-                      capability_forwarding="STARTUPINFO handle_list contains exactly the requester root handle",
+                      capability_forwarding="Only candidate preparation receives STARTUPINFO handle_list with exactly the requester root handle; commit/query/replay inherit none",
                       serial=args.serial.upper(), marker_token=args.marker_token)
         diagnostic.update(phase="capability_binding", call="bind_snapshot_handle")
         capability = bind_snapshot_handle(handle, snapshot, args.serial, diagnostic)
@@ -794,7 +939,7 @@ def capture(args):
         outside(live, store)
         require(work != store and work not in store.parents and store not in work.parents,
                 "Capture store and work roots overlap")
-        report["store"] = str(store)
+        report.update(store=str(store), sprig=str(binary))
         diagnostic.update(phase="snapshot_oracle", call="inventory")
         started = time.monotonic()
         expected = inventory(snapshot)
@@ -812,21 +957,30 @@ def capture(args):
                              "fixture_id": prepared["fixture_id"], "store": str(store)})
         sprig_result(commands, binary, store, "init")
         before = sprig_result(commands, binary, store, "stats")
+        require(before.get("branches") == 0 and before.get("workspaces") == 0,
+                "New Cargo capture store already has a branch/workspace")
         report["sprig_stats_before_import"] = before
         report["store_storage_before_import"] = base.measure(store)
         name = "vss-" + args.label + "-" + uuid.uuid4().hex
+        nonce = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
         started = time.monotonic()
-        diagnostic["call"] = "snapshot_import_tree_experiment"
-        imported = sprig_result(commands, binary, store, "snapshot-import-tree-experiment",
+        diagnostic["call"] = "snapshot_prepare_tree_experiment"
+        request = operation_request(sprig_result(commands, binary, store, "snapshot-prepare-tree-experiment",
                                 str(snapshot), name, "--root-handle", str(handle),
                                 "--serial", args.serial, "--marker-token", args.marker_token,
-                                inherited_handle=handle)
+                                "--nonce", nonce, inherited_handle=handle), name, nonce)
+        report["snapshot_prepare_seconds"] = time.monotonic() - started
+        diagnostic["call"] = "persist_complete_operation_request"
+        request_path = work / "operation-request.json"
+        base.json_new(request_path, request)
+        report.update(snapshot_operation_request=request, snapshot_operation_request_file=str(request_path),
+                      snapshot_operation_outcome="not_submitted",
+                      snapshot_request_persistence="Exclusive bounded JSON file flushed/fsynced, then read back before commit; no parent-directory durability claim")
+        receipt = publish_with_receipt_recovery(commands, binary, store, request_path, request, report, diagnostic)
         report["cas_import_seconds"] = time.monotonic() - started
-        require(imported.get("backend", {}).get("kind") == "writable"
-                and imported.get("mount_state") == "unmounted", "Import was not unmounted writable CAS")
-        revision = imported.get("base_revision")
-        require(isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{64}", revision),
-                "Invalid imported revision identity")
+        # A receipt is historical, not a workspace-path availability promise.
+        # Restore from its immutable candidate identity through the native API.
+        revision = receipt["request"]["candidate_revision"]
         report.update(import_name=name, imported_revision=revision)
         after = sprig_result(commands, binary, store, "stats")
         report.update(sprig_stats_after_import=after, store_storage_after_import=base.measure(store),
@@ -850,6 +1004,10 @@ def capture(args):
                       sprig_stats_after_restore=sprig_result(commands, binary, store, "stats"),
                       store_storage_after_restore=base.measure(store),
                       work_storage_before_report=base.measure(work))
+        require(len(commands.commands) == MAX_COMMANDS
+                and [command["argv"][4] for command in commands.commands
+                     if command["capability_forwarded"]] == ["snapshot-prepare-tree-experiment"],
+                "Cargo receipt capture changed its fixed command/capability budget")
         diagnostic.update(phase="completed", call="all_oracles_passed")
 
     return finish_report(work, "capture.json", report, commands, action)
@@ -866,6 +1024,10 @@ def finalize(args):
     require(captured.get("schema_version") == SCHEMA and captured.get("kind") == KIND
             and captured.get("stage") == "capture" and captured.get("status") == "passed"
             and captured.get("cleanup_safe") is True
+            and captured.get("snapshot_prepare_unpublished_verified") is True
+            and captured.get("snapshot_commit_response_discarded") is True
+            and captured.get("snapshot_receipt_recovery_verified") is True
+            and captured.get("snapshot_replay_no_duplicate_verified") is True
             and captured.get("full_bytes_mode_mtime_hardlinks_verified") is True,
             "Capture report is not a successful capability import/native restore")
     live = base.ordinary_path(captured["live_root"])
@@ -874,6 +1036,7 @@ def finalize(args):
             and captured["prepare_report"] == str(base.ordinary_path(args.prepare_report)),
             "Reports do not belong to the same Cargo run")
     cargo = executable(args.cargo)
+    binary = executable(captured["sprig"])
     require(str(cargo) == prepared["cargo"], "Finalize must use the same installed Cargo executable")
     cargo_home = base.ordinary_path(prepared["cargo_home"])
     prepare_work = base.ordinary_path(prepared["work_root"])
@@ -888,6 +1051,7 @@ def finalize(args):
     commands = Commands(work / "logs", "cargo", args.timeout)
     report = report_base("finalize", live, work, commands)
     report.update(fixture_id=prepared["fixture_id"], store=str(store), cas_restore_path=str(restore),
+                  sprig=str(binary),
                   prepare_report=str(base.ordinary_path(args.prepare_report)),
                   capture_report=str(base.ordinary_path(args.capture_report)),
                   original_cargo_target_dir=str(live / "target"),
@@ -897,6 +1061,7 @@ def finalize(args):
                   relocation_policy="Do not edit fingerprints, dep-info, artifact metadata or timestamps to force Fresh; a rebuild is a failed Fresh acceptance with retained output.")
 
     def action():
+        verify_post_cleanup_receipt(commands, binary, store, captured, report)
         require(load_fixture(restore, 1)["fixture_id"] == prepared["fixture_id"], "Restored marker changed")
         expected = captured["snapshot_inventory"]
         require(inventory(restore) == expected, "Restored tree changed before Fresh validation")
@@ -918,6 +1083,9 @@ def finalize(args):
                       final_restore_inventory=final_tree, restore_storage=base.measure(restore),
                       store_storage=base.measure(store), cargo_home_storage=base.measure(cargo_home),
                       work_storage_before_report=base.measure(work))
+        require(len(commands.commands) == 4
+                and all(not command["capability_forwarded"] for command in commands.commands),
+                "Cargo finalization changed its fixed command/capability budget")
 
     return finish_report(work, "finalize.json", report, commands, action)
 
@@ -966,11 +1134,177 @@ def selftest_windows_metadata():
             raise FixtureError("Windows metadata conversion accepted a non-disk or reparse node")
 
 
+def selftest_receipt_recovery(root):
+    """Pure protocol checks and fake byte pipes; no child or Windows API runs."""
+    request = {"store_id": "1" * 64, "nonce": "2" * 64, "name": "vss-selftest",
+               "expected_generation": 0, "candidate_revision": "3" * 64,
+               "request_digest": "4" * 64}
+    operation_request(request, request["name"], request["nonce"])
+    malformed = [dict(request, extra=True), {key: value for key, value in request.items() if key != "store_id"}]
+    malformed.extend(dict(request, **{key: value}) for key, value in
+                     (("store_id", "G" * 64), ("nonce", "5" * 64), ("name", "other"),
+                      ("candidate_revision", "3" * 63), ("request_digest", "4" * 65),
+                      ("expected_generation", True), ("expected_generation", -1),
+                      ("expected_generation", (1 << 64) - 1)))
+    for value in malformed:
+        try:
+            operation_request(value, request["name"], request["nonce"])
+        except FixtureError:
+            pass
+        else:
+            raise FixtureError("Malformed operation request unexpectedly accepted")
+    receipt = {"request": request, "reservation_generation": 1,
+               "result": {"status": "committed", "publication_generation": 2,
+                          "directory": "receipt-directory"}}
+    prepared = {"generation": 0, "listing": {"branches": {}, "workspaces": {}, "trash": []},
+                "store": "not-a-live-store", "stale_workspaces": [], "active_leases": []}
+    workspace = {"name": request["name"], "branch": request["name"],
+                 "base_revision": request["candidate_revision"], "backend": {"kind": "writable"},
+                 "mount_state": "unmounted", "pending_conflicts": [], "path": "not-a-live-path"}
+    published = dict(prepared, generation=2, listing={"branches": {request["name"]: request["candidate_revision"]},
+                                                    "workspaces": {request["name"]: workspace}, "trash": []})
+    malformed_receipts = [None, dict(receipt, extra=True), dict(receipt, reservation_generation=True),
+                          dict(receipt, request=dict(request, store_id="5" * 64)),
+                          dict(receipt, request=dict(request, expected_generation=False)),
+                          dict(receipt, result={"status": "reserved"}),
+                          dict(receipt, result={"status": "aborted", "reason": "cancelled"})]
+    malformed_receipts.extend(dict(receipt, result=dict(receipt["result"], **{key: value}))
+                              for key, value in (("publication_generation", 1),
+                                                 ("publication_generation", 1 << 64),
+                                                 ("directory", "../outside")))
+    for value in malformed_receipts:
+        try:
+            committed_receipt(value, request)
+        except FixtureError:
+            pass
+        else:
+            raise FixtureError("Malformed/foreign/noncommitted operation receipt unexpectedly accepted")
+    request_path = root / "operation-request.json"
+    base.json_new(request_path, request)
+    expected_commands = ["status", "snapshot-commit-experiment", "snapshot-query-experiment",
+                         "status", "snapshot-commit-experiment", "status"]
+    # A deliberately unrelated first response demonstrates that neither recovery
+    # nor replay uses the returned commit payload. Its bounded raw log is retained.
+    success = [prepared, {"deliberately_unused_commit_response": True}, receipt, published, receipt, published]
+    scenarios = [("success", success, None, None),
+                 ("query_absent", success[:2] + [None], "receipt fields", None),
+                 ("query_wrong_store", success[:2] + [dict(receipt, request=dict(request, store_id="5" * 64))],
+                  "different complete request", None),
+                 ("prepare_published", [published], "Candidate preparation published", None),
+                 ("replay_changed_receipt", success[:4] + [dict(receipt, result=dict(receipt["result"], directory="other"))],
+                  "same receipt", None),
+                 ("replay_generation_increased", success[:5] + [dict(published, generation=3)],
+                  "exactly one expected branch/workspace", None),
+                 ("replay_duplicate_branch", success[:5] + [dict(published, listing=dict(published["listing"],
+                    branches=dict(published["listing"]["branches"], duplicate=request["candidate_revision"])))],
+                  "exactly one expected branch/workspace", None),
+                 ("replay_duplicate_workspace", success[:5] + [dict(published, listing=dict(published["listing"],
+                    workspaces=dict(published["listing"]["workspaces"], duplicate=workspace)))],
+                  "exactly one expected branch/workspace", None),
+                 ("late_restore_failure", success, "mock native restore failure", None),
+                 ("post_cleanup_success", [receipt], None, None),
+                 ("post_cleanup_changed", [dict(receipt, result=dict(receipt["result"], directory="other"))],
+                  "Post-cleanup query changed", None),
+                 ("commit_unknown", success[:2], "Child timed out", 1)]
+    real_popen = subprocess.Popen
+    try:
+        for name, outputs, failure, timeout_step in scenarios:
+            work = root / name
+            work.mkdir()
+            (work / "logs").mkdir()
+            commands = Commands(work / "logs", "mock-receipt", 5)
+            report = report_base("capture", root / "unused-live", work, commands)
+            diagnostic = {"phase": "receipt_selftest"}
+            report["diagnostic"] = diagnostic
+            calls = []
+            post_cleanup = name.startswith("post_cleanup_")
+            scenario_commands = ["snapshot-query-experiment"] if post_cleanup else expected_commands
+
+            class FakeReceiptProcess:
+                pid = 0
+
+                def __init__(self, result, timeout):
+                    self.stdout = io.BytesIO(json.dumps({"schema_version": 1, "result": result}).encode("utf-8"))
+                    self.stderr = io.BytesIO(b"")
+                    self.timeout = timeout
+
+                def wait(self, timeout):
+                    if self.timeout:
+                        raise subprocess.TimeoutExpired("not-executed-sprig", timeout)
+                    return 0
+
+            def fake_popen(argv, **kwargs):
+                step = len(calls)
+                require(step < len(outputs) and argv[4] == scenario_commands[step],
+                        "Receipt selftest invoked an unexpected extra/reordered command")
+                require("startupinfo" not in kwargs and kwargs.get("close_fds") is True,
+                        "Receipt commit/query/replay tried to inherit a capability")
+                if argv[4] != "status":
+                    require(len(argv) == 6 and json.loads(argv[5]) == bounded_json(request_path),
+                            "Receipt recovery did not use the complete persisted inline request")
+                calls.append(argv)
+                return FakeReceiptProcess(outputs[step], step == timeout_step)
+
+            subprocess.Popen = fake_popen
+
+            def action():
+                if post_cleanup:
+                    verify_post_cleanup_receipt(commands, "not-executed-sprig", root / "unused-store",
+                                                {"snapshot_operation_request": request,
+                                                 "snapshot_receipt_recovered": receipt,
+                                                 "import_name": request["name"]}, report)
+                    return
+                recovered = publish_with_receipt_recovery(commands, "not-executed-sprig", root / "unused-store",
+                                                           request_path, request, report, diagnostic)
+                require(recovered == receipt, "Recovery differs from queried receipt")
+                if name == "late_restore_failure":
+                    raise FixtureError("mock native restore failure")
+
+            try:
+                finish_report(work, "capture.json", report, commands, action)
+            except FixtureError as error:
+                require(failure is not None and failure in str(error), "Receipt scenario failed for wrong reason: " + str(error))
+                failed = bounded_json(work / "capture.json")
+                require(failed["cleanup_safe"] is False and failed["status"] == "failed",
+                        "Receipt failure permitted cleanup")
+                if timeout_step is not None:
+                    require(failed.get("uncertain_child") is True and len(calls) == 2
+                            and failed["snapshot_operation_outcome"] == "unknown"
+                            and "snapshot_commit_response_discarded" not in failed,
+                            "Unknown commit child was treated as response loss or retried")
+                if len(calls) >= 4:
+                    require(failed["snapshot_operation_outcome"] == "committed"
+                            and failed["snapshot_receipt_recovered"] == receipt,
+                            "Later failure erased the already-known historical commit")
+            else:
+                require(failure is None and commands.safe() and len(calls) == len(scenario_commands)
+                        and MAX_COMMANDS == 12,
+                        "Receipt success failed its bounded command evidence")
+                require(all(not item["capability_forwarded"] for item in commands.commands),
+                        "Receipt success lost capability-isolation evidence")
+                if post_cleanup:
+                    require(report["post_cleanup_receipt_verified"] and report["post_cleanup_receipt"] == receipt,
+                            "Post-cleanup query lost its matching historical receipt")
+                else:
+                    require(report["snapshot_receipt_recovery_verified"]
+                            and report["snapshot_replay_no_duplicate_verified"],
+                            "Receipt success lost recovery/replay evidence")
+                    raw = Path(commands.commands[1]["stdout_log"]).read_text(encoding="utf-8")
+                    require("deliberately_unused_commit_response" in raw,
+                            "Discarded response lost its bounded raw log")
+            require(len(calls) == len(outputs), "Receipt scenario stopped before expected evidence")
+    finally:
+        subprocess.Popen = real_popen
+
+
 def selftest():
     """No executable except this Python interpreter is launched by this test."""
     selftest_windows_metadata()
     with tempfile.TemporaryDirectory(prefix="sprig-vss-cargo-selftest-") as temporary:
         root = Path(temporary)
+        receipt_root = root / "receipts"
+        receipt_root.mkdir()
+        selftest_receipt_recovery(receipt_root)
         require(all(plain_component(name) for name in ("Cargo.toml", ".cargo", "test-123.exe")),
                 "Ordinary path component rejected")
         require(not any(plain_component(name) for name in ("..", "a:b", "a/b", "a\\b", "x.", "x ", "CON", "NUL.txt")),
@@ -1104,6 +1438,10 @@ def selftest():
                        "external hardlinks rejected", "safe path components", "bounded JSON before write",
                        "positive Fresh/compile/test evidence", "bounded mock stdout/stderr drains",
                        "pre-ingestion failure report preserves phase/call and WinError metadata",
+                       "persisted complete store-bound request and exact inline replay without capability inheritance",
+                       "discarded commit response recovered by query; no duplicate generation/branch/workspace",
+                       "malformed/foreign receipts and unknown child fail closed without retry or cleanup",
+                       "late restore failure preserves committed fact; post-cleanup query needs no source capability",
                        "pure Windows handle metadata ABI, integer conversion, full attributes and type/reparse rejection"]}
 
 

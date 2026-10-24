@@ -66,16 +66,59 @@ const QUERY_BYTES: usize = 64 * 1024;
 /// At most 4096 entries (including root), depth 64, and 32 MiB of logical file
 /// contents (counting every hard-link alias) are accepted. All files are read;
 /// timestamps, USNs, and prior captures are never used to skip content.
-pub fn import_tree(
+pub fn prepare_tree(
     store: &crate::Store,
     root: OwnedHandle,
     expected_root: &Path,
     name: &str,
     serial: u32,
     token: &str,
-) -> crate::Result<crate::WorkspaceResult> {
+    nonce: &str,
+) -> crate::Result<serde_json::Value> {
     let capability = SnapshotTree::from_handle(root, expected_root, serial, token)?;
-    store.import_streamed_writable(name, |batch| capability.capture(batch))
+    let digest = blake3::hash(&serde_json::to_vec(&serde_json::json!({
+        "contract": "sprig-vss-tree-receipt-v1",
+        "root": expected_root.to_str().ok_or_else(|| invalid("non-Unicode snapshot root"))?,
+        "serial": serial, "marker_token": token,
+        "root_volume_id": capability.root.before.volume,
+        "root_file_id": capability.root.before.identifier,
+        "logical_bytes": TREE_BYTES, "entries": TREE_ENTRIES, "depth": TREE_DEPTH,
+        "metadata": "native-canonical-v1-ignore-not-content-indexed",
+        "capture": "full-content-relative-handles-no-reparse-no-ads-internal-hardlinks",
+    }))?)
+    .to_hex()
+    .to_string();
+    let request = store
+        .prepare_snapshot_operation(name, nonce, &digest, |batch| capability.capture(batch))?;
+    Ok(serde_json::to_value(request)?)
+}
+
+fn operation_request(json: &str) -> crate::Result<crate::model::OperationRequest> {
+    if json.len() > 4096 {
+        return Err(invalid("operation request exceeds 4096 bytes").into());
+    }
+    Ok(serde_json::from_str(json)?)
+}
+
+/// Experimental exact-request Store bridge. It performs no VSS/system operation.
+pub fn commit_operation(store: &crate::Store, json: &str) -> crate::Result<serde_json::Value> {
+    Ok(serde_json::to_value(
+        store.commit_prepared_snapshot_operation(&operation_request(json)?)?,
+    )?)
+}
+
+/// Returns a historical receipt or null, never a live workspace availability claim.
+pub fn query_operation(store: &crate::Store, json: &str) -> crate::Result<serde_json::Value> {
+    Ok(serde_json::to_value(
+        store.snapshot_operation(&operation_request(json)?)?,
+    )?)
+}
+
+/// An already committed receipt wins; otherwise the first terminal publication wins.
+pub fn cancel_operation(store: &crate::Store, json: &str) -> crate::Result<serde_json::Value> {
+    Ok(serde_json::to_value(
+        store.cancel_prepared_snapshot_operation(&operation_request(json)?)?,
+    )?)
 }
 
 // Deliberately private and non-Clone. The handle binds descendant reads, but
@@ -1712,25 +1755,35 @@ mod tests {
         let state = fs::read(store_path.join("state.json"))?;
         let expected = Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\fixture");
         let token = "0123456789abcdef0123456789abcdef";
+        assert!(operation_request(&"x".repeat(4097)).is_err());
+        let request = serde_json::json!({"store_id": "a".repeat(64), "nonce": "b".repeat(64),
+            "name": "snapshot", "expected_generation": 0, "candidate_revision": "c".repeat(64),
+            "request_digest": "d".repeat(64)});
+        assert!(operation_request(&request.to_string()).is_ok());
+        let mut extra = request.clone();
+        extra["unknown"] = serde_json::json!(true);
+        assert!(operation_request(&extra.to_string()).is_err());
         assert!(
-            import_tree(
+            prepare_tree(
                 &store,
                 root.file.try_clone()?.into(),
                 expected,
                 "ordinary",
                 serial,
-                token
+                token,
+                &"a".repeat(64)
             )
             .is_err()
         );
         assert!(
-            import_tree(
+            prepare_tree(
                 &store,
                 a.file.try_clone()?.into(),
                 expected,
                 "file",
                 serial,
-                token
+                token,
+                &"a".repeat(64)
             )
             .is_err()
         );
@@ -1740,7 +1793,18 @@ mod tests {
             .create_new(true)
             .open(temporary.0.join("writable"))?;
         assert!(require_read_only_handle(&writable).is_err());
-        assert!(import_tree(&store, writable.into(), expected, "writable", serial, token).is_err());
+        assert!(
+            prepare_tree(
+                &store,
+                writable.into(),
+                expected,
+                "writable",
+                serial,
+                token,
+                &"a".repeat(64)
+            )
+            .is_err()
+        );
         let mut reader = std::ptr::null_mut();
         let mut writer = std::ptr::null_mut();
         // SAFETY: live writable output slots; no inheritance/security is requested.
@@ -1750,7 +1814,18 @@ mod tests {
         // SAFETY: CreatePipe succeeded and returned two fresh owned handles.
         let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
         let _writer = unsafe { OwnedHandle::from_raw_handle(writer) };
-        assert!(import_tree(&store, reader, expected, "pipe", serial, token).is_err());
+        assert!(
+            prepare_tree(
+                &store,
+                reader,
+                expected,
+                "pipe",
+                serial,
+                token,
+                &"a".repeat(64)
+            )
+            .is_err()
+        );
         assert_eq!(state, fs::read(store_path.join("state.json"))?);
         assert!(store.list()?.workspaces.is_empty());
         Ok(())

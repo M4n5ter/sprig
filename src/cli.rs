@@ -120,9 +120,11 @@ enum Command {
     },
     #[cfg(all(windows, feature = "vss-experiment"))]
     #[command(hide = true)]
-    SnapshotImportTreeExperiment {
+    SnapshotPrepareTreeExperiment {
         source: PathBuf,
         name: String,
+        #[arg(long)]
+        nonce: String,
         #[arg(long)]
         root_handle: usize,
         #[arg(long)]
@@ -130,6 +132,15 @@ enum Command {
         #[arg(long)]
         marker_token: String,
     },
+    #[cfg(all(windows, feature = "vss-experiment"))]
+    #[command(hide = true)]
+    SnapshotCommitExperiment { request: String },
+    #[cfg(all(windows, feature = "vss-experiment"))]
+    #[command(hide = true)]
+    SnapshotQueryExperiment { request: String },
+    #[cfg(all(windows, feature = "vss-experiment"))]
+    #[command(hide = true)]
+    SnapshotCancelExperiment { request: String },
     #[command(name = "__writable-serve", hide = true)]
     WritableServe {
         #[arg(long)]
@@ -534,9 +545,22 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             )?)
         }
         #[cfg(all(windows, feature = "vss-experiment"))]
-        Command::SnapshotImportTreeExperiment {
+        Command::SnapshotCommitExperiment { request } => {
+            result(sprig::vss_experiment::commit_operation(&store, request)?)
+        }
+        #[cfg(all(windows, feature = "vss-experiment"))]
+        Command::SnapshotQueryExperiment { request } => {
+            result(sprig::vss_experiment::query_operation(&store, request)?)
+        }
+        #[cfg(all(windows, feature = "vss-experiment"))]
+        Command::SnapshotCancelExperiment { request } => {
+            result(sprig::vss_experiment::cancel_operation(&store, request)?)
+        }
+        #[cfg(all(windows, feature = "vss-experiment"))]
+        Command::SnapshotPrepareTreeExperiment {
             source,
             name,
+            nonce,
             root_handle,
             serial,
             marker_token,
@@ -579,13 +603,14 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
                 return Err(CliError::arguments("cannot duplicate snapshot capability"));
             }
             let handle = unsafe { OwnedHandle::from_raw_handle(duplicate) };
-            result(sprig::vss_experiment::import_tree(
+            result(sprig::vss_experiment::prepare_tree(
                 &store,
                 handle,
                 source,
                 name,
                 serial,
                 marker_token,
+                nonce,
             )?)
         }
         Command::Import { source, name } => result(if cli.writable {

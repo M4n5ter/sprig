@@ -639,25 +639,27 @@ also does not measure kernel/RAM caches or filesystem-global metadata. Statistic
 are not an atomic snapshot of externally modified native trees; quiesce writers
 for reproducible measurements. `doctor` lists orphan/temporary entries.
 
-The current storage schema is **11**.
+The current storage schema is **12**.
 
 This experimental branch adds an internal, bounded operation-receipt ledger for
-future online storage snapshots; it does not expose a new snapshot CLI or change
-strict checkpoint semantics. A nonce binds the complete request (name, expected
-state generation, candidate revision and canonical adapter request digest).
+online storage snapshots. Only the opt-in synthetic VSS experiment connects it
+to hidden prepare/commit/query/cancel commands; strict checkpoint is unchanged.
+A nonce binds the complete request (Store identity, name, expected state
+generation, candidate revision and canonical adapter request digest).
 Reservation precedes publication; the result, branch and logical workspace are
 published in the same atomic state replacement. Merely observing a rename is
 not a durable acknowledgement: exact receipt queries and replay must also pass
 checked file/directory sync barriers, within the documented platform guarantees.
-Retrying an identical terminal
-request returns its historical result, not a claim that its workspace still
+Retrying an identical terminal request returns its historical result, not a claim that its workspace still
 exists. Reusing a nonce for different inputs is rejected. The adapter must include
 all source and capture options in its digest; this internal interface does not
 establish a VSS lease or accept arbitrary streams.
 
 The conservative experimental limit is 256 receipts per store, including aborted
 requests. At capacity, new reservations fail; receipts never expire or evict
-silently. This is not a permanent product retention policy. Candidate revisions
+silently. This is not a permanent product retention policy. Cancellation before
+reservation records a terminal tombstone without requiring or pinning the
+possibly collected candidate. Other receipt candidate revisions
 and committed generation directories remain GC roots, including references in
 retained state backups. Explicit state recovery merges known terminal facts
 rather than rolling them back. If the latest state is damaged, missing and

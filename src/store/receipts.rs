@@ -6,7 +6,8 @@ pub(super) const RECEIPT_LIMIT: usize = 256;
 
 fn validate_request(r: &OperationRequest) -> Result<()> {
     validate_name(&r.name)?;
-    if !valid_hash(&r.nonce)
+    if !valid_hash(&r.store_id)
+        || !valid_hash(&r.nonce)
         || !valid_hash(&r.candidate_revision)
         || !valid_hash(&r.request_digest)
         || r.expected_generation == u64::MAX
@@ -22,8 +23,12 @@ pub(super) fn validate_receipts(state: &State) -> Result<()> {
     }
     for (nonce, receipt) in &state.operation_receipts {
         validate_request(&receipt.request)?;
+        let cancelled_before = matches!(&receipt.result, OperationResult::Aborted { reason } if reason == "cancelled_before_reservation");
         if *nonce != receipt.request.nonce
-            || receipt.reservation_generation != receipt.request.expected_generation + 1
+            || receipt.request.store_id != state.store_id
+            || receipt.reservation_generation < receipt.request.expected_generation + 1
+            || (!cancelled_before
+                && receipt.reservation_generation != receipt.request.expected_generation + 1)
             || receipt.reservation_generation > state.generation
         {
             return Err(failure("invalid operation receipt binding/generation"));
@@ -42,7 +47,9 @@ pub(super) fn validate_receipts(state: &State) -> Result<()> {
                 }
             }
             OperationResult::Aborted { reason }
-                if reason == "state_changed" || reason == "cancelled" => {}
+                if reason == "state_changed"
+                    || reason == "cancelled"
+                    || reason == "cancelled_before_reservation" => {}
             OperationResult::Aborted { .. } => {
                 return Err(failure("invalid operation abort reason"));
             }
@@ -53,6 +60,9 @@ pub(super) fn validate_receipts(state: &State) -> Result<()> {
 
 fn existing(state: &State, request: &OperationRequest) -> Result<Option<OperationReceipt>> {
     validate_request(request)?;
+    if request.store_id != state.store_id {
+        return Err(failure("operation request belongs to a different Store"));
+    }
     if let Some(receipt) = state.operation_receipts.get(&request.nonce) {
         if receipt.request != *request {
             return Err(failure("operation nonce already binds a different request"));
@@ -85,6 +95,103 @@ impl Store {
         sync_directory(&self.root)?;
         sync_directory(&self.root.join("staging"))?;
         Ok(())
+    }
+
+    #[cfg(any(test, all(windows, feature = "vss-experiment")))]
+    pub(crate) fn prepare_snapshot_operation(
+        &self,
+        name: &str,
+        nonce: &str,
+        request_digest: &str,
+        capture: impl FnOnce(&mut content::ObjectBatch) -> Result<Manifest>,
+    ) -> Result<OperationRequest> {
+        let _lock = self.lock()?;
+        let state = self.state()?;
+        let mut request = OperationRequest {
+            store_id: state.store_id.clone(),
+            nonce: nonce.to_owned(),
+            name: name.to_owned(),
+            expected_generation: state.generation,
+            candidate_revision: "0".repeat(64),
+            request_digest: request_digest.to_owned(),
+        };
+        validate_request(&request)?;
+        if state.receipt_recovery_blocked || state.operation_receipts.contains_key(nonce) {
+            return Err(failure(
+                "nonce already recorded or recovery blocked; query the saved request",
+            ));
+        }
+        if state.operation_receipts.len() == RECEIPT_LIMIT {
+            return Err(failure("operation receipt capacity full; nothing evicted"));
+        }
+        fresh_name(&state, name, true)?;
+        let mut batch = content::ObjectBatch::open(&self.objects())?;
+        let manifest = capture(&mut batch)?;
+        content::validate_manifest(&manifest)?;
+        batch.finish()?;
+        request.candidate_revision = self.put_revision(&Revision {
+            parents: vec![],
+            clock: 1,
+            message: format!("storage snapshot {name}"),
+            manifest,
+        })?;
+        // No branch, workspace or reservation yet. The caller must durably save
+        // this exact request before it may submit any publishing operation.
+        Ok(request)
+    }
+
+    pub(crate) fn commit_prepared_snapshot_operation(
+        &self,
+        request: &OperationRequest,
+    ) -> Result<OperationReceipt> {
+        self.reserve_snapshot_operation(request)?;
+        self.publish_snapshot_operation(request)
+    }
+
+    pub(crate) fn cancel_prepared_snapshot_operation(
+        &self,
+        request: &OperationRequest,
+    ) -> Result<OperationReceipt> {
+        let _lock = self.lock()?;
+        let mut state = self.state()?;
+        let receipt = match existing(&state, request)? {
+            Some(mut receipt) if receipt.result == OperationResult::Reserved => {
+                receipt.result = OperationResult::Aborted {
+                    reason: "cancelled".into(),
+                };
+                receipt
+            }
+            Some(receipt) => {
+                self.acknowledge_snapshot_state()?;
+                return Ok(receipt);
+            }
+            None => {
+                if state.operation_receipts.len() == RECEIPT_LIMIT
+                    || request.expected_generation > state.generation
+                {
+                    return Err(failure(
+                        "cannot register cancellation: capacity or future generation",
+                    ));
+                }
+                OperationReceipt {
+                    request: request.clone(),
+                    // Registration only: this terminal tombstone never reserved
+                    // or pinned the candidate, which may already be collected.
+                    reservation_generation: state
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| failure("metadata generation exhausted"))?,
+                    result: OperationResult::Aborted {
+                        reason: "cancelled_before_reservation".into(),
+                    },
+                }
+            }
+        };
+        state
+            .operation_receipts
+            .insert(request.nonce.clone(), receipt.clone());
+        self.save(&mut state)?;
+        Ok(receipt)
     }
 
     fn validate_snapshot_candidate(&self, candidate: &str) -> Result<()> {
@@ -260,6 +367,9 @@ impl Store {
         }
         states.sort_by_key(|state| state.generation);
         for state in states {
+            if state.store_id != restored.store_id {
+                return Err(failure("backup Store identity mismatch"));
+            }
             restored.receipt_recovery_blocked |= state.receipt_recovery_blocked;
             for (nonce, incoming) in state.operation_receipts {
                 if let Some(previous) = restored.operation_receipts.get(&nonce) {
@@ -367,6 +477,7 @@ mod tests {
         }
         fn request(&self, n: u64) -> OperationRequest {
             OperationRequest {
+                store_id: self.store.state().unwrap().store_id,
                 nonce: format!("{n:064x}"),
                 name: format!("snapshot-{n}"),
                 expected_generation: self.store.state().unwrap().generation,
@@ -390,6 +501,173 @@ mod tests {
         SAVE_FAULT.with(|f| f.set(Some(phase)));
         let _reset = Reset;
         action()
+    }
+
+    #[test]
+    fn prepared_cancellation_survives_stale_state_gc_and_rejects_other_stores() {
+        let f = Fixture::new();
+        let other = Fixture::new();
+        assert_eq!(f.candidate, other.candidate);
+        let r = f.request(1);
+        assert!(other.store.reserve_snapshot_operation(&r).is_err());
+        assert!(other.store.snapshot_operation(&r).is_err());
+        assert!(other.store.cancel_prepared_snapshot_operation(&r).is_err());
+        assert!(other.store.commit_prepared_snapshot_operation(&r).is_err());
+        let empty = f
+            .store
+            .put_revision(&Revision {
+                parents: vec![],
+                clock: 1,
+                message: "empty".into(),
+                manifest: Manifest::from([(
+                    String::new(),
+                    f.store.revision(&f.candidate).unwrap().manifest[""].clone(),
+                )]),
+            })
+            .unwrap();
+        {
+            let _lock = f.store.lock().unwrap();
+            let mut state = f.store.state().unwrap();
+            state.branches.insert(r.name.clone(), empty);
+            f.store.save(&mut state).unwrap();
+        }
+        let plan = f.store.gc().unwrap();
+        assert!(!plan.unreachable_objects.is_empty());
+        f.store.gc_apply(&plan.plan_id).unwrap();
+        assert!(
+            f.store
+                .validate_snapshot_candidate(&r.candidate_revision)
+                .is_err()
+        );
+        assert!(
+            fault(SaveFault::BeforeRename, || f
+                .store
+                .cancel_prepared_snapshot_operation(&r))
+            .is_err()
+        );
+        assert!(f.store.snapshot_operation(&r).unwrap().is_none());
+        assert!(
+            fault(SaveFault::AfterRename, || f
+                .store
+                .cancel_prepared_snapshot_operation(&r))
+            .is_err()
+        );
+        let cancelled = f.store.snapshot_operation(&r).unwrap().unwrap();
+        assert_eq!(
+            f.store.cancel_prepared_snapshot_operation(&r).unwrap(),
+            cancelled
+        );
+        assert_eq!(
+            cancelled.result,
+            OperationResult::Aborted {
+                reason: "cancelled_before_reservation".into()
+            }
+        );
+        assert!(cancelled.reservation_generation > r.expected_generation + 1);
+        let state = f.store.state().unwrap();
+        assert!(
+            !f.store
+                .protected_roots(&state)
+                .unwrap()
+                .contains(&r.candidate_revision)
+        );
+        assert_eq!(
+            f.store.commit_prepared_snapshot_operation(&r).unwrap(),
+            cancelled
+        );
+        assert!(f.store.state().unwrap().workspaces.is_empty());
+        assert!(f.store.doctor().unwrap().errors.is_empty());
+    }
+
+    #[test]
+    fn prepared_capture_and_lost_commit_output_recover_without_republication() {
+        let f = Fixture::new();
+        let before = fs::read(f.store.root.join("state.json")).unwrap();
+        let manifest = f.store.revision(&f.candidate).unwrap().manifest;
+        assert!(
+            f.store
+                .prepare_snapshot_operation("bad", &"a".repeat(64), &"b".repeat(64), |_| Err(
+                    failure("capture failed")
+                ))
+                .is_err()
+        );
+        assert_eq!(before, fs::read(f.store.root.join("state.json")).unwrap());
+        let request = f
+            .store
+            .prepare_snapshot_operation("online", &"a".repeat(64), &"b".repeat(64), |_| {
+                Ok(manifest.clone())
+            })
+            .unwrap();
+        assert_eq!(before, fs::read(f.store.root.join("state.json")).unwrap());
+        // This is the caller's durable recovery record, saved BEFORE any reserve
+        // or publish. A missing prepare response cannot publish a branch.
+        let record = f.path.join("operation-request.json");
+        write_new(&record, &serde_json::to_vec(&request).unwrap()).unwrap();
+        sync_directory(&f.path).unwrap();
+        let recovered: OperationRequest =
+            serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+        let lost_response = f
+            .store
+            .commit_prepared_snapshot_operation(&request)
+            .unwrap();
+        drop(request);
+        let observed = f.store.snapshot_operation(&recovered).unwrap().unwrap();
+        assert_eq!(observed, lost_response);
+        let state = fs::read(f.store.root.join("state.json")).unwrap();
+        assert_eq!(
+            f.store
+                .commit_prepared_snapshot_operation(&recovered)
+                .unwrap(),
+            observed
+        );
+        assert_eq!(
+            f.store
+                .cancel_prepared_snapshot_operation(&recovered)
+                .unwrap(),
+            observed
+        );
+        assert_eq!(state, fs::read(f.store.root.join("state.json")).unwrap());
+        let cancel = f
+            .store
+            .prepare_snapshot_operation("cancel", &"c".repeat(64), &"d".repeat(64), |_| {
+                Ok(manifest.clone())
+            })
+            .unwrap();
+        let cancelled = f.store.cancel_prepared_snapshot_operation(&cancel).unwrap();
+        assert_eq!(
+            cancelled.result,
+            OperationResult::Aborted {
+                reason: "cancelled_before_reservation".into()
+            }
+        );
+        assert_eq!(
+            f.store.commit_prepared_snapshot_operation(&cancel).unwrap(),
+            cancelled
+        );
+        assert_eq!(f.store.state().unwrap().branches.len(), 1);
+        // The combined bridge must also resolve a publication acknowledgement
+        // error, not just a deliberately discarded successful response.
+        let uncertain = f
+            .store
+            .prepare_snapshot_operation("uncertain", &"e".repeat(64), &"f".repeat(64), |_| {
+                Ok(manifest)
+            })
+            .unwrap();
+        f.store.reserve_snapshot_operation(&uncertain).unwrap();
+        assert!(
+            fault(SaveFault::AfterRename, || f
+                .store
+                .commit_prepared_snapshot_operation(&uncertain))
+            .is_err()
+        );
+        let known = f.store.snapshot_operation(&uncertain).unwrap().unwrap();
+        assert!(matches!(known.result, OperationResult::Committed { .. }));
+        assert_eq!(
+            f.store
+                .commit_prepared_snapshot_operation(&uncertain)
+                .unwrap(),
+            known
+        );
     }
 
     #[test]

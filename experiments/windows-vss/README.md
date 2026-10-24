@@ -190,3 +190,42 @@ production main remain unchanged; this is not a general-purpose VSS product API.
 包含测试虚拟盘、CAS、恢复副本和日志，不是净节省或连续峰值。没有 staging 副本；
 子进程排空、精确快照和差分关联清理、正常卸载均确认。严格 checkpoint 和生产 main
 未改，此功能仍是受限实验，不是正式通用 VSS 接口。
+
+## Receipt-backed Cargo experiment
+
+The opt-in Cargo path now separates capture from publication:
+`prepare-tree` seals a candidate but changes no branch or workspace; the
+controller writes, flushes and reads back the bounded complete request before
+commit. This request binds the Store identity, nonce, name, expected metadata
+generation, candidate and source/capture digest. Only prepare inherits the
+read-only snapshot-root handle. Commit, exact query and cancellation use the
+saved JSON and do not reopen the snapshot or claim its lease.
+
+The trial deliberately discards the decoded successful commit response, queries
+the saved request, and replays it while checking that no second branch/workspace
+or state generation appears. This is response-loss recovery after a known clean
+child exit, not a claim that an unobserved timeout or process crash was safe.
+Finalization queries the same receipt after requester snapshot cleanup and then
+runs the unchanged restored Cargo Fresh and continued-edit checks. A late restore
+or cleanup error cannot erase a known committed receipt; it remains a separate
+publication fact in the report. Unknown subprocess lifetime still prevents safe
+cleanup. Request files are included only through the exact evidence whitelist.
+
+Local Store fault tests separately cover rename-before/after failures, failed
+acknowledgement barriers, cancellation before/after reservation, stale requests,
+wrong Store identity, and candidate GC. The full request must be retained by the
+trusted controller; these hidden commands do not authenticate a caller or prove
+its recovery file was saved. Windows file flush does not establish a new
+parent-directory/power-loss guarantee. No production online snapshot API or
+persistent privileged broker is introduced.
+
+### 回执集成边界
+
+Cargo 实验先捕获候选，再写入并刷新完整请求记录，然后发布；仅捕获过程继承快照只读根句柄。提交、查询与取消绑定同一 Store 和请求，不需要重新打开快照。试验丢弃一次已正常退出的提交命令的解析结果，再精确查询并重放，验证不重复发布；这不冒充未知超时或进程崩溃测试。快照清理后再次查询历史回执，随后保留原有异路径恢复 Fresh 和继续修改编译检查。
+
+已提交事实与后续恢复、VSS 清理成败分别记录，清理失败不表示提交未发生。未知子进程生命周期仍禁止声称清理安全。隐藏实验命令不是身份认证或请求文件已持久化的证明，不增加 Windows 断电保证，也没有引入生产在线快照 API 或长期高权限服务。
+
+Receipt-stage `cas_import_seconds` spans preparation, recovery-record write,
+commit/query/replay and status checks. Compare the separately reported phases,
+not this wider measurement directly against the earlier 05a3ffd single-import
+94 ms result. That earlier result remains a historical observation.

@@ -353,6 +353,7 @@ function Copy-CaptureEvidence([string] $CaptureWork, [string] $Label) {
     # This is deliberately not a recursive copy of the synthetic work directory.
     $allowance = [int64]17MB
     $files = @([pscustomobject]@{ Source = (Join-Path $CaptureWork 'capture.json'); Name = ('capture-' + $Label + '.json') })
+    $files += [pscustomobject]@{ Source = (Join-Path $CaptureWork 'operation-request.json'); Name = ('capture-' + $Label + '-operation-request.json') }
     foreach ($number in 1..12) {
         foreach ($stream in @('stdout', 'stderr')) {
             $name = 'sprig-{0:D2}.{1}.log' -f $number, $stream

@@ -166,15 +166,26 @@ jobs:
   windows-ewdk-build:
     if: github.event_name == 'workflow_dispatch' && inputs.ewdk_build && !inputs.guest_boot && !inputs.runner_probe && !inputs.refs_volume
     runs-on: windows-2025
-    timeout-minutes: 50
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect the official build-only environment
+      - name: Parse build-only scripts before downloading tools
+        shell: pwsh
+        run: |
+          foreach ($file in @('windows_ewdk_build.ps1', 'windows_ewdk_compile.ps1')) {
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile("$PWD/tests/$file", [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          }
+      - name: Compile fixed baseline and isolated experiment without running outputs
         shell: pwsh
         run: ./tests/windows_ewdk_build.ps1 -AllowBuildOnly
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ewdk-build-result
-          path: ewdk-result.json
+          path: |
+            ewdk-result.json
+            ewdk-compile-result.json
+            ewdk-logs/*.txt
           if-no-files-found: error

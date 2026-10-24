@@ -1,4 +1,4 @@
-# Explicit build-only tool inspection. Never installs or loads a driver.
+# Explicit build-only validation. Never installs, loads, or runs its outputs.
 [CmdletBinding()]
 param([switch]$AllowBuildOnly)
 Set-StrictMode -Version Latest
@@ -13,7 +13,7 @@ $limit = [long](24GB)
 $reportPath = Join-Path $PWD 'ewdk-result.json'
 $result = [ordered]@{ outcome='failed'; phase='guard'; source=$url; expectedBytes=$expectedBytes; downloadLimit=$limit; outputLimit=[long](12GB); sha256=$null; mountedReadOnly=$false; scripts=@(); tools=@(); generatedProgramsExecuted=$false; driverLoaded=$false; cleanup='pending'; failure=$null }
 $created=$false; $mountAttempted=$false
-$privateScripts=@()
+
 if (Test-Path -LiteralPath $reportPath) { throw 'Report already exists.' }
 try {
     if ((Get-Volume -DriveLetter D).SizeRemaining -lt 40GB) { throw 'Insufficient build-only disk headroom.' }
@@ -22,11 +22,14 @@ try {
     $null=New-Item -ItemType Directory -Path $root
     $created=$true
     $result.phase='download'
+    Write-Host 'Downloading fixed official EWDK ISO (20,002,537,472 bytes; maximum 30 minutes).'
     & "$env:SystemRoot\System32\curl.exe" --fail --silent --show-error --location --max-redirs 2 --proto '=https' --proto-redir '=https' --max-filesize $limit --max-time 1800 --output $iso $url
     if ($LASTEXITCODE -ne 0) { throw "Official download failed with code $LASTEXITCODE." }
     $item=Get-Item -LiteralPath $iso
     if ($item.Length -ne $expectedBytes -or $item.Length -gt $limit -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Media size/type mismatch.' }
     $result.sha256=(Get-FileHash -LiteralPath $iso -Algorithm SHA256).Hash
+    if ($result.sha256 -ne '9F48251DD24AD31AAC206D8256E95BDA5F90A9783982C45A8AAFEB9054562379') { throw 'Previously inspected official media hash changed.' }
+    Write-Host 'ISO download and hash complete; mounting read-only.'
     $result.phase='read-only-mount'
     $mountAttempted=$true
     $null=Mount-DiskImage -ImagePath $iso -StorageType ISO -Access ReadOnly -PassThru
@@ -47,9 +50,7 @@ try {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Expected environment script absent.' }
         $file=Get-Item -LiteralPath $path
         if ($file.Length -gt 128KB) { throw 'Unexpected environment script size.' }
-        $contents=Get-Content -LiteralPath $path -Raw
         $result.scripts+= [ordered]@{ path=$relative; sha256=(Get-FileHash -LiteralPath $path).Hash; bytes=$file.Length }
-        $privateScripts+= [ordered]@{ path=$relative; contents=$contents }
     }
     $candidates=@(Get-ChildItem -LiteralPath $drive -Filter MSBuild.exe -Recurse -File) + @(Get-ChildItem -LiteralPath $drive -Filter cl.exe -Recurse -File) + @(Get-ChildItem -LiteralPath $drive -Filter signtool.exe -Recurse -File)
     foreach ($tool in $candidates) {
@@ -61,27 +62,16 @@ try {
         if (-not $matches.Count) { throw 'Expected tool class absent.' }
         if (@($matches | Where-Object { $_.signatureStatus -ne 'Valid' -or $_.signer -notmatch '(^|, )O=Microsoft Corporation(,|$)' }).Count) { throw 'Tool signature or Microsoft publisher verification failed.' }
     }
-    # Do not redistribute Microsoft kit source through public CI artifacts.
-    # Only a local, never-uploaded inspection private key can decrypt this envelope.
-    $rsa=[Security.Cryptography.RSA]::Create()
-    $rsa.ImportFromPem((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ewdk-inspection-public.pem') -Raw))
-    $key=[Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
-    $nonce=[Security.Cryptography.RandomNumberGenerator]::GetBytes(12)
-    $plaintext=[Text.Encoding]::UTF8.GetBytes(($privateScripts | ConvertTo-Json -Depth 5 -Compress))
-    $ciphertext=[byte[]]::new($plaintext.Length)
-    $tag=[byte[]]::new(16)
-    $aes=[Security.Cryptography.AesGcm]::new($key,16)
-    try {
-        $aes.Encrypt($nonce,$plaintext,$ciphertext,$tag)
-        $result['encryptedScripts']=[ordered]@{
-            algorithm='RSA-OAEP-SHA256+A256GCM'
-            wrappedKey=[Convert]::ToBase64String($rsa.Encrypt($key,[Security.Cryptography.RSAEncryptionPadding]::OaepSHA256))
-            nonce=[Convert]::ToBase64String($nonce); tag=[Convert]::ToBase64String($tag)
-            ciphertext=[Convert]::ToBase64String($ciphertext)
-        }
-    } finally { $aes.Dispose(); $rsa.Dispose(); [Array]::Clear($key); [Array]::Clear($plaintext) }
-    $privateScripts=$null
-    $result.outcome='inspection-passed-build-pending' 
+    $expectedScripts=@{
+        'LaunchBuildEnv.cmd'='DA9E9F26DF10D22E98D2D4B1F5E98241CB526A95537DF55BF3A177F91DA1AF09'
+        'BuildEnv\SetupBuildEnv.cmd'='6AD415932B630D12DFEC283EC472C8D1ED0B9C0AF462CD4EC52C076F517D2387'
+    }
+    foreach($entry in $result.scripts) { if($entry.sha256 -ne $expectedScripts[$entry.path]) { throw 'Reviewed environment entry script changed.' } }
+    Write-Host 'Reviewed initialization and official tool signatures verified; beginning build-only validation.'
+    $result.phase='compile'
+    & (Join-Path $PSScriptRoot 'windows_ewdk_compile.ps1') -KitRoot $drive -WorkRoot $root
+    $result.outcome='build-only-passed'
+
 } catch {
     $result.failure=[ordered]@{ type=$_.Exception.GetType().FullName; message=$_.Exception.Message; hresult=$_.Exception.HResult }
 } finally {
@@ -97,5 +87,5 @@ try {
     } catch { $result.cleanup='failed'; $result.outcome='failed'; $result['cleanupFailure']=$_.Exception.Message }
     $result | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath -Encoding utf8
 }
-if ($result.outcome -ne 'inspection-passed-build-pending') { throw 'EWDK inspection failed; see ewdk-result.json.' }
-Write-Host 'Official environment inspected, no generated program executed; compilation awaits exact environment review.'
+if ($result.outcome -ne 'build-only-passed') { throw 'EWDK build-only validation failed; see result and bounded build logs.' }
+Write-Host 'Baseline and experimental code compiled. No generated program executed or driver loaded.'

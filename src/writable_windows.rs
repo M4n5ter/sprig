@@ -219,7 +219,10 @@ fn check_options(options: CreateOptions) -> Result<()> {
         | CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT.0
         | CreateOptions::FILE_NO_EA_KNOWLEDGE.0
         | CreateOptions::FILE_DELETE_ON_CLOSE.0
-        | CreateOptions::FILE_OPEN_FOR_BACKUP_INTENT.0;
+        | CreateOptions::FILE_OPEN_FOR_BACKUP_INTENT.0
+        // This is a no-follow request, not creation of a reparse point. The
+        // owned namespace rejects every reparse node at import and mutation.
+        | CreateOptions::FILE_OPEN_REPARSE_POINT.0;
     if option_bits & !allowed != 0 {
         eprintln!(
             "Windows owned open rejected unsupported create options {:#x}",
@@ -1344,6 +1347,8 @@ mod tests {
             assert!(check_options(CreateOptions((disposition << 24) | 0x21)).is_ok());
         }
         assert!(check_options(CreateOptions(6 << 24)).is_err());
+        // Rust create_new uses no-follow on a plain file, which is safe here.
+        assert!(check_options(CreateOptions(0x0220_0060)).is_ok());
         assert!(
             check_options(CreateOptions(
                 (1 << 24) | CreateOptions::FILE_OPEN_BY_FILE_ID.0

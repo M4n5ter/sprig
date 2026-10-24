@@ -15,6 +15,7 @@ $msbuild=Join-Path $KitRoot 'Program Files\Microsoft Visual Studio\2022\BuildToo
 $setup=Join-Path $KitRoot 'BuildEnv\SetupBuildEnv.cmd'
 $compiler=Join-Path $KitRoot 'Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe'
 $solution=$source+'\build\VStudio\'
+$guards=@{}
 $empty=Join-Path $WorkRoot 'empty-user-props'
 $null=New-Item -ItemType Directory $empty
 function Output-Size {
@@ -45,7 +46,8 @@ function Run-BuildCommand([string]$Name,[string]$Command,[string]$ClExtra='') {
     if($process.ExitCode -ne 0){ throw "Build-only phase failed: $Name ($($process.ExitCode))." }
 }
 function Msbuild-Command([string]$Project,[string]$Target='Build') {
-    return '"'+$msbuild+'" "'+(Join-Path $solution $Project)+'" /nologo /noAutoResponse /interactive:false /m:2 /nr:false /t:'+$Target+' /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off /p:BuildProjectReferences=false /p:MyTargetPlatformVersion=10.0.26100.0 /p:MyNtddiVersion=0x0A000006 /p:MyWin32Version=0x0A00 /p:MyGitHead='+$commit+' /p:MyGitRevision=ddca7bd /p:ImportDirectoryBuildProps=false /p:ImportDirectoryBuildTargets=false /p:UserRootDir='+$empty+' /p:SolutionDir='+$solution+' /verbosity:minimal'
+    $guardProperty=if($guards.ContainsKey($Project)) {' /p:ForceImportAfterCppTargets='+$guards[$Project]}else{''}
+    return '"'+$msbuild+'" "'+(Join-Path $solution $Project)+'" /nologo /noAutoResponse /interactive:false /m:2 /nr:false /t:'+$Target+' /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off /p:BuildProjectReferences=false /p:MyTargetPlatformVersion=10.0.26100.0 /p:MyNtddiVersion=0x0A000006 /p:MyWin32Version=0x0A00 /p:MyGitHead='+$commit+' /p:MyGitRevision=ddca7bd /p:ImportDirectoryBuildProps=false /p:ImportDirectoryBuildTargets=false /p:UserRootDir='+$empty+' /p:SolutionDir='+$solution+' /verbosity:minimal'+$guardProperty
 }
 try {
     Write-Host 'Downloading pinned official WinFsp source (no executable is run).'
@@ -54,7 +56,8 @@ try {
     & "$env:SystemRoot\System32\tar.exe" -xzf $archive -C $WorkRoot
     if($LASTEXITCODE -ne 0 -or -not(Test-Path $source -PathType Container)){throw 'Source extraction failed.'}
     # Evaluation only: /pp and /getProperty never execute a target. Inspect the
-    # actual imported signing tasks before any build, and fail closed on unknowns.
+    # actual imported signing tasks, add unconditional execution vetoes, then
+    # verify every veto in the final imported project before any build.
     foreach($project in @('winfsp_sys.vcxproj','winfsp_dll.vcxproj','testing\memfs.vcxproj','testing\winfsp-tests.vcxproj')) {
         $name=[IO.Path]::GetFileNameWithoutExtension($project)
         $base=(Msbuild-Command $project).Replace(' /t:Build','')
@@ -63,8 +66,15 @@ try {
         Run-BuildCommand ($name+'-properties') ($base+' /getProperty:SignMode,EnterpriseWDK,DisableRegistryUse,WindowsTargetPlatformVersion,VCTargetsPath')
         $props=Get-Content (Join-Path $logs ($name+'-properties.stdout.txt')) -Raw
         if($props -notmatch '"SignMode"\s*:\s*"Off"' -or $props -notmatch '"EnterpriseWDK"\s*:\s*"(?i:true)"' -or $props -notmatch '"DisableRegistryUse"\s*:\s*"(?i:true)"'){throw 'Evaluated isolated kit/signing policy mismatch.'}
-        & python (Join-Path $PSScriptRoot 'check_unsigned_build.py') $pp (Join-Path $logs ($name+'-signing-guard.txt'))
-        if($LASTEXITCODE -ne 0){throw 'Signing preflight refused; no Build executed.'}
+        $guard=Join-Path $WorkRoot ($name+'.signing-guard.targets')
+        & python (Join-Path $PSScriptRoot 'check_unsigned_build.py') $pp (Join-Path $logs ($name+'-signing-guard.txt')) $guard
+        if($LASTEXITCODE -ne 0){throw 'Signing guard preparation refused; no Build executed.'}
+        $guards[$project]=$guard
+        $verified=Join-Path $WorkRoot ($name+'.guarded.pp.xml')
+        $guarded=(Msbuild-Command $project).Replace(' /t:Build','')
+        Run-BuildCommand ($name+'-guarded-preprocess') ($guarded+' /pp:"'+$verified+'"')
+        & python (Join-Path $PSScriptRoot 'check_unsigned_build.py') $verified (Join-Path $logs ($name+'-signing-guard.txt')) $guard --verify
+        if($LASTEXITCODE -ne 0){throw 'Signing execution guard not verified; no Build executed.'}
     }
     Run-BuildCommand 'baseline-sys' (Msbuild-Command 'winfsp_sys.vcxproj')
     $sys=Join-Path $solution 'build\Release\winfsp-x64.sys'

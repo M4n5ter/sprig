@@ -62,6 +62,12 @@ try {
     if ($freshDisks.Count -ne 1) { throw 'Image no longer maps to one disk.' }
     $fresh = $freshDisks[0]
     if ($fresh.UniqueId -ne $initializedIdentity -or $fresh.Number -ne $partition.DiskNumber -or $fresh.Size -ne 1073741824 -or $fresh.PartitionStyle -ne 'GPT' -or $fresh.IsBoot -or $fresh.IsSystem) { throw 'Image mapping changed before format.' }
+    try {
+        $method = (Get-CimClass -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Volume -Amended).CimClassMethods['Format']
+        $result.formatReturnMap = @($method.Qualifiers | Where-Object Name -in 'ValueMap', 'Values' | Select-Object Name, Value)
+    } catch {
+        $result.formatMetadataError = $_.Exception.Message
+    }
     $volume = $partition | Format-Volume -FileSystem ReFS -NewFileSystemLabel SprigSynthetic -Confirm:$false
     if ($volume.FileSystem -ne 'ReFS' -or -not $volume.DriveLetter) { throw 'The new volume is not mounted ReFS.' }
     $result.formatted = $true
@@ -71,8 +77,25 @@ try {
     $result.testExitCode = $LASTEXITCODE
     if ($LASTEXITCODE -ne 0) { throw 'ReFS runtime contract failed.' }
 } catch {
-    $result.error = $_.Exception.Message
-    throw
+    $originalError = $_
+    $result.error = $originalError.Exception.Message
+    try {
+        $result.errorRecord = $originalError | Format-List * -Force | Out-String
+        $details = @()
+        $exception = $originalError.Exception
+        while ($null -ne $exception) {
+            if ($exception -is [Microsoft.Management.Infrastructure.CimException] -and $null -ne $exception.ErrorData) {
+                $details += @($exception.ErrorData.CimInstanceProperties | ForEach-Object {
+                    [ordered]@{ Name = $_.Name; CimType = [string]$_.CimType; Value = $_.Value }
+                })
+            }
+            $exception = $exception.InnerException
+        }
+        $result.extendedErrorData = $details
+    } catch {
+        $result.diagnosticError = $_.Exception.Message
+    }
+    throw $originalError
 } finally {
     $env:SPRIG_REFS_TEST_ROOT = $oldRoot
     if ($mountAttempted) {
@@ -90,11 +113,11 @@ try {
             $result.cleanup = 'failed: ' + $_.Exception.Message
             throw
         } finally {
-            $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $directory 'result.json')
-            $result | ConvertTo-Json -Depth 5 | Write-Output
+            $result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $directory 'result.json')
+            $result | ConvertTo-Json -Depth 12 | Write-Output
         }
     } else {
-        $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $directory 'result.json')
-        $result | ConvertTo-Json -Depth 5 | Write-Output
+        $result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $directory 'result.json')
+        $result | ConvertTo-Json -Depth 12 | Write-Output
     }
 }

@@ -599,6 +599,42 @@ impl CheckedSecurity {
         self.storage.as_ptr().cast_mut().cast()
     }
 }
+fn report_acl_mismatch(label: &str, fixed: &CheckedAcl, request: &CheckedAcl) {
+    match (fixed, request) {
+        (Some((fixed_revision, fixed_aces)), Some((request_revision, request_aces))) => {
+            eprintln!(
+                "Windows owned security mismatch: {label} revision fixed={fixed_revision} request={request_revision}; ACE count fixed={} request={}",
+                fixed_aces.len(),
+                request_aces.len()
+            );
+            // Fixed policy has one DACL ACE. Bound diagnostics even if an
+            // untrusted request carries a large (already validated) ACL.
+            for (index, (fixed, request)) in fixed_aces.iter().zip(request_aces).take(8).enumerate()
+            {
+                if fixed != request {
+                    let fixed_mask =
+                        u32::from_le_bytes(fixed[4..8].try_into().expect("validated ordinary ACE"));
+                    let request_mask = u32::from_le_bytes(
+                        request[4..8].try_into().expect("validated ordinary ACE"),
+                    );
+                    eprintln!(
+                        "Windows owned security mismatch: {label} ACE {index} type fixed={} request={}; flags fixed={:#04x} request={:#04x}; mask fixed={fixed_mask:#010x} request={request_mask:#010x}; same_sid={}",
+                        fixed[0],
+                        request[0],
+                        fixed[1],
+                        request[1],
+                        fixed[8..] == request[8..]
+                    );
+                }
+            }
+        }
+        _ => eprintln!(
+            "Windows owned security mismatch: {label} non-null ACL fixed={} request={}",
+            fixed.is_some(),
+            request.is_some()
+        ),
+    }
+}
 fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
     use windows_sys::Win32::Security::{
         EqualSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
@@ -617,6 +653,32 @@ fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
         || left.resource_manager_control != right.resource_manager_control
         || left.acls != right.acls
     {
+        // Diagnostic only: do not log paths, contents or SID values, and do not
+        // change the fixed-policy equality decision to accommodate the request.
+        let left_control = left.control & !ENCODING_AND_DEFAULTED;
+        let right_control = right.control & !ENCODING_AND_DEFAULTED;
+        if left_control != right_control {
+            eprintln!(
+                "Windows owned security mismatch: control fixed={left_control:#06x} request={right_control:#06x}"
+            );
+        }
+        if left.revision != right.revision {
+            eprintln!(
+                "Windows owned security mismatch: descriptor revision fixed={} request={}",
+                left.revision, right.revision
+            );
+        }
+        if left.resource_manager_control != right.resource_manager_control {
+            eprintln!(
+                "Windows owned security mismatch: resource-manager control fixed={:#04x} request={:#04x}",
+                left.resource_manager_control, right.resource_manager_control
+            );
+        }
+        for (index, label) in ["SACL", "DACL"].into_iter().enumerate() {
+            if left.acls[index] != right.acls[index] {
+                report_acl_mismatch(label, &left.acls[index], &right.acls[index]);
+            }
+        }
         return Ok(false);
     }
     for owner in [true, false] {
@@ -643,10 +705,20 @@ fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
         }
         if a.is_null() || b.is_null() {
             if a != b {
+                eprintln!(
+                    "Windows owned security mismatch: {} presence fixed={} request={}",
+                    if owner { "owner" } else { "group" },
+                    !a.is_null(),
+                    !b.is_null()
+                );
                 return Ok(false);
             }
         // SAFETY: non-null SIDs belong to the validated, still-live descriptors.
         } else if unsafe { EqualSid(a, b) } == 0 {
+            eprintln!(
+                "Windows owned security mismatch: {} SID differs",
+                if owner { "owner" } else { "group" }
+            );
             return Ok(false);
         }
     }

@@ -15,6 +15,8 @@ $msbuild=Join-Path $KitRoot 'Program Files\Microsoft Visual Studio\2022\BuildToo
 $setup=Join-Path $KitRoot 'BuildEnv\SetupBuildEnv.cmd'
 $compiler=Join-Path $KitRoot 'Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe'
 $solution=$source+'\build\VStudio\'
+$harness=Join-Path $WorkRoot 'harness'
+$sdk=Join-Path $KitRoot 'Program Files\Windows Kits\10'
 $guards=@{}
 $empty=Join-Path $WorkRoot 'empty-user-props'
 $null=New-Item -ItemType Directory $empty
@@ -47,7 +49,7 @@ function Run-BuildCommand([string]$Name,[string]$Command,[string]$ClExtra='') {
         # /pp may write its parse error into the requested output rather than
         # stdout. Preserve only bounded diagnostic lines, not imported kit source.
         foreach($candidate in Get-ChildItem $WorkRoot -Filter '*.pp.xml' -File) {
-            $diagnostics=@(Select-String -LiteralPath $candidate.FullName -Pattern 'error MSB[0-9]{4}' | Select-Object -First 10 | ForEach-Object { $_.Line.Substring(0,[Math]::Min($_.Line.Length,2048)) })
+            $diagnostics=@(Select-String -LiteralPath $candidate.FullName -Pattern '(^MSBUILD :|\([0-9]+(?:,[0-9]+)?\):)\s*error MSB[0-9]{4}:' | Select-Object -First 10 | ForEach-Object { $_.Line.Substring(0,[Math]::Min($_.Line.Length,2048)) })
             if($diagnostics.Count){$diagnostics | Set-Content (Join-Path $logs ($Name+'-preprocess-errors.txt'))}
         }
         throw "Build-only phase failed: $Name ($($process.ExitCode))."
@@ -94,15 +96,19 @@ try {
     & python (Join-Path $package 'apply_probe_patch.py') --source $source
     if($LASTEXITCODE -ne 0){throw 'Exact experimental source preparation failed.'}
     Run-BuildCommand 'experimental-sys' (Msbuild-Command 'winfsp_sys.vcxproj' 'Rebuild') '/DFSP_TEST_FREEZE_PROBE=1'
-    $harness=Join-Path $WorkRoot 'harness'
     $null=New-Item -ItemType Directory $harness
     Copy-Item (Join-Path $package 'freeze_probe.c'),(Join-Path $package 'probe_protocol.h') $harness
-    Run-BuildCommand 'freeze-probe' ('"'+$compiler+'" /nologo /W4 /std:c11 /O2 /DUNICODE /D_UNICODE "'+$harness+'\freeze_probe.c" /Fo"'+$harness+'\freeze_probe.obj" /Fe"'+$harness+'\freeze_probe.exe" /link advapi32.lib')
+    # SetupBuildEnv intentionally calls vsdevcmd -winsdk=none. VCXPROJ builds
+    # resolve SDK paths through WDK props; this direct C compile needs them too.
+    $include=(@('um','shared','ucrt') | ForEach-Object {' /I"'+$sdk+'\Include\10.0.26100.0\'+$_+'"'}) -join ''
+    $libraries=(@('um','ucrt') | ForEach-Object {' /LIBPATH:"'+$sdk+'\Lib\10.0.26100.0\'+$_+'\x64"'}) -join ''
+    Run-BuildCommand 'freeze-probe' ('"'+$compiler+'" /nologo /W4 /std:c11 /O2 /DUNICODE /D_UNICODE'+$include+' "'+$harness+'\freeze_probe.c" /Fo"'+$harness+'\freeze_probe.obj" /Fe"'+$harness+'\freeze_probe.exe" /link'+$libraries+' advapi32.lib')
+    $result.compiled=$true
+} finally {
+
     foreach($file in Get-ChildItem $WorkRoot -Recurse -File | Where-Object { $_.Extension -in '.sys','.dll','.exe' -and ($_.FullName.StartsWith($solution+'build\') -or $_.FullName.StartsWith($harness+'\')) }) {
         $result.outputs += [ordered]@{name=$file.FullName.Substring($WorkRoot.Length+1);bytes=$file.Length;sha256=(Get-FileHash $file.FullName).Hash}
     }
-    $result.compiled=$true
-} finally {
     $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $PWD 'ewdk-compile-result.json') -Encoding utf8
     # Upload only bounded textual build logs, never binaries, source or toolkit.
     foreach($file in Get-ChildItem $logs -File) { if($file.Length -gt 8MB){Remove-Item $file.FullName; "Omitted oversized build log; inspect bounded result." | Set-Content $file.FullName} }

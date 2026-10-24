@@ -24,9 +24,27 @@ if (Test-Path -LiteralPath $image) { throw 'Image must not already exist.' }
 $script = Join-Path $directory 'create.txt'
 $diskpartLog = Join-Path $directory 'diskpart.log'
 $result = [ordered]@{ image = $image; maximumBytes = 1073741824; created = $false; mounted = $false; formatted = $false; testExitCode = $null; cleanup = 'not-mounted' }
+$startedAt = Get-Date
 $before = @(Get-Disk | Select-Object -ExpandProperty Number)
 $oldRoot = $env:SPRIG_REFS_TEST_ROOT
 $mountAttempted = $false
+$formatter = $null
+$formatterStarted = $false
+$formatterStartUnknown = $false
+$prefix = [Text.StringBuilder]::new()
+$stderr = $null
+$remainingOutput = $null
+$formatOutputCollected = $false
+function Assert-FormatTarget {
+    $mapped = @(Get-DiskImage -ImagePath $image -ErrorAction Stop | Get-Disk -ErrorAction Stop)
+    if ($mapped.Count -ne 1) { throw 'Image mapping is not unique.' }
+    $d = $mapped[0]
+    if ($d.UniqueId -ne $initializedIdentity -or $d.Number -ne $partition.DiskNumber -or $d.Size -ne 1073741824 -or $d.PartitionStyle -ne 'GPT' -or $d.IsBoot -or $d.IsSystem) { throw 'Format image identity changed.' }
+    $letters = @(Get-Partition -DriveLetter $partition.DriveLetter -ErrorAction Stop)
+    if ($letters.Count -ne 1) { throw 'Format drive letter is not unique.' }
+    $p = $letters[0]
+    if ($p.DiskNumber -ne $partition.DiskNumber -or $p.PartitionNumber -ne $partition.PartitionNumber -or $p.Offset -ne $partition.Offset -or $p.Size -ne $partition.Size -or $p.GptType -ne $partition.GptType) { throw 'Format drive letter no longer identifies the new partition.' }
+}
 try {
     # DiskPart creates only this nonexistent file; attach and format are separate,
     # so every consequential step can bind to the exact returned image object.
@@ -68,7 +86,70 @@ try {
     } catch {
         $result.formatMetadataError = $_.Exception.Message
     }
-    $volume = $partition | Format-Volume -FileSystem ReFS -NewFileSystemLabel SprigSynthetic -Confirm:$false
+    $result.operatingSystem = Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture
+    $result.diskGeometry = $fresh | Select-Object Number, UniqueId, Size, LogicalSectorSize, PhysicalSectorSize, BusType, PartitionStyle, IsBoot, IsSystem
+    $result.partitionGeometry = $partition | Select-Object DiskNumber, PartitionNumber, Offset, Size, GptType, DriveLetter
+    $result.imageGeometry = Get-DiskImage -ImagePath $image | Select-Object Size, FileSize, BlockSize, LogicalSectorSize, Attached
+    if (-not $partition.DriveLetter) { throw 'New partition has no drive letter.' }
+    # Same ReFS quick-format, via the official formatter to preserve its precise
+    # diagnostic. Do not add /X or /Y (force-dismount), cluster, integrity, Dev
+    # Drive or registry overrides. Only the initial new-volume warning gets Y;
+    # stdin then closes, so any further unexpected prompt fails rather than loops.
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = Join-Path $env:SystemRoot 'System32\format.com'
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @("$($partition.DriveLetter):", '/FS:ReFS', '/Q', '/V:SprigSynthetic')) {
+        $start.ArgumentList.Add($argument)
+    }
+    $formatter = [Diagnostics.Process]::new()
+    $formatter.StartInfo = $start
+    Assert-FormatTarget
+    $formatterStartUnknown = $true
+    $formatterStarted = $formatter.Start()
+    $formatterStartUnknown = $false
+    if (-not $formatterStarted) { throw 'Native formatter did not start.' }
+    $stderr = $formatter.StandardError.ReadToEndAsync()
+    $prefix = [Text.StringBuilder]::new()
+    $buffer = [char[]]::new(1)
+    $pending = $null
+    $confirmed = $false
+    while ($prefix.Length -lt 65536) {
+        $pending = $formatter.StandardOutput.ReadAsync($buffer, 0, 1)
+        if (-not $pending.Wait(10000)) { break }
+        if ($pending.GetAwaiter().GetResult() -eq 0) { $pending = $null; break }
+        [void]$prefix.Append($buffer[0])
+        $result.formatStdout = $prefix.ToString()
+        $pending = $null
+        if ($prefix.ToString() -match 'Proceed with Format \(Y/N\)\?') {
+            Assert-FormatTarget
+            $formatter.StandardInput.WriteLine('Y')
+            $confirmed = $true
+            $result.formatWarningConfirmed = $true
+            break
+        }
+    }
+    # Never answer an unrecognized prompt (especially a forced-dismount prompt).
+    $formatter.StandardInput.Close()
+    if ($null -ne $pending) {
+        if (-not $pending.Wait(10000)) { throw 'Formatter output is still pending after stdin closed.' }
+        if ($pending.GetAwaiter().GetResult() -gt 0) { [void]$prefix.Append($buffer[0]) }
+    }
+    $remainingOutput = $formatter.StandardOutput.ReadToEndAsync()
+    if (-not $formatter.WaitForExit(30000)) { throw 'Formatter did not exit after stdin closed; preserve the attached image.' }
+    $result.formatStdout = $prefix.ToString() + $remainingOutput.GetAwaiter().GetResult()
+    $result.formatStderr = $stderr.GetAwaiter().GetResult()
+    $result.formatWarningConfirmed = $confirmed
+    $result.formatExitCode = $formatter.ExitCode
+    $formatOutputCollected = $true
+    $formatter.Dispose()
+    $formatter = $null
+    if ($result.formatExitCode -ne 0) { throw "Native ReFS formatter exited $($result.formatExitCode)." }
+    $volumes = @($partition | Get-Volume)
+    if ($volumes.Count -ne 1) { throw 'New partition must map to one volume.' }
+    $volume = $volumes[0]
     if ($volume.FileSystem -ne 'ReFS' -or -not $volume.DriveLetter) { throw 'The new volume is not mounted ReFS.' }
     $result.formatted = $true
     $result.volume = $volume | Select-Object DriveLetter, FileSystem, AllocationUnitSize, Size, SizeRemaining
@@ -79,6 +160,12 @@ try {
 } catch {
     $originalError = $_
     $result.error = $originalError.Exception.Message
+    try {
+        if (-not $formatOutputCollected) { $result.formatStdout = $prefix.ToString() }
+        if (-not $formatOutputCollected -and $null -ne $remainingOutput -and $remainingOutput.IsCompletedSuccessfully) { $result.formatStdout += $remainingOutput.GetAwaiter().GetResult() }
+        if ($null -ne $stderr -and $stderr.IsCompletedSuccessfully) { $result.formatStderr = $stderr.GetAwaiter().GetResult() }
+        if ($formatterStarted -and $null -ne $formatter -and $formatter.HasExited) { $result.formatExitCode = $formatter.ExitCode }
+    } catch { $result.formatDiagnosticError = $_.Exception.Message }
     try {
         $result.errorRecord = $originalError | Format-List * -Force | Out-String
         $details = @()
@@ -95,6 +182,20 @@ try {
     } catch {
         $result.diagnosticError = $_.Exception.Message
     }
+    try {
+        $result.systemStorageEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $startedAt } -MaxEvents 100 -ErrorAction Stop |
+            Where-Object ProviderName -match '(?i)refs|disk|volmgr|partmgr|vhd' |
+            Select-Object TimeCreated, Id, ProviderName, Message)
+    } catch { $result.systemEventsError = $_.Exception.Message }
+    $eventLogs = @()
+    foreach ($name in @('Microsoft-Windows-StorageManagement/Operational', 'Microsoft-Windows-ReFS/Operational', 'Microsoft-Windows-VHDMP/Operational')) {
+        try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = $name; StartTime = $startedAt } -MaxEvents 20 -ErrorAction Stop |
+                Select-Object TimeCreated, Id, ProviderName, Message)
+            $eventLogs += [ordered]@{ log = $name; events = $events }
+        } catch { $eventLogs += [ordered]@{ log = $name; readError = $_.Exception.Message } }
+    }
+    $result.storageEventLogs = $eventLogs
     throw $originalError
 } finally {
     $env:SPRIG_REFS_TEST_ROOT = $oldRoot
@@ -102,6 +203,10 @@ try {
         try {
             # All test children have exited. No force/lazy option, disk deletion,
             # driver changes or detach of any unrelated image is performed.
+            if ($formatterStartUnknown) { throw 'Formatter start outcome is unknown; preserve image for diagnostics.' }
+            if ($formatterStarted -and $null -ne $formatter -and -not $formatter.HasExited) {
+                throw 'Formatter is still active; no forced detach attempted.'
+            }
             $currentImage = Get-DiskImage -ImagePath $image -ErrorAction Stop
             if ($currentImage.Attached) {
                 Dismount-DiskImage -ImagePath $image -ErrorAction Stop

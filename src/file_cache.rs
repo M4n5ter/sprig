@@ -251,6 +251,9 @@ mod tests {
             fs::write(cache.join(&key), &bytes)?;
         }
         materialize(&reader, &chunks, size, &objects, &root.join("hit"))?;
+        // materialize normally applies the manifest mode after a cache clone.
+        #[cfg(unix)]
+        platform::set_path_mode(&root.join("hit"), 0o600)?;
         fs::write(root.join("hit"), b"changed workspace")?;
         assert_eq!(fs::read(cache.join(&key))?, bytes);
         assert_eq!(fs::read(root.join("repaired"))?, bytes);

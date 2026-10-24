@@ -578,7 +578,8 @@ as file chunks. Workspace observations and Store backups are not a shared tree.
 The current `state.json` stays uncompressed. `init --no-compression` chooses raw
 payloads for a new store when compression CPU cost matters more than space; the
 default is selective compression, reported by `stats.payload_compression`. This
-policy is fixed at initialization, not changed under active readers. New payload chunks use independent,
+policy is fixed at initialization, not changed under active readers. Compression
+trades CPU for space; it is not a claim that every workload becomes faster. New payload chunks use independent,
 checksummed Zstandard frames only when compression saves at least 32 bytes and
 6.25%; otherwise they remain raw. Addresses always hash decoded bytes. Both raw
 and decoded chunks are bounded to 256 KiB, and decompression has a bounded window

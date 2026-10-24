@@ -18,6 +18,8 @@ mod platform;
 #[cfg(all(target_os = "linux", feature = "projection"))]
 pub mod projection;
 mod store;
+#[cfg(all(windows, feature = "vss-experiment"))]
+pub mod vss_experiment;
 pub mod writable;
 #[cfg(all(target_os = "linux", feature = "projection"))]
 pub mod writable_fuse;

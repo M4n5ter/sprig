@@ -17,6 +17,8 @@ incremental = false
 
 [features]
 default = []
+# Isolated synthetic Windows VSS acceptance, not a general device-path API.
+vss-experiment = []
 projection = ["dep:fuser"]
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -7,6 +7,7 @@
 [CmdletBinding()]
 param(
     [switch] $AllowSyntheticVolume,
+    [switch] $DirectImport,
     [Parameter(Mandatory)] [string] $Requester,
     [Parameter(Mandatory)] [string] $Sprig,
     [string] $Python = 'python',
@@ -335,7 +336,7 @@ function Copy-CaptureEvidence([string] $CaptureWork, [string] $Label) {
     # This is deliberately not a recursive copy of the synthetic work directory.
     $allowance = [int64]17MB
     $files = @([pscustomobject]@{ Source = (Join-Path $CaptureWork 'capture.json'); Name = ('capture-' + $Label + '.json') })
-    foreach ($number in 1..8) {
+    foreach ($number in 1..12) {
         foreach ($stream in @('stdout', 'stderr')) {
             $name = 'sprig-{0:D2}.{1}.log' -f $number, $stream
             $files += [pscustomobject]@{ Source = (Join-Path (Join-Path $CaptureWork 'logs') $name); Name = ('capture-' + $Label + '-' + $name) }
@@ -361,6 +362,7 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
         '--relative-path', 'fixture', '--work-root', $captureWork, '--store', $store,
         '--sprig', $Sprig, '--label', $Label)
     if ($PreviousReport) { $childArguments += @('--previous-report', $PreviousReport) }
+    if ($DirectImport) { $childArguments += '--direct-import' }
     $arguments = @('--approved-synthetic-volume', $volumeGuid, '--expected-serial', $serialHex,
         '--marker-token', $markerToken, '--acknowledge-storage-snapshot-only', '--allow-own-volume-diff-512m',
         '--vss-timeout-seconds', '120', '--child-timeout-seconds', '300', '--child-exe', $Python, '--') + $childArguments

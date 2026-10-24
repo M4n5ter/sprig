@@ -6,6 +6,30 @@ use super::*;
 use crate::writable::WritableCas;
 
 impl Store {
+    /// Internal stream capture seam: no caller-supplied revision/object IDs are
+    /// published until capture, manifest validation and the durability batch pass.
+    #[cfg(any(test, all(windows, feature = "vss-experiment")))]
+    pub(crate) fn import_streamed_writable(
+        &self,
+        name: &str,
+        capture: impl FnOnce(&mut content::ObjectBatch) -> Result<Manifest>,
+    ) -> Result<WorkspaceResult> {
+        let _lock = self.lock()?;
+        let mut state = self.state()?;
+        fresh_name(&state, name, true)?;
+        let mut batch = content::ObjectBatch::open(&self.objects())?;
+        let manifest = capture(&mut batch)?;
+        content::validate_manifest(&manifest)?;
+        batch.finish()?;
+        let revision = self.put_revision(&Revision {
+            parents: vec![],
+            clock: 1,
+            message: format!("storage snapshot {name}"),
+            manifest,
+        })?;
+        self.restore_writable_locked(&mut state, &revision, name, name, true)
+    }
+
     pub(super) fn writable_core(&self, workspace: &Workspace) -> Result<WritableCas> {
         let WorkspaceBackend::Writable { revision } = &workspace.backend else {
             return Err(failure("workspace does not own a writable CAS journal"));
@@ -814,5 +838,96 @@ impl Store {
         let mut value = self.finish_writable_view(&source, result, remount)?;
         value.mount_state = self.mount_state(&workspace);
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod stream_import_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn streamed_import_failures_never_publish_state() {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-stream-import-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let store = Store::init(&root.join("store")).unwrap();
+        let original = fs::read(store.root.join("state.json")).unwrap();
+        let make = |batch: &mut content::ObjectBatch| -> Result<Manifest> {
+            let kind = batch.put_reader(&mut Cursor::new(vec![b'x'; 64 * 1024]))?;
+            Ok(Manifest::from([
+                (
+                    String::new(),
+                    content::Entry {
+                        id: "root".into(),
+                        link_group: None,
+                        mode: 0o755,
+                        modified_ns: 0,
+                        kind: EntryKind::Directory,
+                    },
+                ),
+                (
+                    "file".into(),
+                    content::Entry {
+                        id: "file".into(),
+                        link_group: None,
+                        mode: 0o644,
+                        modified_ns: 0,
+                        kind,
+                    },
+                ),
+            ]))
+        };
+        assert!(
+            store
+                .import_streamed_writable("read-failure", |batch| {
+                    let _ = make(batch)?;
+                    Err(failure("injected source identity/read failure"))
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .import_streamed_writable("metadata-failure", |batch| {
+                    let mut manifest = make(batch)?;
+                    manifest.get_mut("file").unwrap().mode = 0o1000;
+                    Ok(manifest)
+                })
+                .is_err()
+        );
+        assert!(
+            packed::with_failed_finish(|| store.import_streamed_writable("finish-failure", make))
+                .is_err()
+        );
+        assert_eq!(fs::read(store.root.join("state.json")).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(store.root.join("revisions")).unwrap().count(),
+            0
+        );
+        // A later generation failure can retain an immutable orphan revision,
+        // but must not publish a branch/workspace head. Restore only our fixture.
+        fs::rename(store.root.join("native"), store.root.join("native-held")).unwrap();
+        fs::write(store.root.join("native"), b"injected generation blocker").unwrap();
+        let generation_result = store.import_streamed_writable("generation-failure", make);
+        fs::remove_file(store.root.join("native")).unwrap();
+        fs::rename(store.root.join("native-held"), store.root.join("native")).unwrap();
+        assert!(generation_result.is_err());
+        assert_eq!(fs::read(store.root.join("state.json")).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(store.root.join("revisions")).unwrap().count(),
+            1
+        );
+        let value = store.import_streamed_writable("good", make).unwrap();
+        assert_eq!(value.name, "good");
+        assert_eq!(store.stats().unwrap().branches, 1);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 }

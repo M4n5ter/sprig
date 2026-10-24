@@ -169,12 +169,18 @@ jobs:
           Get-FileHash "$output\requester.exe" -Algorithm SHA256 | Select-Object Algorithm, Hash | ConvertTo-Json | Set-Content "$output\compile-result.json"
       - name: Build the existing Sprig CLI only for explicit runtime acceptance
         if: inputs.vss_volume
-        run: cargo build --release --locked
+        run: |
+          cargo test --locked --features vss-experiment --lib stream_import_tests
+          if ($LASTEXITCODE -ne 0) { throw 'Stream publication regression failed.' }
+          cargo test --locked --features vss-experiment --lib vss_experiment
+          if ($LASTEXITCODE -ne 0) { throw 'Snapshot reader regression failed.' }
+          cargo build --release --locked --features vss-experiment
+          if ($LASTEXITCODE -ne 0) { throw 'Experimental CLI build failed.' }
       - name: Run the explicitly approved synthetic storage snapshot acceptance
         if: inputs.vss_volume
         shell: pwsh
         run: |
-          ./experiments/windows-vss/run_vss_fixture.ps1 -AllowSyntheticVolume -Requester "$env:SPRIG_VSS_BUILD\requester.exe" -Sprig "$env:GITHUB_WORKSPACE\target\release\sprig.exe"
+          ./experiments/windows-vss/run_vss_fixture.ps1 -AllowSyntheticVolume -DirectImport -Requester "$env:SPRIG_VSS_BUILD\requester.exe" -Sprig "$env:GITHUB_WORKSPACE\target\release\sprig.exe"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -14,6 +14,7 @@ Windows runtime contract (Python 3.9+, standard library):
   capture SNAPSHOT_ROOT --live-root DIRECTORY --relative-path fixture
           --work-root NEW_OUTSIDE_DIRECTORY --store SHARED_OUTSIDE_STORE
           --sprig ABSOLUTE_EXE --label LABEL [--previous-report capture.json]
+          [--direct-import]
   measure PATH [PATH ...]
   selftest                         # tiny local fixtures; never runs Sprig/VSS
 
@@ -22,6 +23,8 @@ deletes existing directories. Timed-out CLI children are NOT killed or retried;
 failure reports require retaining the snapshot/volume for operator inspection.
 The post-token probe is restored after stable snapshot reads, only if its live
 bytes still match our probe, making a subsequent settled capture comparable.
+Direct import skips the staging tree, not the full snapshot/hash oracles. Its
+first capture into a new store also verifies three rejected identity/root inputs.
 """
 
 import argparse
@@ -56,8 +59,8 @@ MAX_FIXTURE = 64 * MIB
 FIXED_NS = 1700000000000000000  # Exactly representable at Windows 100 ns precision.
 MAX_MEASURE_FILES = 100000
 MAX_MEASURE_BYTES = 2 * 1024 * MIB
-MAX_CLI_COMMANDS = 8
-MAX_CLI_LOG_BYTES = MIB
+MAX_CLI_COMMANDS = 12
+MAX_CLI_LOG_BYTES = MIB // 2
 VSS_ROOT = re.compile(r"^\\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy[0-9]+\\?$", re.I)
 
 
@@ -194,6 +197,66 @@ def volume(path):
 def outside_volume(live_root, target):
     require(volume(live_root)[0] != volume(target)[0],
             "Staging, CAS, reports and writer control files must be outside the source volume")
+
+
+def snapshot_identity(snapshot_root):
+    """Read the serial and exact synthetic volume marker from one snapshot HANDLE."""
+    require(os.name == "nt" and VSS_ROOT.fullmatch(str(snapshot_root)) is not None,
+            "Direct import identity requires the requester's VSS device root")
+    marker = Path(snapshot_root) / ".sprig-vss-synthetic-volume"
+    check_node(marker)
+    stream_check(marker)
+    from ctypes import wintypes
+
+    class HandleInfo(ctypes.Structure):
+        _fields_ = [("attributes", ctypes.c_uint32),
+                    ("creation_time", ctypes.c_uint32 * 2),
+                    ("access_time", ctypes.c_uint32 * 2),
+                    ("write_time", ctypes.c_uint32 * 2),
+                    ("volume_serial", ctypes.c_uint32),
+                    ("size_high", ctypes.c_uint32), ("size_low", ctypes.c_uint32),
+                    ("links", ctypes.c_uint32),
+                    ("index_high", ctypes.c_uint32), ("index_low", ctypes.c_uint32)]
+
+    assert ctypes.sizeof(HandleInfo) == 52 and HandleInfo.volume_serial.offset == 28
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_file = kernel.CreateFileW
+    open_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                          ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    open_file.restype = wintypes.HANDLE
+    get_info = kernel.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(HandleInfo)]
+    get_info.restype = wintypes.BOOL
+    read = kernel.ReadFile
+    read.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                     ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    read.restype = wintypes.BOOL
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    handle = open_file(str(marker), 0x80000080, 7, None, 3, 0x00200000, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = HandleInfo()
+        if not get_info(handle, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        expected_size = len(b"sprig-vss-synthetic-only-v1\n") + 32 + 1
+        require(not info.attributes & (0x400 | 0x10) and info.links == 1
+                and info.size_high == 0 and info.size_low == expected_size,
+                "Snapshot volume marker is not a single-link ordinary file of the exact expected size")
+        buffer = ctypes.create_string_buffer(expected_size)
+        count = wintypes.DWORD()
+        if not read(handle, buffer, expected_size, ctypes.byref(count), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        require(count.value == expected_size, "Short snapshot volume marker read")
+        match = re.fullmatch(rb"sprig-vss-synthetic-only-v1\n([0-9A-Fa-f]{32})\n", buffer.raw)
+        require(match is not None, "Invalid snapshot volume marker format")
+        return {"serial": "%08X" % info.volume_serial,
+                "marker_token": match.group(1).decode("ascii"), "source": "snapshot_marker_handle"}
+    finally:
+        if not close(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def deterministic(domain, index, size=BLOCK):
@@ -399,19 +462,49 @@ def writer(args):
 
 
 def allocation(path, info):
+    class StandardInfo(ctypes.Structure):
+        _fields_ = [("allocation_size", ctypes.c_int64),
+                    ("end_of_file", ctypes.c_int64),
+                    ("number_of_links", ctypes.c_uint32),
+                    ("delete_pending", ctypes.c_uint8),
+                    ("directory", ctypes.c_uint8)]
+
+    # FILE_STANDARD_INFO uses byte-sized BOOLEANs, not Win32 BOOLs. Fixed-width
+    # fields let this ABI check run locally without loading or calling WinAPI.
+    assert ctypes.sizeof(StandardInfo) == 24
+    assert [getattr(StandardInfo, name).offset for name, _ in StandardInfo._fields_] == [0, 8, 16, 20, 21]
     if os.name != "nt":
         return getattr(info, "st_blocks", None) * 512 if hasattr(info, "st_blocks") else None
+    if not stat.S_ISREG(info.st_mode) or is_reparse(info):
+        return None
     from ctypes import wintypes
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    get_size = kernel.GetCompressedFileSizeW
-    get_size.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
-    get_size.restype = wintypes.DWORD
-    high = wintypes.DWORD()
-    ctypes.set_last_error(0)
-    low = get_size(str(path), ctypes.byref(high))
-    if low == 0xFFFFFFFF and ctypes.get_last_error() != 0:
+    open_file = kernel.CreateFileW
+    open_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                          ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    open_file.restype = wintypes.HANDLE
+    get_info = kernel.GetFileInformationByHandleEx
+    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    # FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING, and
+    # FILE_FLAG_OPEN_REPARSE_POINT: query this entry without following links.
+    handle = open_file(str(path), 0x80, 0x7, None, 3, 0x00200000, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
         return None
-    return (high.value << 32) | low
+    result = None
+    try:
+        standard = StandardInfo()
+        if get_info(handle, 1, ctypes.byref(standard), ctypes.sizeof(standard)):
+            if not standard.directory and not standard.delete_pending and standard.allocation_size >= 0:
+                result = standard.allocation_size
+    finally:
+        if not close(handle):
+            result = None
+    # Unknown allocation stays unknown; never substitute logical file length.
+    return result
 
 
 def measure(root):
@@ -508,9 +601,9 @@ class Sprig:
         self.binary, self.store, self.logs = str(binary), str(store), Path(logs)
         self.timeout, self.commands = timeout, []
 
-    def run(self, *args):
+    def run(self, *args, expect_failure=False):
         require(len(self.commands) < MAX_CLI_COMMANDS,
-                "Capture exceeded its fixed 8-command Sprig limit; review the storage budget before adding commands")
+                "Capture exceeded its fixed 12-command Sprig limit; review the storage budget before adding commands")
         command = [self.binary, "--store", self.store, "--json"] + list(args)
         number = len(self.commands) + 1
         out = self.logs / ("sprig-%02d.stdout.log" % number)
@@ -525,7 +618,7 @@ class Sprig:
         self.commands.append(record)
 
         def drain(pipe, log, state):
-            # Each worker holds at most one 64 KiB read and writes <= 1 MiB.
+            # Each worker holds at most one 64 KiB read and writes <= 512 KiB.
             # Continue reading/discarding on overflow (or a log-write failure)
             # so a full OS pipe cannot deadlock the child or cause unbounded RAM.
             try:
@@ -589,10 +682,17 @@ class Sprig:
         require(record["streams_drained"] and not any(record[name]["error"] for name in ("stdout", "stderr")),
                 "Sprig output drain failed; inspect bounded log metadata")
         require(not any(record[name]["overflow"] for name in ("stdout", "stderr")),
-                "Sprig output exceeded the 1 MiB per-stream limit; logs retained, JSON not parsed")
-        require(status == 0, "Sprig failed; see retained logs: " + str(err))
+                "Sprig output exceeded the 512 KiB per-stream limit; logs retained, JSON not parsed")
+        require(status != 0 if expect_failure else status == 0,
+                "Sprig unexpectedly accepted a rejection case" if expect_failure
+                else "Sprig failed; see retained logs: " + str(err))
         require(out.stat().st_size <= MAX_CLI_LOG_BYTES, "Unexpectedly large bounded Sprig log")
         envelope = json.loads(out.read_text(encoding="utf-8"))
+        if expect_failure:
+            require(envelope.get("schema_version") == 1 and isinstance(envelope.get("error"), dict),
+                    "Expected a structured Sprig rejection, not an unknown process failure")
+            record["expected_failure"] = True
+            return envelope["error"]
         require(envelope.get("schema_version") == 1 and "result" in envelope,
                 "Unexpected Sprig JSON envelope")
         result = envelope["result"]
@@ -630,6 +730,7 @@ def cas_file_content(cli, revision, expected):
 
 
 def capture(args):
+    capture_started = time.monotonic()
     require(os.name == "nt", "capture requires a Windows VSS device root; selftest is platform-independent")
     require(VSS_ROOT.fullmatch(args.snapshot_root) is not None,
             "Snapshot root must be the requester-provided VSS GLOBALROOT device path")
@@ -651,6 +752,7 @@ def capture(args):
         check_node(cursor, directory=True)
     live_marker, snapshot_marker = load_fixture(live), load_fixture(snapshot)
     require(live_marker == snapshot_marker, "Live and snapshot fixture identities differ")
+    direct_identity = snapshot_identity(args.snapshot_root) if args.direct_import else None
     work = ordinary_path(args.work_root, must_exist=False)
     store = ordinary_path(args.store, must_exist=False)
     binary = ordinary_path(args.sprig)
@@ -664,7 +766,8 @@ def capture(args):
     owner = Path(str(store) + ".sprig-vss-owner.json")
     expected_owner = {"schema_version": SCHEMA, "kind": KIND,
                       "fixture_id": live_marker["fixture_id"], "store": str(store)}
-    if store.exists():
+    new_store = not store.exists()
+    if not new_store:
         check_node(owner)
         require(owner.stat().st_size <= 16384, "Invalid store ownership marker size")
         require(json.loads(owner.read_text(encoding="utf-8")) == expected_owner,
@@ -688,6 +791,8 @@ def capture(args):
               "label": args.label, "fixture_id": live_marker["fixture_id"],
               "snapshot_root": args.snapshot_root, "snapshot_fixture": str(snapshot),
               "live_root": str(live), "store": str(store), "work_root": str(work),
+              "staging_mode": "none" if args.direct_import else "metadata_preserving_copy",
+              "cas_import_mode": "direct_snapshot" if args.direct_import else "staged_writable",
               "commands": cli.commands,
               "limitations": ["Not a volume rollback or VSS native revert test.",
                   "No guarantee of inclusion of every unflushed mmap store.",
@@ -703,21 +808,57 @@ def capture(args):
             require(previous["snapshot_inventory"] == expected,
                     "Repeated snapshot differs from settled capture; dedup comparison invalid")
         report["post_token_test"] = post_probe(live, snapshot, expected)
+        report["snapshot_oracle_seconds"] = time.monotonic() - started
         stage = work / "stage"
-        stage_snapshot(snapshot, stage, expected)
-        report["snapshot_staging_seconds"] = time.monotonic() - started
+        if not args.direct_import:
+            staging_started = time.monotonic()
+            stage_snapshot(snapshot, stage, expected)
+            report["staging_seconds"] = time.monotonic() - staging_started
+            report["snapshot_staging_seconds"] = time.monotonic() - started
+        else:
+            report["staging_seconds"] = 0.0
+            report["direct_identity"] = direct_identity
         report["staging_storage"] = measure(stage)
-        report["snapshot_read_and_staging_verified"] = True
-        if not store.exists():
+        report["snapshot_read_verified"] = True
+        report["snapshot_read_and_staging_verified"] = not args.direct_import
+        if new_store:
             # Sidecar is adjacent, exclusively created; never pre-create Sprig's store itself.
             json_new(owner, expected_owner)
             cli.run("init")
         before = cli.run("stats")
+        if args.direct_import and new_store:
+            wrong_serial = "%08X" % (int(direct_identity["serial"], 16) ^ 1)
+            marker_token = direct_identity["marker_token"]
+            wrong_marker = ("1" if marker_token[0] == "0" else "0") + marker_token[1:]
+            rejected = []
+            for label, root_arg, serial, marker_token in (
+                ("wrong-serial", str(snapshot), wrong_serial, direct_identity["marker_token"]),
+                ("wrong-marker", str(snapshot), direct_identity["serial"], wrong_marker),
+                ("invalid-root", str(live), direct_identity["serial"], direct_identity["marker_token"]),
+            ):
+                error = cli.run("snapshot-import-experiment", root_arg,
+                                "vss-reject-" + label + "-" + uuid.uuid4().hex,
+                                "--serial", serial, "--marker-token", marker_token, expect_failure=True)
+                rejected.append({"case": label, "error": error})
+            after_rejections = cli.run("stats")
+            require(all(after_rejections[key] == before[key] for key in ("branches", "revisions", "workspaces")),
+                    "Rejected direct imports changed branch, revision or workspace counts")
+            report["direct_rejection_checks"] = {"cases": rejected,
+                "stats_before": {key: before[key] for key in ("branches", "revisions", "workspaces")},
+                "stats_after": {key: after_rejections[key] for key in ("branches", "revisions", "workspaces")},
+                "counts_unchanged": True, "verification": "Combined before/after check for exactly three rejected calls"}
+            before = after_rejections
         report["sprig_stats_before_import"] = before
         report["store_storage_before_import"] = measure(store)
         name = "vss-" + args.label + "-" + uuid.uuid4().hex
         started = time.monotonic()
-        imported = cli.run("--writable", "import", str(stage), name)
+        if args.direct_import:
+            imported = cli.run("snapshot-import-experiment", str(snapshot), name,
+                               "--serial", direct_identity["serial"],
+                               "--marker-token", direct_identity["marker_token"])
+            report["direct_snapshot_import_seconds"] = time.monotonic() - started
+        else:
+            imported = cli.run("--writable", "import", str(stage), name)
         require(imported.get("backend", {}).get("kind") == "writable"
                 and imported.get("mount_state") == "unmounted", "Import is not unmounted writable CAS")
         revision = imported.get("base_revision")
@@ -753,7 +894,8 @@ def capture(args):
                 "total_object_count_delta": after_import["objects"] - before["objects"],
                 "total_object_storage_delta_bytes": after_import["object_storage_bytes"] - before["object_storage_bytes"],
                 "note": "Total objects include metadata pages. Independent imports can add fresh entry identities and metadata despite sharing every file payload chunk. Native restore, staging, revision, branch and journal overhead is retained and measured; zero total growth is not asserted."}
-        report.update(status="passed", cleanup_safe=True, all_direct_cli_children_exited=True)
+        report.update(status="passed", cleanup_safe=True, all_direct_cli_children_exited=True,
+                      capture_total_seconds=time.monotonic() - capture_started)
     except BaseException as error:
         report["error"] = str(error)
         report.update(getattr(error, "details", {}))
@@ -829,7 +971,7 @@ def selftest():
             try:
                 cli.run("stats")
             except FixtureError as error:
-                require("1 MiB per-stream limit" in str(error), "Selftest overflow failed for wrong reason")
+                require("512 KiB per-stream limit" in str(error), "Selftest overflow failed for wrong reason")
             else:
                 raise FixtureError("Selftest accepted overflowing CLI streams")
             record = cli.commands[-1]
@@ -843,7 +985,7 @@ def selftest():
             try:
                 cli.run("stats")
             except FixtureError as error:
-                require("8-command" in str(error), "Selftest command cap failed for wrong reason")
+                require("12-command" in str(error), "Selftest command cap failed for wrong reason")
             else:
                 raise FixtureError("Selftest accepted excess CLI command")
         finally:
@@ -861,7 +1003,7 @@ def selftest():
             "checks": ["deterministic sealed bytes", "exact marker/files", "flushed pre-token",
                        "full repeated hashes", "post-token restoration", "stage metadata preservation",
                        "bounded mmap and ordinary writes", "unexpected-file rejection", "storage measurement",
-                       "local Python child drains stdout/stderr beyond 1 MiB without deadlock",
+                       "local Python child drains stdout/stderr beyond 512 KiB without deadlock",
                        "CLI command ceiling", "JSON size rejected before file creation"]}
 
 
@@ -883,6 +1025,8 @@ def parser():
     for option in ("live-root", "relative-path", "work-root", "store", "sprig", "label"):
         capture_parser.add_argument("--" + option, required=True)
     capture_parser.add_argument("--previous-report")
+    capture_parser.add_argument("--direct-import", action="store_true",
+                                help="Use the explicit experimental snapshot importer without a staging copy")
     capture_parser.add_argument("--timeout", type=int, default=120)
     usage = commands.add_parser("measure", help="Read-only bounded logical/allocated storage measurement")
     usage.add_argument("paths", nargs="+")

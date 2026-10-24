@@ -108,6 +108,16 @@ struct CommitOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[cfg(all(windows, feature = "vss-experiment"))]
+    #[command(hide = true)]
+    SnapshotImportExperiment {
+        source: PathBuf,
+        name: String,
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        marker_token: String,
+    },
     #[command(name = "__writable-serve", hide = true)]
     WritableServe {
         #[arg(long)]
@@ -488,6 +498,28 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         Command::UnmountGeneration { generation } => {
             store.unmount_generation(generation)?;
             result(json!({"generation": generation, "retained": true}))
+        }
+        #[cfg(all(windows, feature = "vss-experiment"))]
+        Command::SnapshotImportExperiment {
+            source,
+            name,
+            serial,
+            marker_token,
+        } => {
+            if serial.len() != 8 || !serial.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(CliError::arguments(
+                    "serial must be eight hexadecimal digits",
+                ));
+            }
+            let serial = u32::from_str_radix(serial, 16)
+                .map_err(|_| CliError::arguments("invalid snapshot serial"))?;
+            result(sprig::vss_experiment::import(
+                &store,
+                source,
+                name,
+                serial,
+                marker_token,
+            )?)
         }
         Command::Import { source, name } => result(if cli.writable {
             store.import_writable(source, name)?

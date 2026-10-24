@@ -1038,6 +1038,19 @@ thread_local! {
 }
 
 #[cfg(test)]
+pub(crate) fn with_failed_finish<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FINISH_FAULT.with(|fault| fault.set(None));
+        }
+    }
+    FINISH_FAULT.with(|fault| fault.set(Some(FinishPhase::PayloadSynced)));
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
 fn fail_finish(phase: FinishPhase) -> Result<()> {
     if FINISH_FAULT.with(|fault| fault.get() == Some(phase)) {
         return Err(io::Error::other(format!("injected pack finish failure at {phase:?}")).into());

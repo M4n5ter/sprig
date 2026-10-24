@@ -60,12 +60,28 @@ repeated full snapshot hashes test independence from subsequent live mutations.
 Mutable concurrent files need not match the live tree or each other at a single
 application transaction boundary.
 
-The current production Windows path validator intentionally rejects device
-paths. The collector therefore stages the known snapshot files outside the live
-volume, preserving their supported metadata, then uses the actual Sprig writable
-import and native restore commands. This extra staging is explicitly measured;
-it is not a direct/lazy production VSS ingestion fast path. It does not relax the
-production no-reparse or device-path restrictions.
+The ordinary Windows path validator still rejects device paths. The original
+staged collector remains available as the baseline. The opt-in `vss-experiment`
+feature adds a hidden, synthetic-only direct-import command: it accepts exactly
+this requester-owned snapshot fixture, validates the volume marker, namespace,
+read-only no-follow handles, metadata and exact EOF, and streams content into the
+existing ObjectBatch. Store validation and durable batch completion precede
+revision/head publication. It is not a general public VSS API, a lazy mount, or
+permission to open arbitrary GLOBALROOT paths. The requester must keep its
+immutable snapshot alive throughout the call.
+
+The explicit runtime workflow uses direct import, retaining the same full-read,
+post-token, CAS listing, native-restore and repeated-content oracles. Three
+invalid identity/root calls must fail without changing state counts; unit tests
+cover read/metadata/batch-publication failures. Direct capture omits the staging
+copy, not its correctness checks, whose time remains reported separately.
+
+Baseline run [40100028865](https://github.com/M4n5ter/sprig/actions/runs/40100028865)
+passed all four captures, including active mmap/ordinary writes and exact cleanup.
+Its file-allocation fields used GetCompressedFileSizeW, which returns logical
+length for ordinary uncompressed nonsparse files. Preserve that raw evidence,
+but do not call its 428.675 MiB host file-length sample physical allocation or a
+peak. Current measurement uses FILE_STANDARD_INFO.AllocationSize instead.
 
 Report snapshot creation, snapshot reads/staging, CAS import, native restore and
 cleanup separately. Report live file logical/allocated bytes, VSS diff used and
@@ -88,4 +104,9 @@ space improvement is claimed before actual measurements.
 测试仅格式化本次新建且已核身份的1 GiB 虚拟盘（不超过已批 4 GiB 上限），差分区只在该卷内部、上限 512 MiB。
 CAS、暂存和恢复目录在卷外，额外合成输出上限 2 GiB。不改变已有卷、注册表、启动设置或信任配置。
 仅显式清理本次精确快照及新关联；不确定状态拒绝强制卸载。非持久快照仍可能随 requester 退出自动释放，不能把这种释放当成已核清理或承诺异常子进程可继续读取。
-当前收录需要显式暂存，成本全部统计，不冒称生产直读快路径或已实现全场景加速、省空间。
+原暂存收录保留作基线。当前显式试验使用 vss-experiment feature 下的受限直读入口，
+仅接受 requester 保持存活的固定快照、marker 与六文件白名单，逐只读 handle 校验身份、元数据与精确 EOF，
+复用 ObjectBatch 和 Store 持久发布次序；不是通用 GLOBALROOT 开放或正式 VSS API。
+全部恢复/重复内容/快照稳定性检查仍保留，新增错误身份与根路径拒绝测试，不改变严格 checkpoint。
+基线四轮已通过，但其 GetCompressedFileSizeW 字段对普通文件实际是逻辑长度口径，428.675 MiB 不代表物理峰值。
+新测量改用 FILE_STANDARD_INFO.AllocationSize，仍不等于卷级独占占用或连续峰值；不冒称全场景加速、省空间。

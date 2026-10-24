@@ -321,8 +321,12 @@ class Session {
         ComPtr<IVssEnumMgmtObject> items;
         HRESULT hr = on ? diff_->QueryDiffAreasOnVolume(volume(), items.put()) :
                           diff_->QueryDiffAreasForVolume(volume(), items.put());
-        ok(hr, on ? "Query diff areas ON volume" : "Query diff areas FOR volume");
-        require(static_cast<bool>(items), "Diff area query returned no enumerator");
+        // Some local providers return S_FALSE at query time. This is not
+        // evidence of emptiness: require a real enumerator and validate Next.
+        if (hr != S_FALSE) ok(hr, on ? "Query diff areas ON volume" : "Query diff areas FOR volume");
+        require(static_cast<bool>(items), hr == S_FALSE ?
+                "Diff area query returned S_FALSE with no enumerator; association state remains unverified" :
+                "Diff area query returned no enumerator");
         std::vector<Area> result;
         for (unsigned n = 0; n < 4096; ++n) {
             MgmtItem item; ULONG count = 0;

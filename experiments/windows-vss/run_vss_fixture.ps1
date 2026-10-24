@@ -383,6 +383,20 @@ function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
         $captureReport = Get-Content -LiteralPath $captureReportPath -Raw | ConvertFrom-Json
         $captureEntry.fixture = $captureReport
     }
+    # A rejected preflight is a failed trial, but can still prove that no VSS
+    # mutation or collector was started. Corroborate with independent CIM before
+    # allowing normal detach; never infer this from the process exit code alone.
+    if ($requestReport.version -eq 1 -and $requestReport.ok -eq $false -and
+        $requestReport.cleanup_safe -eq $true -and $requestReport.volume -eq $volumeGuid -and
+        $requestReport.provider_id -eq '{b5946137-7b9f-4925-af80-51abd60b20d5}' -and
+        $requestReport.child_started -eq $false -and $requestReport.child_drained -eq $true -and
+        $null -eq $requestReport.child_exit_code -and $requestReport.snapshot_created -eq $false -and
+        $null -eq $requestReport.snapshot_id -and $null -eq $requestReport.snapshot_set_id -and
+        $requestReport.snapshot_cleanup -eq 'not_needed' -and $requestReport.diff_area_cleanup -eq 'not_needed') {
+        Assert-NoOwnVssState
+        $script:runtimeUncertain = $false
+        throw "Capture $Label was refused before any VSS mutation or collector; no snapshot result exists."
+    }
     if ($exitCode -ne 0 -or $requestReport.version -ne 1 -or $requestReport.ok -ne $true -or
         $requestReport.cleanup_safe -ne $true -or $requestReport.volume -ne $volumeGuid -or
         $requestReport.provider_id -ne '{b5946137-7b9f-4925-af80-51abd60b20d5}' -or

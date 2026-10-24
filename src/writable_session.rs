@@ -9,17 +9,37 @@
 
 use std::fs;
 use std::io;
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 use std::io::Read;
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 use std::io::Write;
 use std::path::Path;
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
@@ -29,12 +49,24 @@ const STOP: &str = "writable-stop.json";
 const CLEAN: &str = "writable-clean.json";
 const STOP_TMP: &str = "writable-stop.json.tmp";
 const CLEAN_TMP: &str = "writable-clean.json.tmp";
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 const MAX_RECORD_BYTES: u64 = 4096;
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 static NEXT_NONCE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionRecord {
@@ -70,7 +102,11 @@ fn generation_name(generation: &Path) -> io::Result<&str> {
     Ok(name)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 fn validate(generation: &Path, record: &SessionRecord) -> io::Result<()> {
     if record.version != 1
         || record.generation != generation_name(generation)?
@@ -93,7 +129,11 @@ fn validate(generation: &Path, record: &SessionRecord) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 fn read_record(generation: &Path, name: &str) -> io::Result<SessionRecord> {
     let file = platform::open_regular(&generation.join(name))?;
     if platform::file_metadata(&file)?.len() > MAX_RECORD_BYTES {
@@ -110,7 +150,11 @@ fn read_record(generation: &Path, name: &str) -> io::Result<SessionRecord> {
     Ok(record)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 fn require_record(generation: &Path, name: &str, expected: &SessionRecord) -> io::Result<()> {
     validate(generation, expected)?;
     if read_record(generation, name)? != *expected {
@@ -119,7 +163,11 @@ fn require_record(generation: &Path, name: &str, expected: &SessionRecord) -> io
     Ok(())
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 fn absent(generation: &Path, name: &str) -> io::Result<bool> {
     match platform::symlink_metadata(generation.join(name)) {
         Ok(_) => Ok(false),
@@ -147,7 +195,11 @@ pub(crate) fn has_session(generation: &Path) -> io::Result<bool> {
 
 /// Also rejects stray certificates and interrupted certificate publications.
 /// Recovery must preserve the old generation, not erase these markers.
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 pub(crate) fn ensure_clean(generation: &Path) -> io::Result<()> {
     generation_name(generation)?;
     for name in [ACTIVE, STOP, CLEAN, STOP_TMP, CLEAN_TMP] {
@@ -160,7 +212,11 @@ pub(crate) fn ensure_clean(generation: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 fn write_new(generation: &Path, name: &str, record: &SessionRecord) -> io::Result<()> {
     validate(generation, record)?;
     let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
@@ -174,7 +230,11 @@ fn write_new(generation: &Path, name: &str, record: &SessionRecord) -> io::Resul
     platform::sync_directory(generation)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 pub(crate) fn begin(generation: &Path, revision: &str) -> io::Result<SessionRecord> {
     ensure_clean(generation)?;
     // This is a uniqueness tag, not an authentication secret. create_new and
@@ -197,7 +257,11 @@ pub(crate) fn begin(generation: &Path, revision: &str) -> io::Result<SessionReco
     Ok(record)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 fn publish(
     generation: &Path,
     name: &str,
@@ -216,7 +280,11 @@ fn publish(
     platform::sync_directory(generation)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 pub(crate) fn request_stop(generation: &Path) -> io::Result<SessionRecord> {
     let record = read_record(generation, ACTIVE)?;
     publish(generation, STOP, STOP_TMP, &record)?;
@@ -224,7 +292,11 @@ pub(crate) fn request_stop(generation: &Path) -> io::Result<SessionRecord> {
 }
 
 /// Missing stop is ordinary while running; a missing active marker is not.
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 pub(crate) fn read_stop(generation: &Path, expected: &SessionRecord) -> io::Result<bool> {
     require_record(generation, ACTIVE, expected)?;
     if absent(generation, STOP)? {
@@ -234,7 +306,11 @@ pub(crate) fn read_stop(generation: &Path, expected: &SessionRecord) -> io::Resu
     Ok(true)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 pub(crate) fn acknowledge(generation: &Path, expected: &SessionRecord) -> io::Result<()> {
     if !read_stop(generation, expected)? {
         return Err(invalid(
@@ -246,7 +322,11 @@ pub(crate) fn acknowledge(generation: &Path, expected: &SessionRecord) -> io::Re
 
 /// Call only after normal unmount and daemon lease release. Never call from
 /// Filesystem::destroy. Every missing marker, including on retry, is an error.
-#[cfg(any(test, all(target_os = "linux", feature = "projection")))]
+#[cfg(any(
+    test,
+    all(target_os = "linux", feature = "projection"),
+    all(windows, feature = "windows-mount")
+))]
 pub(crate) fn finish_stop(generation: &Path, expected: &SessionRecord) -> io::Result<()> {
     for name in [ACTIVE, STOP, CLEAN] {
         require_record(generation, name, expected)?;
@@ -264,6 +344,26 @@ pub(crate) fn finish_stop(generation: &Path, expected: &SessionRecord) -> io::Re
     // Active is removed last, so an interrupted cleanup cannot advertise a
     // clean generation before removal of the associated certificates is durable.
     fs::remove_file(generation.join(ACTIVE))?;
+    platform::sync_directory(generation)
+}
+
+/// Only the Windows controller uses this to bind its ready/busy handshakes.
+#[cfg(all(windows, feature = "windows-mount"))]
+pub(crate) fn active_record(generation: &Path) -> io::Result<SessionRecord> {
+    read_record(generation, ACTIVE)
+}
+
+/// A busy stop request may be cancelled, but never a certified or uncertain stop.
+#[cfg(all(windows, feature = "windows-mount"))]
+pub(crate) fn cancel_stop(generation: &Path, expected: &SessionRecord) -> io::Result<()> {
+    require_record(generation, ACTIVE, expected)?;
+    require_record(generation, STOP, expected)?;
+    for name in [CLEAN, CLEAN_TMP, STOP_TMP] {
+        if !absent(generation, name)? {
+            return Err(invalid("cannot cancel a certified or interrupted stop"));
+        }
+    }
+    fs::remove_file(generation.join(STOP))?;
     platform::sync_directory(generation)
 }
 

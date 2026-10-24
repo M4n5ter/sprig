@@ -24,6 +24,10 @@ pub mod writable_fuse;
 #[cfg(all(target_os = "linux", feature = "projection"))]
 pub mod writable_lifecycle;
 mod writable_session;
+#[cfg(all(windows, feature = "windows-mount"))]
+pub mod writable_windows;
+#[cfg(all(windows, feature = "windows-mount"))]
+pub mod writable_windows_lifecycle;
 
 pub use blame::{BlameLine, LineBlame as Blame};
 pub use copy_tree::CopyMode;

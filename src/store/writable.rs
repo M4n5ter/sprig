@@ -4,6 +4,10 @@
 
 use super::*;
 use crate::writable::WritableCas;
+#[cfg(all(target_os = "linux", feature = "projection"))]
+use crate::writable_lifecycle as writable_mount;
+#[cfg(all(windows, feature = "windows-mount"))]
+use crate::writable_windows_lifecycle as writable_mount;
 
 impl Store {
     pub(super) fn writable_core(&self, workspace: &Workspace) -> Result<WritableCas> {
@@ -67,7 +71,7 @@ impl Store {
     }
 
     /// Creates an owned CAS workspace without requiring a filesystem mount.
-    /// Configure the executable and explicitly mount it for ordinary Linux tools.
+    /// Configure the executable and explicitly mount it using a supported platform adapter.
     pub fn import_writable(&self, source: &Path, name: &str) -> Result<WorkspaceResult> {
         let _lock = self.lock()?;
         let mut state = self.state()?;
@@ -185,16 +189,20 @@ impl Store {
 
 impl Store {
     pub(super) fn writable_mount_state(&self, workspace: &Workspace) -> String {
-        #[cfg(all(target_os = "linux", feature = "projection"))]
+        #[cfg(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        ))]
         {
-            match crate::writable_lifecycle::inspect(
-                &self.root.join("native").join(&workspace.directory),
-            ) {
+            match writable_mount::inspect(&self.root.join("native").join(&workspace.directory)) {
                 Ok(state) => format!("{state:?}").to_ascii_lowercase(),
                 Err(error) => format!("broken: {error}"),
             }
         }
-        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        )))]
         {
             let _ = workspace;
             "unmounted".into()
@@ -205,19 +213,24 @@ impl Store {
         let WorkspaceBackend::Writable { revision } = &workspace.backend else {
             return Err(failure("not a writable CAS workspace"));
         };
-        #[cfg(all(target_os = "linux", feature = "projection"))]
+        #[cfg(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        ))]
         {
+            #[cfg(target_os = "linux")]
             self.require_projection_support()?;
             let generation = self.root.join("native").join(&workspace.directory);
+            #[cfg(target_os = "linux")]
             use crate::projection::lifecycle::MountState;
-            match crate::writable_lifecycle::inspect(&generation)? {
-                MountState::Mounted => {
-                    crate::writable_lifecycle::verify_binding(&generation, revision)
-                }
+            #[cfg(windows)]
+            use writable_mount::MountState;
+            match writable_mount::inspect(&generation)? {
+                MountState::Mounted => writable_mount::verify_binding(&generation, revision),
                 MountState::Partial => Err(failure(
                     "writable mount is partial; normal unmount is required",
                 )),
-                MountState::Unmounted => crate::writable_lifecycle::start(
+                MountState::Unmounted => writable_mount::start(
                     &self.root,
                     revision,
                     &generation,
@@ -229,23 +242,31 @@ impl Store {
                 ),
             }
         }
-        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        )))]
         {
             let _ = (revision, initialize);
             Err(failure(
-                "writable filesystem mount requires Linux and the projection feature; SDK operations remain available",
+                "writable filesystem mount requires Linux/projection or Windows/windows-mount; SDK operations remain available",
             ))
         }
     }
 
     pub(super) fn stop_writable(&self, workspace: &Workspace) -> Result<()> {
-        #[cfg(all(target_os = "linux", feature = "projection"))]
+        #[cfg(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        ))]
         {
             let generation = self.root.join("native").join(&workspace.directory);
-            if crate::writable_lifecycle::inspect(&generation)?
-                != crate::projection::lifecycle::MountState::Unmounted
-            {
-                crate::writable_lifecycle::stop(&generation)?;
+            #[cfg(target_os = "linux")]
+            use crate::projection::lifecycle::MountState;
+            #[cfg(windows)]
+            use writable_mount::MountState;
+            if writable_mount::inspect(&generation)? != MountState::Unmounted {
+                writable_mount::stop(&generation)?;
             }
         }
         // A disappearing mount is not proof that the daemon released its journal.
@@ -268,6 +289,35 @@ impl Store {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    #[cfg(all(windows, feature = "windows-mount"))]
+    pub fn serve_writable(root: &Path, revision: &str, generation: &str) -> Result<()> {
+        validate_name(generation)?;
+        if !valid_hash(revision) {
+            return Err(failure("invalid writable base revision"));
+        }
+        require_directory(root)?;
+        let store = Store {
+            root: root.canonicalize()?,
+            projection_executable: None,
+        };
+        store.state()?;
+        let workspace = Workspace {
+            backend: WorkspaceBackend::Writable {
+                revision: revision.into(),
+            },
+            branch: "serving".into(),
+            base_revision: revision.into(),
+            directory: generation.into(),
+            observed: Observed::new(),
+            observation_epoch: None,
+            pending: None,
+        };
+        let path = store.root.join("native").join(generation);
+        let startup = writable_mount::take_start_lock(&path)?;
+        let core = store.writable_core(&workspace)?;
+        writable_mount::serve(std::sync::Arc::new(core), &path, revision, startup)
     }
 
     #[cfg(all(target_os = "linux", feature = "projection"))]

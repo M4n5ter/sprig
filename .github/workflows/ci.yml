@@ -9,6 +9,11 @@ on:
         type: boolean
         required: false
         default: false
+      windows_mount:
+        description: 'Explicitly install approved WinFsp runtime and SDK on this disposable runner'
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 jobs:
@@ -60,6 +65,19 @@ jobs:
           path: |
             ${{ runner.temp }}/sprig-refs-*/result.json
             ${{ runner.temp }}/sprig-refs-*/diskpart.log
+          if-no-files-found: warn
+      - name: Explicit optional Windows mount validation
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.windows_mount
+        shell: pwsh
+        run: ./tests/winfsp_workflow.ps1 -AllowRuntimeInstallation
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.windows_mount
+        with:
+          name: windows-mount-result
+          path: |
+            ${{ runner.temp }}/sprig-winfsp-*/result.json
+            ${{ runner.temp }}/sprig-winfsp-*/install.log
+            ${{ runner.temp }}/sprig-winfsp-*/mount-result.json
           if-no-files-found: warn
       - name: Build optimized example binary
         if: runner.os != 'Windows'

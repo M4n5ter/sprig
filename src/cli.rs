@@ -16,7 +16,7 @@ use sprig::{CopyMode, MergeStrategy, Mutation, Store};
     about = "Native filesystem workspaces with content-addressed revision history"
 )]
 #[command(
-    after_help = "Workspaces are real directories, not sandboxes. Stop external writers before capturing a revision. Use COMMAND --help for details."
+    after_help = "Workspaces are real directories, not sandboxes. Stop external writers before capturing a revision. Use COMMAND --help for details. Optional Windows mount: WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos; https://github.com/winfsp/winfsp"
 )]
 struct Cli {
     /// Store directory. Use a new path for `init`.
@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, global = true)]
     projected: bool,
 
-    /// Create an owned writable CAS journal. Use mount explicitly for Linux tools.
+    /// Create an owned writable CAS journal. Use mount explicitly with a supported filesystem adapter.
     #[arg(long, global = true, conflicts_with = "projected")]
     writable: bool,
 
@@ -414,16 +414,22 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         generation,
     } = &cli.command
     {
-        #[cfg(all(target_os = "linux", feature = "projection"))]
+        #[cfg(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        ))]
         {
             Store::serve_writable(&cli.store, revision, generation)?;
             return Ok(Output::Exit(0));
         }
-        #[cfg(not(all(target_os = "linux", feature = "projection")))]
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "projection"),
+            all(windows, feature = "windows-mount")
+        )))]
         {
             let _ = (revision, generation);
             return Err(CliError::arguments(
-                "writable mount requires Linux and the projection feature",
+                "writable mount requires Linux/projection or Windows/windows-mount",
             ));
         }
     }

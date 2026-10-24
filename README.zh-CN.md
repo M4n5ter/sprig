@@ -443,7 +443,7 @@ Windows 的 `exec` 通过继承的独占访问文件句柄维持租约。在多�
 它共用现有 Store、修订、合并引擎、分支 CAS、可恢复代际与 SDK 事务。import、fork、
 checkout 和 restore 创建后**不自动挂载**。SDK 的 write、edit、apply、mkdir、rm、cp、
 mv 无需挂载即可使用。Linux 在启用 `--features projection` 后可显式挂载供普通程序访问；
-不安装驱动或持久提权组件。Windows 与 macOS 不提供这个可写文件系统适配器。
+不安装驱动或持久提权组件。Windows 可选使用下文范围较窄的适配器；macOS 尚无 owned 挂载适配器。
 
 ```sh
 sprig --store "$STORE" --writable import "$SOURCE" owned
@@ -513,7 +513,7 @@ cargo build --locked --features projection
 sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 ```
 
-CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。项目尚未选择许可证。
+CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。Sprig 采用 MIT 许可证。
 
 Ubuntu 24.04 的 [Linux 映射工作区检查](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
 已验证 C 编译与执行、现有 ELF 执行、私有和共享映射、别名与进程间一致性、`msync`、
@@ -526,3 +526,33 @@ Ubuntu 24.04 的 [Linux 映射工作区检查](https://github.com/M4n5ter/sprig/
 无修改与恢复后的构建均为 `Fresh`；增量缓存硬链接成功，未出现 rustc 的复制回退警告。
 同一检查覆盖别名写入、链接数与投影链接组重挂载后的隔离。
 这不代表所有 Cargo 项目都兼容或更快。
+
+## 许可证
+
+Sprig 采用 [MIT 许可证](LICENSE)。第三方依赖保留各自的许可证；该声明不改变外部文件系统运行时的许可。
+
+### 可选 Windows owned 挂载
+
+使用 MSVC 工具链以及明确安装的 WinFsp 2.1 runtime 和开发 SDK，通过
+`cargo build --locked --release --features windows-mount` 构建。
+Sprig 不负责安装或更新运行时。此可选适配器目前正在进行真实运行验证，普通原生工作区
+和未挂载 SDK 工作区不依赖它。通过 `--writable` 创建工作区后，使用与 Linux 相同的
+`mount`、`checkpoint` 和 `unmount` 命令。
+
+挂载视图支持名称与时间戳可由 Windows 表示的普通文件和目录。硬链接别名、符号链接、
+命名数据流、自定义 ACL 修改及不支持的元数据均明确拒绝，不做静默转换。
+原生及未挂载 SDK 后端仍保留硬链接能力。这不代表完整 NTFS 或 Linux 文件系统对等。
+挂载安全描述符固定为当前账户；请确保后备 Store 仅供该账户访问。
+
+检查点先阻止新打开，若仍有文件描述符或映射则拒绝继续；正常停止先刷新卷和日志，
+再为确切会话生成完成证书。Cleanup 不等于最终 Close，尚未完成的分页 I/O 仍保留文件上下文。
+会话中断或失败时保留日志，并阻止普通写入和检查点，直至显式恢复到另一个工作区。
+CLI 不强制卸载、不杀进程、不安装驱动，也不重启机器。
+
+显式 `windows_mount` CI 输入仅在一次性托管 Windows runner 安装已批准的运行时，
+检查哈希与签名，然后执行组件与真实挂载生命周期测试。默认 CI 不安装它。
+
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+（[上游](https://github.com/winfsp/winfsp)）。WinFsp 保留自身的
+[许可证及 FLOSS 例外](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/License.txt)。
+可选 `winfsp_wrs` 绑定采用 MIT；Sprig 的 MIT 不重新授权运行时，也不替代其条款。

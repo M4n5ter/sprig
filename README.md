@@ -787,7 +787,7 @@ CAS, recoverable generations and SDK transactions. Import, fork, checkout and
 restore create it **unmounted**. SDK `write`, `edit`, `apply`, `mkdir`, `rm`, `cp`
 and `mv` work without a mount. Linux builds with `--features projection` can
 explicitly mount it for ordinary programs; no driver or persistent helper is
-installed. Windows and macOS do not expose this writable filesystem adapter.
+installed. Windows has the optional, narrower adapter below; macOS has no owned mount adapter.
 
 ```sh
 sprig --store "$STORE" --writable import "$SOURCE" owned
@@ -879,7 +879,7 @@ sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 
 The CLI is a thin adapter over the Rust library. Tests cover history, concurrent
 workspaces, merges, line attribution, transactions, recovery, storage integrity,
-native backends and CLI parsing. No project license has been selected.
+native backends and CLI parsing. Sprig uses the MIT license.
 
 The [Linux mapped-workspace check](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
 on Ubuntu 24.04 verified C compilation/execution, existing ELF execution, private
@@ -895,3 +895,41 @@ with executed-output checks. No-op and restored builds were `Fresh`; incremental
 cache hardlinks succeeded without rustc's copying-fallback warning. The same
 check exercised alias writes, link counts and projected-group remount isolation.
 This does not establish compatibility or speed for every Cargo project.
+
+## License
+
+Sprig is licensed under the [MIT License](LICENSE). Third-party dependencies
+retain their own licenses; this does not relicense external filesystem runtimes.
+
+### Optional Windows owned mount
+
+Build with `cargo build --locked --release --features windows-mount` using the
+MSVC toolchain and an explicitly installed WinFsp 2.1 runtime and developer SDK.
+Sprig does not install or update the runtime. This optional adapter is currently
+under runtime validation; ordinary native and unmounted SDK workspaces remain
+independent of it. After creating an owned workspace with `--writable`, use the
+same `mount`, `checkpoint` and `unmount` commands as on Linux.
+
+The mounted view accepts regular files and directories with Windows-representable
+names and timestamps. It rejects hardlink aliases, symlinks, named streams,
+custom ACL changes and unsupported metadata instead of silently converting them.
+The native and unmounted SDK backends retain their hardlink support. This is not
+full NTFS or Linux filesystem parity. The mounted security descriptor is fixed
+for the current account; keep the backing Store private to that account.
+
+Checkpoint gates new opens and refuses live descriptors or mapped sections;
+normal stop flushes the volume and journal before certifying the exact session.
+Cleanup is not final Close: pending paging I/O keeps its file context alive.
+An interrupted or failed session retains its journal and blocks ordinary writes
+and checkpoint until explicit recovery to another workspace. No forced detach,
+process kill, driver installation or reboot is performed by the CLI.
+
+The opt-in `windows_mount` CI input installs the approved runtime only on a
+disposable hosted Windows runner, checks its checksum and signature, and runs
+component and mounted lifecycle tests. Default CI does not install it.
+
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+([upstream](https://github.com/winfsp/winfsp)). WinFsp retains its own
+[license and FLOSS exception](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/License.txt).
+The optional `winfsp_wrs` binding is MIT-licensed; Sprig's MIT license does not
+relicense the runtime or replace its terms.

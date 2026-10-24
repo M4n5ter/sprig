@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Small native-filesystem workspace snapshots"
 publish = false
+license = "MIT"
 
 [profile.dev]
 debug = 0
@@ -17,9 +18,14 @@ incremental = false
 [features]
 default = []
 projection = ["dep:fuser"]
+windows-mount = ["dep:winfsp_wrs", "dep:windows-sys"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "=0.16.0", optional = true, default-features = false, features = ["abi-7-31"] }
+
+[target.'cfg(windows)'.dependencies]
+winfsp_wrs = { version = "=0.4.0", optional = true }
+windows-sys = { version = "=0.52.0", optional = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_IO", "Win32_System_LibraryLoader"] }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

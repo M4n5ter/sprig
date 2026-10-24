@@ -4,6 +4,7 @@ use sprig::{Result, Store};
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +54,58 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
         );
         completed.push("namespace_holes_flush_busy_hardlink_rejection");
 
+        let exclusive = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(view.path.join("renamed.txt"))?;
+        let denied = OpenOptions::new()
+            .read(true)
+            .open(view.path.join("renamed.txt"))
+            .unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(32));
+        drop(exclusive);
+        let mut renamed_handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(view.path.join("renamed.txt"))?;
+        fs::rename(view.path.join("renamed.txt"), view.path.join("moved.txt"))?;
+        renamed_handle.seek(SeekFrom::Start(0))?;
+        let mut still_open = Vec::new();
+        renamed_handle.read_to_end(&mut still_open)?;
+        assert_eq!(still_open, b"abc\0\0\0\0Z");
+        renamed_handle.seek(SeekFrom::Start(0))?;
+        renamed_handle.write_all(b"A")?;
+        renamed_handle.sync_all()?;
+        drop(renamed_handle);
+        fs::rename(view.path.join("moved.txt"), view.path.join("renamed.txt"))?;
+        fs::write(view.path.join("delete-open.txt"), b"detached")?;
+        let mut detached = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(view.path.join("delete-open.txt"))?;
+        fs::remove_file(view.path.join("delete-open.txt"))?;
+        detached.seek(SeekFrom::Start(0))?;
+        let mut old = Vec::new();
+        detached.read_to_end(&mut old)?;
+        assert_eq!(old, b"detached");
+        detached.seek(SeekFrom::Start(0))?;
+        detached.write_all(b"retained")?;
+        detached.sync_all()?;
+        drop(detached);
+        assert!(!view.path.join("delete-open.txt").exists());
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(view.path.join("directory"))?;
+        assert!(
+            store
+                .checkpoint("main", "directory remains busy", None)
+                .is_err()
+        );
+        drop(directory);
+        completed.push("share_modes_rename_open_delete_open_directory_busy");
+
         let mapped = OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,11 +150,11 @@ fn windows_owned_mount_commit_and_lifetime() -> Result<()> {
         completed.push("mapped_flush_final_close_barrier");
         let commit = store.checkpoint("main", "Windows owned changes", None)?;
         let now = store.mount_workspace("main")?;
-        assert_eq!(fs::read(now.path.join("renamed.txt"))?, b"abc\0\0\0\0Z");
+        assert_eq!(fs::read(now.path.join("renamed.txt"))?, b"Abc\0\0\0\0Z");
         assert_eq!(fs::read(now.path.join("mapped.bin"))?[17], 91);
         assert_eq!(
             store.read(&commit.revision, "renamed.txt")?,
-            b"abc\0\0\0\0Z"
+            b"Abc\0\0\0\0Z"
         );
         store.restore_writable(&commit.revision, "restored")?;
         let restored = store.mount_workspace("restored")?;

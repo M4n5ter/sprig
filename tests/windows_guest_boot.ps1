@@ -535,17 +535,18 @@ try {
     Complete-Phase
 
     Start-Phase 'normal-guest-reboot'
-    $accepted = @(Invoke-Guest {
-        # The child contains only this fixed command, never a credential. Delay
-        # briefly so PS Direct can acknowledge it; /t 0 avoids implicit /f.
-        $childCommand = 'Start-Sleep -Seconds 3; & (Join-Path $env:SystemRoot ''System32\shutdown.exe'') /r /t 0'
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCommand))
-        $child = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) -PassThru -ErrorAction Stop
-        if ($null -eq $child -or $child.Id -le 0) { throw 'guest-normal-reboot-not-accepted' }
-        $child.Dispose()
-        $true
-    } 60)
-    if ($accepted.Count -ne 1 -or $accepted[0] -ne $true) { throw 'guest-reboot-request-unverified' }
+    Assert-VMIsolation
+    # A successful normal power transition may disconnect PowerShell Direct
+    # before it returns. This request is never treated as completion: only the
+    # independent new boot time / VM Off observation below can prove success.
+    try {
+        $null = Invoke-Guest {
+            & "$env:SystemRoot\System32\shutdown.exe" /r /t 0
+            if ($LASTEXITCODE -ne 0) { throw 'guest-normal-reboot-not-accepted' }
+        } 60
+        $phase['requestReturned'] = $true
+    } catch { $phase['requestReturned'] = $false }
+
     $result.secondBoot = Wait-GuestReady 480 $result.firstBoot.lastBootUpTimeUtc
     $result.rebootObserved = $true
     Remove-GuestAnswerFiles
@@ -572,17 +573,18 @@ try {
     Complete-Phase
 
     Start-Phase 'normal-guest-shutdown'
-    $accepted = @(Invoke-Guest {
-        # The child contains only this fixed command, never a credential. Delay
-        # briefly so PS Direct can acknowledge it; /t 0 avoids implicit /f.
-        $childCommand = 'Start-Sleep -Seconds 3; & (Join-Path $env:SystemRoot ''System32\shutdown.exe'') /s /t 0'
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCommand))
-        $child = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) -PassThru -ErrorAction Stop
-        if ($null -eq $child -or $child.Id -le 0) { throw 'guest-normal-shutdown-not-accepted' }
-        $child.Dispose()
-        $true
-    } 60)
-    if ($accepted.Count -ne 1 -or $accepted[0] -ne $true) { throw 'guest-shutdown-request-unverified' }
+    Assert-VMIsolation
+    # A successful normal power transition may disconnect PowerShell Direct
+    # before it returns. This request is never treated as completion: only the
+    # independent new boot time / VM Off observation below can prove success.
+    try {
+        $null = Invoke-Guest {
+            & "$env:SystemRoot\System32\shutdown.exe" /s /t 0
+            if ($LASTEXITCODE -ne 0) { throw 'guest-normal-shutdown-not-accepted' }
+        } 60
+        $phase['requestReturned'] = $true
+    } catch { $phase['requestReturned'] = $false }
+
     $shutdownDeadline = [DateTime]::UtcNow.AddSeconds((Get-RemainingSeconds 180))
     while ([DateTime]::UtcNow -lt $shutdownDeadline -and (Get-OwnedVM).State -ne 'Off') { Start-Sleep -Seconds 3 }
     if ((Get-OwnedVM).State -ne 'Off') { throw 'normal-guest-shutdown-deadline-exceeded' }

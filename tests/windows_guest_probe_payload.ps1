@@ -163,11 +163,11 @@ switch ($Mode) {
         $j = $h.text | ConvertFrom-Json
         if ($j.outcome -notin @('no_in_hold_ack_observed','falsified','inconclusive') -or $j.retention_required -or -not $j.owned_fixture_cleanup_completed) { throw 'probe-uncertain-result-retain-guest' }
         # Reconstruct source-defined diagnostic fields only, never arbitrary stdout.
-        if ($j.schema -ne 'sprig.mapping-freeze.v1' -or $j.architecture -ne 'x64' -or $j.reason -notmatch '^[a-z0-9_]{1,80}$' -or
+        if ($j.schema -ne 'sprig.mapping-freeze.v1' -or $j.architecture -ne 'x64' -or $j.reason -notmatch '^[a-z0-9_]{1,80}$' -or $j.root_validation_call -notin @('not_started','exact_drive_root','open_root_handle','root_handle_metadata','root_volume_information_by_handle','root_volume_binding','passed') -or
             ($j.outcome -eq 'no_in_hold_ack_observed' -and $h.code -ne 0) -or
             ($j.outcome -eq 'falsified' -and $h.code -ne 1) -or
             ($j.outcome -eq 'inconclusive' -and $h.code -ne 2)) { throw 'probe-result-envelope-invalid' }
-        $safe = [ordered]@{ outcome=[string]$j.outcome;reason=[string]$j.reason;win32Error=[uint32]$j.win32_error; exitCode=[int]$h.code; retentionRequired=[bool]$j.retention_required; fixtureCleanup=[bool]$j.owned_fixture_cleanup_completed; wholeTreeSnapshotVerified=$false; backingStoreSnapshotVerified=$false; negativeControlValid=[bool]$j.negative.negative_control_valid; negative=(SafeTrial $j.negative);coherency=(SafeTrial $j.coherency);verifierActive=$verifierActive;verifierQuerySha256=$verifierQuerySha256 }
+        $safe = [ordered]@{ outcome=[string]$j.outcome;reason=[string]$j.reason;rootValidationCall=[string]$j.root_validation_call;win32Error=[uint32]$j.win32_error; exitCode=[int]$h.code; retentionRequired=[bool]$j.retention_required; fixtureCleanup=[bool]$j.owned_fixture_cleanup_completed; wholeTreeSnapshotVerified=$false; backingStoreSnapshotVerified=$false; negativeControlValid=[bool]$j.negative.negative_control_valid; negative=(SafeTrial $j.negative);coherency=(SafeTrial $j.coherency);verifierActive=$verifierActive;verifierQuerySha256=$verifierQuerySha256 }
         $probeStage='normal-stop-own-services'
         StopOwnServices
         $safe['normalMemfsStop']=$true

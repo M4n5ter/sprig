@@ -823,6 +823,15 @@ try {
         $result.cleanup.directoryRemoved = $true
         $result.credentialHandling.fixtureRemoved = $true
     } catch { $cleanupErrors.Add('owned-fixture-removal-failed') }
+    if ($AllowKernelProbe -and $null -ne $result.hostBoot -and $result.cleanup.vmRemoved -and -not $nativeUnsettled) {
+        try {
+            $finalHostBoot = Get-HostBootFingerprint
+            $result.hostBoot['afterGuestExperiment'] = $finalHostBoot
+            if ($result.hostBoot.before.systemStoreSha256 -ne $finalHostBoot.systemStoreSha256 -or
+                $result.hostBoot.before.firmwareEntriesSha256 -ne $finalHostBoot.firmwareEntriesSha256) { throw 'host-boot-fingerprint-changed' }
+            $result.hostBoot['unchangedAfterGuestExperiment'] = $true
+        } catch { $cleanupErrors.Add('host-final-boot-fingerprint-unverified') }
+    }
     $answerXml = $null
     $password = $null
     $guestCredential = $null

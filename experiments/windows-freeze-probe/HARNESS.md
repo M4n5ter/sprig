@@ -1,8 +1,8 @@
 # Live-mapping falsification harness
 
 `freeze_probe.c` is original MIT-licensed x64 Win32 C source for a deliberately
-narrow, disposable-guest experiment. Source preparation is complete; it has not
-been compiled or run. This document is not a successful test report.
+narrow, disposable-guest experiment. Build-only CI has compiled this harness. Runtime outcomes are recorded in each
+workflow artifact; this document is not a successful freezing test report.
 
 ## Authorization and environment boundary
 
@@ -23,11 +23,11 @@ freeze_probe.exe --allow-experiment R:\
 
 Here `R:\` must be replaced with the operator-owned RAM mount root. Passing this
 argument is the operator's assertion of ownership and RAM-backend suitability;
-the harness cannot prove either from a filesystem label. It validates that:
+the harness cannot prove either from a filesystem label. It validates the root through an opened directory handle, not the MountManager-dependent GetVolumePathName API. It validates that:
 
-- The argument is the actual local DOS drive/directory volume root, not a child
+- The argument is the exact local DOS drive root, not a child
   directory, UNC share, device-namespace path, or ADS path.
-- `GetVolumeInformationW` reports a name containing `SPRIGPROBE`, allowing a
+- `GetVolumeInformationByHandleW` reports a name containing `SPRIGPROBE`, allowing a
   WinFsp-provided prefix. Each newly created handle is checked against the same
   volume serial and marker. The kernel independently requires its configured
   filesystem-name suffix to be exactly `-SPRIGPROBE`.

@@ -372,42 +372,53 @@ static BOOL has_probe_marker(const wchar_t *name)
             return TRUE;
     return FALSE;
 }
+static const char *gRootValidation = "not_started";
 static BOOL check_mount_root(const wchar_t *argument, wchar_t *root,
                              DWORD rootCount, DWORD *serial, DWORD *error)
 {
-    wchar_t volumeRoot[32768], fs[256];
-    DWORD n, flags, maxComponent, attr;
-    size_t len;
+    wchar_t fs[256];
+    DWORD n, flags, maxComponent;
+    BY_HANDLE_FILE_INFORMATION info;
+    HANDLE handle;
+    BOOL ok = FALSE;
     *error = ERROR_INVALID_NAME;
-    /* Reject relative paths, UNC shares, device namespaces, and ADS syntax.
-     * This deliberately supports only a local DOS drive or directory mount.
-     */
-    if (!argument || wcslen(argument) < 3 ||
+    gRootValidation = "exact_drive_root";
+    /* Only the exact newly owned DOS drive root is supported. No relative,
+     * directory mount, UNC, device namespace or ADS path is accepted. */
+    if (!argument || wcslen(argument) != 3 ||
         !((argument[0] >= L'A' && argument[0] <= L'Z') ||
           (argument[0] >= L'a' && argument[0] <= L'z')) ||
-        argument[1] != L':' || (argument[2] != L'\\' && argument[2] != L'/') ||
-        wcschr(argument + 2, L':')) return FALSE;
+        argument[1] != L':' || argument[2] != L'\\') return FALSE;
     n = GetFullPathNameW(argument, rootCount, root, NULL);
-    if (!n || n >= rootCount - 1) { *error = GetLastError(); return FALSE; }
-    len = wcslen(root);
-    while (len > 3 && (root[len - 1] == L'\\' || root[len - 1] == L'/'))
-        root[--len] = 0;
-    if (root[len - 1] != L'\\') { root[len++] = L'\\'; root[len] = 0; }
-    attr = GetFileAttributesW(root);
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        *error = attr == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_DIRECTORY;
-        return FALSE;
+    if (n != 3 || n >= rootCount) { *error = GetLastError(); return FALSE; }
+    /* Upstream volpath-test.c documents GetVolumePathName as unreliable for
+     * non-MountManager mounts. Bind the actual open root instead, exactly as
+     * each subsequent file handle is bound to its volume below. */
+    gRootValidation = "open_root_handle";
+    handle = CreateFileW(root, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (handle == INVALID_HANDLE_VALUE) { *error = GetLastError(); return FALSE; }
+    gRootValidation = "root_handle_metadata";
+    if (!GetFileInformationByHandle(handle, &info)) { *error = GetLastError(); goto done; }
+    if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        *error = ERROR_DIRECTORY; goto done;
     }
-    if (!GetVolumePathNameW(root, volumeRoot, 32768)) { *error = GetLastError(); return FALSE; }
-    if (_wcsicmp(root, volumeRoot) != 0) return FALSE;
-    if (!GetVolumeInformationW(root, NULL, 0, serial, &maxComponent, &flags, fs, 256)) {
-        *error = GetLastError(); return FALSE;
+    gRootValidation = "root_volume_information_by_handle";
+    if (!GetVolumeInformationByHandleW(handle, NULL, 0, serial,
+                                      &maxComponent, &flags, fs, 256)) {
+        *error = GetLastError(); goto done;
     }
-    /* WinFsp may prefix FileSystemName. The driver independently requires its
-     * configured suffix to be exactly -SPRIGPROBE. A name is not proof of RAM.
-     */
-    if (!has_probe_marker(fs)) { *error = ERROR_NOT_SUPPORTED; return FALSE; }
-    return TRUE;
+    gRootValidation = "root_volume_binding";
+    if (info.dwVolumeSerialNumber != *serial || !has_probe_marker(fs)) {
+        *error = ERROR_NOT_SUPPORTED; goto done;
+    }
+    gRootValidation = "passed";
+    ok = TRUE;
+done:
+    CloseHandle(handle);
+    return ok;
 }
 static BOOL create_fixture(FILE_FIXTURE *f, const wchar_t *root, DWORD serial,
                            ULONGLONG nonce, DWORD *error)
@@ -944,10 +955,10 @@ static void print_report(const char *outcome, const char *reason, DWORD error,
                          const TRIAL *positive)
 {
     printf("{\"schema\":\"sprig.mapping-freeze.v1\",\"architecture\":\"x64\","
-           "\"outcome\":\"%s\",\"reason\":\"%s\",\"win32_error\":%lu,"
+           "\"outcome\":\"%s\",\"reason\":\"%s\",\"win32_error\":%lu,\"root_validation_call\":\"%s\","
            "\"retention_required\":%s,\"owned_fixture_cleanup_completed\":%s,"
            "\"backing_store_snapshot_verified\":false,\"whole_tree_snapshot_verified\":false,"
-           "\"negative\":", outcome, reason, (unsigned long)error,
+           "\"negative\":", outcome, reason, (unsigned long)error, gRootValidation,
            boolean(retention), boolean(cleaned));
     print_trial(negative);
     printf(",\"coherency\":"); print_trial(positive);

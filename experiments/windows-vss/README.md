@@ -25,14 +25,17 @@ The dispatch-only workflow compiles using the runner's existing official Visual
 Studio/Windows SDK. The runtime input defaults to false. Enabling it requires the
 explicitly approved disposable-runner test scope:
 
-- A new, identity-checked dynamic VHDX, maximum 4 GiB, containing only a new NTFS
+- A new, identity-checked dynamic VHDX, 1 GiB (within the approved 4 GiB maximum), containing only a new NTFS
   volume. No existing disk is initialized or formatted.
 - Exactly the Microsoft system provider, with a maximum 512 MiB diff association
   from the new volume to itself. Existing associations are not resized. A larger
   system minimum or unsupported volume causes refusal, not a registry change or
   quota increase.
 - CAS, temporary staging, restored trees and logs outside the snapshotted volume,
-  with a 2 GiB synthetic-output limit. The containing host volume is never added
+  with a 2 GiB synthetic-output limit. Fixed fixture sizes/capture counts and bounded
+  child log sinks constrain normal and known-error-path writes; sampled checks
+  stop further work before the reserved allowance is exhausted. This is not a
+  filesystem quota or protection against arbitrary OS corruption. The containing host volume is never added
   to the snapshot set.
 - Delete only the recorded snapshot ID without force; remove only the newly
   owned association after confirming snapshots are gone. Unknown cleanup is
@@ -82,7 +85,7 @@ space improvement is claimed before actual measurements.
 这是独立的在线“存储时点快照”试验，不修改 Sprig 原有严格 checkpoint。
 原生 NTFS 文件和映射继续存在；VSS 不保证所有未同步内存写入或多文件应用事务的原子性。
 首次仅验合成普通文件，使用固定微软 provider、无应用 writer 的非持久快照。
-测试仅格式化本次新建且已核身份的最大 4 GiB 虚拟盘，差分区只在该卷内部、上限 512 MiB。
+测试仅格式化本次新建且已核身份的1 GiB 虚拟盘（不超过已批 4 GiB 上限），差分区只在该卷内部、上限 512 MiB。
 CAS、暂存和恢复目录在卷外，额外合成输出上限 2 GiB。不改变已有卷、注册表、启动设置或信任配置。
 仅显式清理本次精确快照及新关联；不确定状态拒绝强制卸载。非持久快照仍可能随 requester 退出自动释放，不能把这种释放当成已核清理或承诺异常子进程可继续读取。
 当前收录需要显式暂存，成本全部统计，不冒称生产直读快路径或已实现全场景加速、省空间。

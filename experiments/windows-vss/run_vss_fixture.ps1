@@ -78,18 +78,74 @@ $store = Join-Path $hostWork 'cas'
 $writerReady = Join-Path $hostWork 'writer.ready'
 $writerStop = Join-Path $hostWork 'writer.stop'
 $markerToken = [Guid]::NewGuid().ToString('N')
-$maximumImageBytes = [uint64]4GB
+$maximumImageBytes = [uint64]1GB
 $maximumAddedBytes = [uint64]2GB
 $budgetReserveBytes = [uint64]64MB
+$maximumProcessLogBytes = [int64]1MB
+$maximumProcesses = 12
+$maximumResultBytes = 8MB
+$maximumVhdxMetadataBytes = [uint64]64MB
+$maximumExternalBytes = [uint64]896MB
+# The fixed-memory pumps keep draining after a log reaches its cap. Truncation
+# is evidence of failure, never a reason to leave a child blocked on a full pipe.
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading.Tasks;
+public sealed class SprigVssLogResult {
+    public long TotalBytes;
+    public long WrittenBytes;
+    public bool Overflow;
+    public string WriteError;
+}
+public static class SprigVssBoundedLog {
+    public static async Task<SprigVssLogResult> DrainAsync(Stream input, Stream output, long limit) {
+        var result = new SprigVssLogResult();
+        var buffer = new byte[8192];
+        while (true) {
+            int count = await input.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+            if (count == 0) break;
+            result.TotalBytes = result.TotalBytes > long.MaxValue - count ? long.MaxValue : result.TotalBytes + count;
+            result.Overflow |= result.TotalBytes > limit;
+            int keep = (int)Math.Min((long)count, Math.Max(0L, limit - result.WrittenBytes));
+            if (keep != 0 && result.WriteError == null) {
+                try {
+                    await output.WriteAsync(buffer, 0, keep).ConfigureAwait(false);
+                    result.WrittenBytes += keep;
+                } catch (Exception error) {
+                    result.WriteError = error.GetType().Name;
+                }
+            }
+        }
+        try { await output.FlushAsync().ConfigureAwait(false); }
+        catch (Exception error) { result.WriteError = error.GetType().Name; }
+        return result;
+    }
+}
+'@
 $processes = [Collections.Generic.List[object]]::new()
 $result = [ordered]@{
     version = 1; ok = $false; run_id = $runId; image = $image; evidence_directory = $evidence
     maximum_image_bytes = $maximumImageBytes; maximum_added_bytes = $maximumAddedBytes
+    authorized_image_maximum_bytes = [uint64]4GB
     maximum_diff_bytes = [uint64]512MB; payload_file_mib = 8; payload_files = 3
     min_diff_area_file_size_mib = $minimumMiB; image_os = $env:ImageOS
     operating_system = ($os | Select-Object Caption, Version, BuildNumber)
     created = $false; mounted = $false; formatted = $false; cleanup = 'not-mounted'
     captures = @(); storage_checkpoints = @(); storage_measurement = @(); errors = @()
+    budget_plan = [ordered]@{
+        capture_count = 4; fixture_file_bytes_ceiling = 25MB
+        staging_bytes = 100MB; native_restore_bytes = 100MB; cas_payload_allowance_bytes = 100MB
+        cache_bytes = 256MB; transient_materialization_bytes = 24MB; fixture_cli_log_bytes = 64MB
+        cas_metadata_state_and_backup_allowance_bytes = 64MB; fixture_report_bytes = 4MB
+        copied_capture_evidence_bytes = 68MB; orchestration_log_bytes = 24MB
+        final_result_bytes = 8MB; control_file_allowance_bytes = 8MB
+        host_allocation_rounding_and_extra_metadata_allowance_bytes = 76MB
+        outside_volume_total_bytes = $maximumExternalBytes
+        vhdx_virtual_capacity_bytes = $maximumImageBytes; vhdx_metadata_allowance_bytes = $maximumVhdxMetadataBytes
+        total_normal_operation_allowance_bytes = ($maximumImageBytes + $maximumVhdxMetadataBytes + $maximumExternalBytes)
+        limitation = 'Finite normal-operation bounds for four fixed six-entry fixtures: at most 6160 payload chunks at minimum 16 KiB, 53-byte packed index entries, and bounded manifests/state/backups. Not a filesystem quota or protection against arbitrary OS/software faults. Tool/build outputs are outside this synthetic experiment budget.'
+    }
 }
 $mountAttempted = $false
 $runtimeUncertain = $false
@@ -136,6 +192,7 @@ function Assert-OutputBudget([string] $Stage) {
 }
 function Start-OwnedProcess([string] $File, [string[]] $Arguments, [string] $Label) {
     if ($Label -notmatch '^[a-z0-9-]+$') { throw 'Invalid process evidence label.' }
+    if ($processes.Count -ge $maximumProcesses) { throw 'Fixed orchestration process/log count exhausted.' }
     $stdout = Join-Path $evidence ($Label + '.stdout.log')
     $stderr = Join-Path $evidence ($Label + '.stderr.log')
     $start = [Diagnostics.ProcessStartInfo]::new()
@@ -151,7 +208,7 @@ function Start-OwnedProcess([string] $File, [string[]] $Arguments, [string] $Lab
     $record = [pscustomobject]@{
         Label = $Label; Process = $process; StartUnknown = $true; Started = $false
         Drained = $false; Stdout = $stdout; Stderr = $stderr; OutStream = $null; ErrStream = $null
-        OutTask = $null; ErrTask = $null; ExitCode = $null
+        OutTask = $null; ErrTask = $null; OutResult = $null; ErrResult = $null; ExitCode = $null
     }
     $processes.Add($record)
     $record.OutStream = [IO.FileStream]::new($stdout, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
@@ -160,8 +217,8 @@ function Start-OwnedProcess([string] $File, [string[]] $Arguments, [string] $Lab
     $record.StartUnknown = $false
     if (-not $record.Started) { throw "Process $Label did not start." }
     $process.StandardInput.Close()
-    $record.OutTask = $process.StandardOutput.BaseStream.CopyToAsync($record.OutStream)
-    $record.ErrTask = $process.StandardError.BaseStream.CopyToAsync($record.ErrStream)
+    $record.OutTask = [SprigVssBoundedLog]::DrainAsync($process.StandardOutput.BaseStream, $record.OutStream, $maximumProcessLogBytes)
+    $record.ErrTask = [SprigVssBoundedLog]::DrainAsync($process.StandardError.BaseStream, $record.ErrStream, $maximumProcessLogBytes)
     return $record
 }
 function Wait-OwnedProcess($Record, [int] $Seconds) {
@@ -176,12 +233,16 @@ function Wait-OwnedProcess($Record, [int] $Seconds) {
     }
     foreach ($task in @($Record.OutTask, $Record.ErrTask)) {
         if (-not $task.Wait(10000)) { throw "Process $($Record.Label) output is not drained; a descendant may still own a pipe." }
-        $task.GetAwaiter().GetResult()
     }
+    $Record.OutResult = $Record.OutTask.GetAwaiter().GetResult()
+    $Record.ErrResult = $Record.ErrTask.GetAwaiter().GetResult()
     $Record.OutStream.Dispose()
     $Record.ErrStream.Dispose()
     $Record.ExitCode = $Record.Process.ExitCode
     $Record.Drained = $true
+    if ($Record.OutResult.Overflow -or $Record.ErrResult.Overflow -or $Record.OutResult.WriteError -or $Record.ErrResult.WriteError) {
+        throw "Process $($Record.Label) log overflow/write failure after complete drain; no further experiment step is permitted."
+    }
     return $Record.ExitCode
 }
 function Invoke-OwnedProcess([string] $File, [string[]] $Arguments, [string] $Label, [int] $Seconds = 300) {
@@ -270,9 +331,9 @@ function Assert-NoOwnVssState {
 function Copy-CaptureEvidence([string] $CaptureWork, [string] $Label) {
     # Exact helper-created diagnostics only, with a small aggregate allowance.
     # This is deliberately not a recursive copy of the synthetic work directory.
-    $allowance = [int64]16MB
+    $allowance = [int64]17MB
     $files = @([pscustomobject]@{ Source = (Join-Path $CaptureWork 'capture.json'); Name = ('capture-' + $Label + '.json') })
-    foreach ($number in 1..32) {
+    foreach ($number in 1..8) {
         foreach ($stream in @('stdout', 'stderr')) {
             $name = 'sprig-{0:D2}.{1}.log' -f $number, $stream
             $files += [pscustomobject]@{ Source = (Join-Path (Join-Path $CaptureWork 'logs') $name); Name = ('capture-' + $Label + '-' + $name) }
@@ -282,13 +343,14 @@ function Copy-CaptureEvidence([string] $CaptureWork, [string] $Label) {
         if (Test-Path -LiteralPath $file.Source -PathType Leaf) {
             Assert-PlainPath $file.Source
             $length = (Get-Item -LiteralPath $file.Source).Length
-            if ($length -gt 8MB -or $length -gt $allowance) { throw 'Capture diagnostics exceed the evidence whitelist size limit.' }
+            if ($length -gt 1MB -or $length -gt $allowance) { throw 'Capture diagnostics exceed the evidence whitelist size limit.' }
             Copy-Item -LiteralPath $file.Source -Destination (Join-Path $evidence $file.Name)
             $allowance -= $length
         }
     }
 }
 function Invoke-Capture([string] $Label, [string] $PreviousReport = '') {
+    if ($result.captures.Count -ge 4) { throw 'The fixed four-capture experiment budget is exhausted.' }
     Assert-OwnVolume
     [void](Assert-OutputBudget ('before-' + $Label))
     $captureWork = Join-Path $hostWork ('capture-' + $Label)
@@ -336,7 +398,7 @@ try {
     $before = @(Get-Disk | Select-Object Number, UniqueId)
     if (Test-Path -LiteralPath $image) { throw 'Image must not exist before creation.' }
     $createScript = Join-Path $hostWork 'create-vhd.txt'
-    "create vdisk file=`"$image`" maximum=4096 type=expandable`nexit" | Set-Content -LiteralPath $createScript -Encoding ascii
+    "create vdisk file=`"$image`" maximum=1024 type=expandable`nexit" | Set-Content -LiteralPath $createScript -Encoding ascii
     [void](Invoke-OwnedProcess (Join-Path $env:SystemRoot 'System32\diskpart.exe') @('/s', $createScript) 'diskpart-create' 90)
     if (-not (Test-Path -LiteralPath $image -PathType Leaf)) { throw 'VHDX creation failed; no retry.' }
     Assert-PlainPath $image
@@ -384,12 +446,26 @@ try {
     $result.disk = $fresh | Select-Object Number, UniqueId, Size, LogicalSectorSize, PhysicalSectorSize, BusType
     $result.volume = [ordered]@{ guid = $volumeGuid; serial = $serialHex; drive_letter = [string]$partition.DriveLetter; filesystem = 'NTFS' }
     $volumeRoot = "$($partition.DriveLetter):\"
+    $liveRoot = Join-Path $volumeRoot 'fixture'
+    Record-StorageMeasurement 'post-format-before-fixture'
+    $baseline = $result.storage_measurement[-1]
+    if (-not $baseline.allocation_complete -or $null -eq $baseline.image.allocated_bytes) {
+        throw 'Cannot verify post-format VHDX allocation and reserve the experiment budget; no fixture writes are allowed.'
+    }
+    if ($baseline.image.allocated_bytes -gt ($maximumImageBytes + $maximumVhdxMetadataBytes) -or
+        ($maximumImageBytes + $maximumVhdxMetadataBytes + $maximumExternalBytes) -gt $maximumAddedBytes) {
+        throw 'Formatted VHDX and conservative remaining allowances do not fit the 2 GiB budget.'
+    }
+    $baselineExternal = [uint64]$baseline.host_total_allocated_bytes - [uint64]$baseline.image.allocated_bytes
+    if ($baselineExternal -gt $maximumExternalBytes) { throw 'Post-format external output already exceeds its reserved bound.' }
+    $result.budget_plan.post_format_host_allocated_bytes = $baseline.host_total_allocated_bytes
+    $result.budget_plan.remaining_vhdx_allocation_reserve_bytes = ($maximumImageBytes + $maximumVhdxMetadataBytes - [uint64]$baseline.image.allocated_bytes)
+    $result.budget_plan.remaining_external_allocation_reserve_bytes = ($maximumExternalBytes - $baselineExternal)
     $marker = Join-Path $volumeRoot '.sprig-vss-synthetic-volume'
     if (Test-Path -LiteralPath $marker) { throw 'Fresh synthetic marker unexpectedly exists.' }
     [IO.File]::WriteAllText($marker, "sprig-vss-synthetic-only-v1`n$markerToken`n", [Text.ASCIIEncoding]::new())
     Assert-OwnVolume
     Assert-NoOwnVssState
-    $liveRoot = Join-Path $volumeRoot 'fixture'
     [void](Invoke-OwnedProcess $Python @($Fixture, 'prepare', '--live-root', $liveRoot, '--file-mib', '8') 'fixture-prepare' 120)
     [void](Assert-OutputBudget 'prepared')
     Record-StorageMeasurement 'prepared'
@@ -443,10 +519,22 @@ try {
         $result.errors += $_.Exception.Message
     }
     $result.processes = @($processes | ForEach-Object {
-        [ordered]@{ label = $_.Label; started = $_.Started; start_unknown = $_.StartUnknown; drained = $_.Drained; exit_code = $_.ExitCode }
+        [ordered]@{ label = $_.Label; started = $_.Started; start_unknown = $_.StartUnknown; drained = $_.Drained; exit_code = $_.ExitCode
+            log_limit_bytes = $maximumProcessLogBytes; stdout = $_.OutResult; stderr = $_.ErrResult }
     })
-    $result | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $evidence 'result.json') -Encoding utf8
-    $result | ConvertTo-Json -Depth 16 | Write-Output
+    $json = $result | ConvertTo-Json -Depth 16
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt $maximumResultBytes) {
+        # Detailed collector reports already have their exact whitelist files.
+        # Keep requester/cleanup evidence and never write an oversized result.
+        foreach ($capture in $result.captures) { $capture.fixture = $null }
+        $result.ok = $false
+        $result.errors += 'Result exceeded its 8 MiB bound; detailed collector reports remain in capture-*.json.'
+        $json = $result | ConvertTo-Json -Depth 16
+        if ([Text.Encoding]::UTF8.GetByteCount($json) -gt $maximumResultBytes) { throw 'Even compact result exceeded its fixed bound; no oversized output written.' }
+        if ($null -eq $scriptFailure) { $scriptFailure = [InvalidOperationException]::new('Result evidence exceeded its bounded size.') }
+    }
+    [IO.File]::WriteAllText((Join-Path $evidence 'result.json'), $json, [Text.UTF8Encoding]::new($false))
+    Write-Output $json
     # The evidence directory has only result.json, capture-*.json and *.log.
     # The workflow must upload this directory's explicit whitelist, NEVER work,
     # runner-temp globs, synthetic.vhdx, fixtures, CAS, staging or restore trees.

@@ -27,6 +27,7 @@ bytes still match our probe, making a subsequent settled capture comparable.
 import argparse
 import ctypes
 import hashlib
+import io
 import json
 import mmap
 import os
@@ -55,6 +56,8 @@ MAX_FIXTURE = 64 * MIB
 FIXED_NS = 1700000000000000000  # Exactly representable at Windows 100 ns precision.
 MAX_MEASURE_FILES = 100000
 MAX_MEASURE_BYTES = 2 * 1024 * MIB
+MAX_CLI_COMMANDS = 8
+MAX_CLI_LOG_BYTES = MIB
 VSS_ROOT = re.compile(r"^\\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy[0-9]+\\?$", re.I)
 
 
@@ -74,9 +77,10 @@ def emit(value):
 
 
 def json_new(path, value):
-    with Path(path).open("x", encoding="utf-8", newline="\n") as handle:
-        json.dump(value, handle, sort_keys=True, indent=2)
-        handle.write("\n")
+    encoded = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    require(len(encoded) <= MIB, "JSON output exceeds the fixed 1 MiB file limit")
+    with Path(path).open("xb") as handle:
+        require(handle.write(encoded) == len(encoded), "Short bounded JSON write")
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -492,24 +496,89 @@ class Sprig:
         self.timeout, self.commands = timeout, []
 
     def run(self, *args):
+        require(len(self.commands) < MAX_CLI_COMMANDS,
+                "Capture exceeded its fixed 8-command Sprig limit; review the storage budget before adding commands")
         command = [self.binary, "--store", self.store, "--json"] + list(args)
         number = len(self.commands) + 1
         out = self.logs / ("sprig-%02d.stdout.log" % number)
         err = self.logs / ("sprig-%02d.stderr.log" % number)
-        record = {"argv": command, "stdout_log": str(out), "stderr_log": str(err)}
+        def stream_state():
+            return {"bytes_seen": 0, "bytes_logged": 0, "overflow": False,
+                    "eof": False, "error": None, "log_limit_bytes": MAX_CLI_LOG_BYTES}
+
+        record = {"argv": command, "stdout_log": str(out), "stderr_log": str(err),
+                  "exited": False, "streams_drained": False,
+                  "stdout": stream_state(), "stderr": stream_state()}
         self.commands.append(record)
-        with out.open("xb") as stdout, err.open("xb") as stderr:
-            process = subprocess.Popen(command, stdout=stdout, stderr=stderr, shell=False)
-            record["pid"] = process.pid
+
+        def drain(pipe, log, state):
+            # Each worker holds at most one 64 KiB read and writes <= 1 MiB.
+            # Continue reading/discarding on overflow (or a log-write failure)
+            # so a full OS pipe cannot deadlock the child or cause unbounded RAM.
             try:
-                status = process.wait(timeout=self.timeout)
-            except subprocess.TimeoutExpired:
-                record["exited"] = False
-                raise FixtureError("Sprig timed out; do not delete snapshots or detach the source volume",
-                                   uncertain_child=True, child_pid=process.pid, argv=command)
+                while True:
+                    data = pipe.read(64 * 1024)
+                    if not data:
+                        state["eof"] = True
+                        break
+                    state["bytes_seen"] += len(data)
+                    if state["bytes_seen"] > MAX_CLI_LOG_BYTES:
+                        state["overflow"] = True
+                    remaining = MAX_CLI_LOG_BYTES - state["bytes_logged"]
+                    if remaining > 0 and state["error"] is None:
+                        try:
+                            part = data[:remaining]
+                            require(log.write(part) == len(part), "Short bounded CLI log write")
+                            state["bytes_logged"] += len(part)
+                        except BaseException as error:
+                            state["error"] = str(error)
+            except BaseException as error:
+                state["error"] = str(error)
+            finally:
+                for handle in (pipe, log):
+                    try:
+                        handle.close()
+                    except BaseException as error:
+                        state["error"] = str(error)
+
+        stdout = out.open("xb")
+        try:
+            stderr = err.open("xb")
+        except BaseException:
+            stdout.close()
+            raise
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+        except BaseException:
+            stdout.close()
+            stderr.close()
+            raise
+        record["pid"] = process.pid
+        threads = [threading.Thread(target=drain, args=(process.stdout, stdout, record["stdout"]), daemon=True),
+                   threading.Thread(target=drain, args=(process.stderr, stderr, record["stderr"]), daemon=True)]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + self.timeout
+        try:
+            status = process.wait(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            # Daemon drainers remain bounded while the requester holds its job.
+            # Do not terminate, retry, wait indefinitely, or report cleanup-safe.
+            raise FixtureError("Sprig timed out; do not delete snapshots or detach the source volume",
+                               uncertain_child=True, child_pid=process.pid, argv=command)
         record.update(exited=True, returncode=status)
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
+            raise FixtureError("Sprig exited but output pipes did not drain before the deadline; retain state",
+                               uncertain_child=True, child_pid=process.pid, argv=command)
+        record["streams_drained"] = all(record[name]["eof"] for name in ("stdout", "stderr"))
+        require(record["streams_drained"] and not any(record[name]["error"] for name in ("stdout", "stderr")),
+                "Sprig output drain failed; inspect bounded log metadata")
+        require(not any(record[name]["overflow"] for name in ("stdout", "stderr")),
+                "Sprig output exceeded the 1 MiB per-stream limit; logs retained, JSON not parsed")
         require(status == 0, "Sprig failed; see retained logs: " + str(err))
-        require(out.stat().st_size <= 8 * MIB, "Unexpectedly large Sprig JSON output")
+        require(out.stat().st_size <= MAX_CLI_LOG_BYTES, "Unexpectedly large bounded Sprig log")
         envelope = json.loads(out.read_text(encoding="utf-8"))
         require(envelope.get("schema_version") == 1 and "result" in envelope,
                 "Unexpected Sprig JSON envelope")
@@ -717,11 +786,70 @@ def selftest():
             raise FixtureError("Selftest accepted an unexpected fixture file")
         usage = measure(root)
         require(usage["logical_bytes"] < MIB, "Selftest grew beyond tiny fixture budget")
+        # A normal mock response and one bounded local Python output child test
+        # the actual drainers. Neither executes Sprig nor touches VSS.
+        logs = root / "mock-cli-logs"
+        logs.mkdir()
+        cli = Sprig("not-executed", "not-opened", logs, 5)
+        real_popen = subprocess.Popen
+
+        class FakeProcess:
+            pid = 0
+
+            def __init__(self, stdout, stderr):
+                self.stdout, self.stderr = io.BytesIO(stdout), io.BytesIO(stderr)
+
+            def wait(self, timeout):
+                return 0
+
+        try:
+            subprocess.Popen = lambda *a, **k: FakeProcess(
+                b'{"schema_version":1,"result":{"ok":true}}', b"")
+            require(cli.run("stats") == {"ok": True}, "Selftest bounded CLI JSON failed")
+            require(cli.commands[-1]["streams_drained"], "Selftest pipes did not reach EOF")
+            output_program = (
+                "import sys; "
+                "sys.stdout.buffer.write(b'x' * %d); sys.stdout.buffer.flush(); "
+                "sys.stderr.buffer.write(b'y' * %d); sys.stderr.buffer.flush()"
+                % (MAX_CLI_LOG_BYTES + 13, MAX_CLI_LOG_BYTES + 29))
+            subprocess.Popen = lambda *a, **k: real_popen([sys.executable, "-c", output_program], **k)
+            try:
+                cli.run("stats")
+            except FixtureError as error:
+                require("1 MiB per-stream limit" in str(error), "Selftest overflow failed for wrong reason")
+            else:
+                raise FixtureError("Selftest accepted overflowing CLI streams")
+            record = cli.commands[-1]
+            require(record["exited"] and record["streams_drained"], "Selftest did not drain overflow")
+            for name in ("stdout", "stderr"):
+                require(record[name]["overflow"] and record[name]["bytes_logged"] == MAX_CLI_LOG_BYTES,
+                        "Selftest stream cap metadata differs")
+                require(Path(record[name + "_log"]).stat().st_size == MAX_CLI_LOG_BYTES,
+                        "Selftest CLI log exceeded its cap")
+            cli.commands = [{} for _ in range(MAX_CLI_COMMANDS)]
+            try:
+                cli.run("stats")
+            except FixtureError as error:
+                require("8-command" in str(error), "Selftest command cap failed for wrong reason")
+            else:
+                raise FixtureError("Selftest accepted excess CLI command")
+        finally:
+            subprocess.Popen = real_popen
+        oversized = root / "oversized.json"
+        try:
+            json_new(oversized, {"payload": "z" * MIB})
+        except FixtureError as error:
+            require("1 MiB file limit" in str(error), "Selftest JSON cap failed for wrong reason")
+            require(not oversized.exists(), "Oversized JSON was written before size validation")
+        else:
+            raise FixtureError("Selftest accepted oversized JSON")
     return {"schema_version": SCHEMA, "status": "selftest_passed", "sprig_executed": False,
-            "vss_executed": False, "tiny_fixture_only": True,
+            "vss_executed": False, "tiny_fixture_only": True, "local_python_output_child_executed": True,
             "checks": ["deterministic sealed bytes", "exact marker/files", "flushed pre-token",
                        "full repeated hashes", "post-token restoration", "stage metadata preservation",
-                       "bounded mmap and ordinary writes", "unexpected-file rejection", "storage measurement"]}
+                       "bounded mmap and ordinary writes", "unexpected-file rejection", "storage measurement",
+                       "local Python child drains stdout/stderr beyond 1 MiB without deadlock",
+                       "CLI command ceiling", "JSON size rejected before file creation"]}
 
 
 def parser():

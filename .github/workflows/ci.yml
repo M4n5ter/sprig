@@ -4,6 +4,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      runner_probe:
+        description: Read-only Windows virtualization and diagnostic capability probe
+        type: boolean
+        required: false
+        default: false
       refs_volume:
         description: 'Explicitly create a disposable 4 GiB ReFS VHDX for this run'
         type: boolean
@@ -13,6 +18,7 @@ permissions:
   contents: read
 jobs:
   check:
+    if: ${{ !inputs.runner_probe }}
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +81,7 @@ jobs:
           python3 examples/compare.py --binary target/release/sprig "${args[@]}"
 
   projection:
+    if: ${{ !inputs.runner_probe }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -104,3 +111,19 @@ jobs:
             projection-result.json
             writable-result.json
           if-no-files-found: ignore
+
+  windows-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.runner_probe
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read existing runner capabilities without changing configuration
+        shell: pwsh
+        run: ./tests/windows_runner_probe.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-runner-capabilities
+          path: runner-capabilities.json
+          if-no-files-found: error

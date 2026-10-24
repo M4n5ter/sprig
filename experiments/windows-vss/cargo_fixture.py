@@ -495,6 +495,11 @@ def finish_report(work, filename, report, commands, action):
                       all_direct_child_pipes_drained=True, total_seconds=time.monotonic() - started)
     except BaseException as error:
         report.update(error=str(error), **getattr(error, "details", {}))
+        report["error_type"] = type(error).__name__
+        for name in ("errno", "winerror"):
+            value = getattr(error, name, None)
+            if isinstance(value, int):
+                report[name] = value
         report["all_direct_children_exited"] = all(c.get("exited") for c in commands.commands)
         report["all_direct_child_pipes_drained"] = all(c.get("streams_drained") for c in commands.commands)
         base.json_new(work / filename, report)
@@ -572,7 +577,7 @@ def sprig_result(commands, binary, store, *args, inherited_handle=None):
     return result
 
 
-def bind_snapshot_handle(handle, expected_root, expected_serial):
+def bind_snapshot_handle(handle, expected_root, expected_serial, diagnostic=None):
     """Bind the independent pathname oracle to the received root capability first."""
     require(os.name == "nt", "Snapshot capability binding is Windows-only")
     from ctypes import wintypes
@@ -598,19 +603,34 @@ def bind_snapshot_handle(handle, expected_root, expected_serial):
     get_type = kernel.GetFileType
     get_type.argtypes = [wintypes.HANDLE]
     get_type.restype = wintypes.DWORD
+    if diagnostic is not None:
+        diagnostic["call"] = "GetFileType"
     require(get_type(handle) == 1, "Snapshot capability is not a disk filesystem handle")
     name = ctypes.create_unicode_buffer(32768)
+    if diagnostic is not None:
+        diagnostic["call"] = "GetFinalPathNameByHandleW"
     length = final_name(handle, name, len(name), 2)  # VOLUME_NAME_NT, normalized file name.
     if length == 0:
         raise ctypes.WinError(ctypes.get_last_error())
     require(length < len(name), "Snapshot capability final path is too long")
     prefix = "\\\\?\\GLOBALROOT"
+    if diagnostic is not None:
+        diagnostic["call"] = "validate_final_path_binding"
+        synthetic = re.match(r"^\\Device\\HarddiskVolumeShadowCopy[0-9]+(?:\\|$)", name.value, re.I) is not None
+        diagnostic["returned_final_path"] = name.value[:1024] if synthetic else "<non-synthetic path omitted>"
+        diagnostic["returned_final_path_characters"] = len(name.value)
+        diagnostic["returned_final_path_truncated"] = synthetic and len(name.value) > 1024
+        diagnostic["expected_final_path"] = str(expected_root)[len(prefix):][:1024]
     require(str(expected_root).startswith(prefix)
             and name.value == str(expected_root)[len(prefix):],
             "Snapshot pathname is not bound to the inherited directory HANDLE")
     info = HandleInfo()
+    if diagnostic is not None:
+        diagnostic["call"] = "GetFileInformationByHandle"
     if not get_info(handle, ctypes.byref(info)):
         raise ctypes.WinError(ctypes.get_last_error())
+    if diagnostic is not None:
+        diagnostic["call"] = "validate_directory_and_serial"
     require(info.attributes & 0x10 and not info.attributes & 0x400,
             "Snapshot capability is not a no-reparse directory")
     require(info.volume_serial == int(expected_serial, 16), "Snapshot capability volume serial differs")
@@ -621,50 +641,71 @@ def bind_snapshot_handle(handle, expected_root, expected_serial):
 
 
 def capture(args):
-    require(os.name == "nt", "Capture requires the Windows requester's held snapshot")
-    require(VSS_ROOT.fullmatch(args.snapshot_root) is not None, "Invalid requester snapshot root")
-    require(args.relative_path == "fixture", "Only the fixed synthetic fixture descendant is permitted")
-    require(re.fullmatch(r"[a-z][a-z0-9-]{0,31}", args.label) is not None, "Unsafe capture label")
-    require(re.fullmatch(r"[0-9A-Fa-f]{8}", args.serial) is not None
-            and re.fullmatch(r"[0-9A-Fa-f]{32}", args.marker_token) is not None, "Invalid snapshot identity")
-    require(re.fullmatch(r"[1-9][0-9]{0,19}", args.snapshot_handle) is not None,
-            "Snapshot HANDLE must be canonical positive decimal")
-    handle = int(args.snapshot_handle)
-    require(handle < (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
-            and os.get_handle_inheritable(handle), "Missing inherited requester directory capability")
-    live = base.ordinary_path(args.live_root)
-    _, mounted_root = base.volume(live)
-    require(os.path.normcase(str(Path(mounted_root) / "fixture")) == os.path.normcase(str(live)),
-            "Live root must be the source volume's fixed fixture directory")
-    prepared = verified_prepare(args.prepare_report, live)
-    snapshot = Path(args.snapshot_root) / "fixture"
-    capability = bind_snapshot_handle(handle, snapshot, args.serial)
-    os.set_handle_inheritable(handle, False)
-    require(not os.get_handle_inheritable(handle), "Could not clear inherited snapshot HANDLE flag")
-    capability["inheritance_cleared_before_children"] = True
-    identity = base.snapshot_identity(args.snapshot_root)
-    require(identity["serial"].upper() == args.serial.upper()
-            and identity["marker_token"].lower() == args.marker_token.lower(),
-            "Snapshot synthetic volume identity differs from requester expectations")
-    require(load_fixture(live, 1) == load_fixture(snapshot, 1), "Snapshot fixture identity differs from live")
-    binary = executable(args.sprig)
-    store = base.ordinary_path(args.store, must_exist=False)
-    require(store.parent.is_dir() and not store.exists(), "Cargo capture requires a NEW store")
-    outside(live, store)
+    # Establish only a safe, new, outside-volume diagnostic destination first.
+    # No snapshot argument is parsed or queried before failures can be recorded.
+    live = base.ordinary_path(args.live_root, must_exist=False)
     work = new_work(args.work_root, live)
-    require(work != store and work not in store.parents and store not in work.parents,
-            "Capture store and work roots overlap")
-    commands = Commands(work / "logs", "sprig", args.timeout)
+    commands = Commands(work / "logs", "sprig", 300)
     report = report_base("capture", live, work, commands)
-    report.update(label=args.label, fixture_id=prepared["fixture_id"], store=str(store),
-                  prepare_report=str(base.ordinary_path(args.prepare_report)),
-                  snapshot_root=args.snapshot_root, snapshot_fixture=str(snapshot),
-                  cas_import_mode="inherited_snapshot_tree_capability", staging_mode="none",
-                  snapshot_capability=capability,
-                  capability_forwarding="STARTUPINFO handle_list contains exactly the requester root handle",
-                  serial=args.serial.upper(), marker_token=args.marker_token)
+    diagnostic = {"phase": "pre_ingestion", "call": "validate_platform"}
+    report["diagnostic"] = diagnostic
 
     def action():
+        require(os.name == "nt", "Capture requires the Windows requester's held snapshot")
+        diagnostic["call"] = "validate_snapshot_arguments"
+        require(VSS_ROOT.fullmatch(args.snapshot_root) is not None, "Invalid requester snapshot root")
+        require(args.relative_path == "fixture", "Only the fixed synthetic fixture descendant is permitted")
+        require(re.fullmatch(r"[a-z][a-z0-9-]{0,31}", args.label) is not None, "Unsafe capture label")
+        require(re.fullmatch(r"[0-9A-Fa-f]{8}", args.serial) is not None
+                and re.fullmatch(r"[0-9A-Fa-f]{32}", args.marker_token) is not None, "Invalid snapshot identity")
+        require(1 <= args.timeout <= 300, "Child timeout must be 1..300 seconds")
+        commands.timeout = args.timeout
+        diagnostic["call"] = "parse_snapshot_handle"
+        require(re.fullmatch(r"[1-9][0-9]{0,19}", args.snapshot_handle) is not None,
+                "Snapshot HANDLE must be canonical positive decimal")
+        handle = int(args.snapshot_handle)
+        require(handle < (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1,
+                "Missing inherited requester directory capability")
+        diagnostic["call"] = "os.get_handle_inheritable"
+        require(os.get_handle_inheritable(handle), "Missing inherited requester directory capability")
+        diagnostic["call"] = "validate_live_root"
+        base.ordinary_path(live)
+        _, mounted_root = base.volume(live)
+        require(os.path.normcase(str(Path(mounted_root) / "fixture")) == os.path.normcase(str(live)),
+                "Live root must be the source volume's fixed fixture directory")
+        diagnostic["call"] = "verified_prepare"
+        prepared = verified_prepare(args.prepare_report, live)
+        snapshot = Path(args.snapshot_root) / "fixture"
+        report.update(label=args.label, fixture_id=prepared["fixture_id"],
+                      prepare_report=str(base.ordinary_path(args.prepare_report)),
+                      snapshot_root=args.snapshot_root, snapshot_fixture=str(snapshot),
+                      cas_import_mode="inherited_snapshot_tree_capability", staging_mode="none",
+                      capability_forwarding="STARTUPINFO handle_list contains exactly the requester root handle",
+                      serial=args.serial.upper(), marker_token=args.marker_token)
+        diagnostic.update(phase="capability_binding", call="bind_snapshot_handle")
+        capability = bind_snapshot_handle(handle, snapshot, args.serial, diagnostic)
+        diagnostic["call"] = "os.set_handle_inheritable_false"
+        os.set_handle_inheritable(handle, False)
+        diagnostic["call"] = "verify_handle_inheritance_cleared"
+        require(not os.get_handle_inheritable(handle), "Could not clear inherited snapshot HANDLE flag")
+        capability["inheritance_cleared_before_children"] = True
+        report["snapshot_capability"] = capability
+        diagnostic.update(phase="pre_ingestion", call="snapshot_identity")
+        identity = base.snapshot_identity(args.snapshot_root)
+        require(identity["serial"].upper() == args.serial.upper()
+                and identity["marker_token"].lower() == args.marker_token.lower(),
+                "Snapshot synthetic volume identity differs from requester expectations")
+        diagnostic["call"] = "load_live_and_snapshot_fixture"
+        require(load_fixture(live, 1) == load_fixture(snapshot, 1), "Snapshot fixture identity differs from live")
+        diagnostic["call"] = "validate_sprig_executable_and_new_store"
+        binary = executable(args.sprig)
+        store = base.ordinary_path(args.store, must_exist=False)
+        require(store.parent.is_dir() and not store.exists(), "Cargo capture requires a NEW store")
+        outside(live, store)
+        require(work != store and work not in store.parents and store not in work.parents,
+                "Capture store and work roots overlap")
+        report["store"] = str(store)
+        diagnostic.update(phase="snapshot_oracle", call="inventory")
         started = time.monotonic()
         expected = inventory(snapshot)
         require(inventory(snapshot) == expected, "Snapshot changed between complete oracle reads")
@@ -674,6 +715,7 @@ def capture(args):
         report.update(snapshot_inventory=expected, snapshot_read_verified=True,
                       snapshot_oracle_seconds=time.monotonic() - started,
                       snapshot_storage=base.measure(snapshot), staging_storage=base.measure(work / "stage"))
+        diagnostic.update(phase="cas_ingestion", call="create_owner_and_initialize_store")
         owner = Path(str(store) + ".sprig-vss-owner.json")
         require(not owner.exists(), "Orphan Cargo store ownership marker requires inspection")
         base.json_new(owner, {"schema_version": SCHEMA, "kind": KIND,
@@ -684,6 +726,7 @@ def capture(args):
         report["store_storage_before_import"] = base.measure(store)
         name = "vss-" + args.label + "-" + uuid.uuid4().hex
         started = time.monotonic()
+        diagnostic["call"] = "snapshot_import_tree_experiment"
         imported = sprig_result(commands, binary, store, "snapshot-import-tree-experiment",
                                 str(snapshot), name, "--root-handle", str(handle),
                                 "--serial", args.serial, "--marker-token", args.marker_token,
@@ -700,6 +743,7 @@ def capture(args):
                       import_storage_delta=base.delta(before, after,
                           ("objects", "object_bytes", "object_storage_bytes", "store_logical_bytes", "store_allocated_bytes")))
         started = time.monotonic()
+        diagnostic.update(phase="native_restore", call="restore_and_verify")
         restored = sprig_result(commands, binary, store, "--copy", "restore", revision, name + "-restore")
         require(restored.get("backend", {}).get("kind") == "native"
                 and restored.get("mount_state") == "native", "Restore was not native materialization")
@@ -716,6 +760,7 @@ def capture(args):
                       sprig_stats_after_restore=sprig_result(commands, binary, store, "stats"),
                       store_storage_after_restore=base.measure(store),
                       work_storage_before_report=base.measure(work))
+        diagnostic.update(phase="completed", call="all_oracles_passed")
 
     return finish_report(work, "capture.json", report, commands, action)
 
@@ -863,12 +908,53 @@ def selftest():
             require(not oversized.exists(), "Oversized report created a file before refusal")
         else:
             raise FixtureError("Oversized report was accepted")
+        error_work = root / "pre-ingestion-error"
+        error_work.mkdir()
+        (error_work / "logs").mkdir()
+        error_commands = Commands(error_work / "logs", "sprig", 5)
+        error_report = report_base("capture", live, error_work, error_commands)
+        error_report["diagnostic"] = {"phase": "capability_binding", "call": "GetFinalPathNameByHandleW"}
+
+        def fail_before_ingestion():
+            error = OSError(5, "mock pre-ingestion failure")
+            error.winerror = 6
+            raise error
+
+        try:
+            finish_report(error_work, "capture.json", error_report, error_commands, fail_before_ingestion)
+        except FixtureError as error:
+            require(error.details.get("report_path") == str(error_work / "capture.json"),
+                    "Pre-ingestion error did not identify its retained report")
+        else:
+            raise FixtureError("Pre-ingestion error was swallowed")
+        failed = bounded_json(error_work / "capture.json")
+        require(failed["status"] == "failed" and failed["cleanup_safe"] is False
+                and failed["commands"] == [] and failed["error_type"] == "OSError"
+                and failed["errno"] == 5 and failed["winerror"] == 6
+                and failed["diagnostic"] == error_report["diagnostic"]
+                and "mock pre-ingestion failure" in failed["error"],
+                "Pre-ingestion error lost its exact bounded diagnostic")
+        if os.name != "nt":
+            # The actual capture entry point must retain even its platform
+            # preflight failure, without issuing any Windows or child calls.
+            capture_work = root / "capture-platform-error"
+            try:
+                capture(argparse.Namespace(live_root=str(live), work_root=str(capture_work)))
+            except FixtureError:
+                pass
+            else:
+                raise FixtureError("Non-Windows capture preflight unexpectedly passed")
+            failed = bounded_json(capture_work / "capture.json")
+            require(failed["commands"] == [] and failed["cleanup_safe"] is False
+                    and failed["diagnostic"] == {"phase": "pre_ingestion", "call": "validate_platform"},
+                    "Capture preflight failed before producing its diagnostic report")
         require(base.measure(root)["logical_bytes"] < 2 * MIB, "Selftest exceeded its tiny ordinary-file allowance")
     return {"schema_version": SCHEMA, "status": "selftest_passed", "cargo_executed": False,
             "sprig_executed": False, "vss_executed": False,
             "checks": ["fixed crate and edits", "full repeated oracle", "internal hardlinks",
                        "external hardlinks rejected", "safe path components", "bounded JSON before write",
-                       "positive Fresh/compile/test evidence", "bounded mock stdout/stderr drains"]}
+                       "positive Fresh/compile/test evidence", "bounded mock stdout/stderr drains",
+                       "pre-ingestion failure report preserves phase/call and WinError metadata"]}
 
 
 def parser():

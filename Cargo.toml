@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Small native-filesystem workspace snapshots"
 publish = false
+license = "MIT"
 
 [profile.dev]
 debug = 0

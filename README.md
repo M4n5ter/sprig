@@ -895,3 +895,8 @@ with executed-output checks. No-op and restored builds were `Fresh`; incremental
 cache hardlinks succeeded without rustc's copying-fallback warning. The same
 check exercised alias writes, link counts and projected-group remount isolation.
 This does not establish compatibility or speed for every Cargo project.
+
+## License
+
+Sprig is licensed under the [MIT License](LICENSE). Third-party dependencies
+retain their own licenses.

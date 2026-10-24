@@ -141,6 +141,12 @@ jobs:
           Assert-PlainPath "$source\run_vss_fixture.ps1"
           Assert-PlainPath $source
           Assert-PlainPath ([IO.Path]::GetPathRoot($source))
+          $fileResolver = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-LocalFile' }, $false)
+          if ($null -eq $fileResolver) { throw 'File resolver missing.' }
+          . ([scriptblock]::Create($fileResolver.Extent.Text))
+          $pythonCommand = Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          $resolvedPython = Resolve-LocalFile $pythonCommand.Source
+          if ($resolvedPython -isnot [string]) { throw 'Python resolution must produce one existing file.' }
           $pump = [regex]::Match((Get-Content "$source\run_vss_fixture.ps1" -Raw), "(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
           if (-not $pump.Success) { throw 'Bounded pump source missing.' }
           Add-Type -TypeDefinition $pump.Groups[1].Value

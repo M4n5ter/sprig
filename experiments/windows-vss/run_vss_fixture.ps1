@@ -47,7 +47,7 @@ function Resolve-LocalFile([string] $Path) {
 $Requester = Resolve-LocalFile $Requester
 $Sprig = Resolve-LocalFile $Sprig
 $Fixture = Resolve-LocalFile $Fixture
-$pythonCommand = Get-Command $Python -CommandType Application -ErrorAction Stop
+$pythonCommand = Get-Command $Python -CommandType Application -ErrorAction Stop | Select-Object -First 1
 $Python = Resolve-LocalFile $pythonCommand.Source
 $root = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path
 Assert-PlainPath $root

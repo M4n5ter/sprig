@@ -51,7 +51,8 @@ struct State {
 }
 struct Shared {
     core: Arc<WritableCas>,
-    security: SecurityDescriptor,
+    file_security: SecurityDescriptor,
+    directory_security: SecurityDescriptor,
     // Covers callbacks and the controller's gate/busy/sync operations together.
     operation: Mutex<()>,
     state: Mutex<State>,
@@ -239,8 +240,12 @@ fn mode_for(attributes: FileAttributes, directory: bool) -> Result<u32> {
 }
 
 impl WindowsCas {
-    pub(crate) fn new(core: Arc<WritableCas>, security: SecurityDescriptor) -> io::Result<Self> {
-        if security.is_empty() {
+    pub(crate) fn new(
+        core: Arc<WritableCas>,
+        file_security: SecurityDescriptor,
+        directory_security: SecurityDescriptor,
+    ) -> io::Result<Self> {
+        if file_security.is_empty() || directory_security.is_empty() {
             return Err(unsupported(
                 "restricted current-user security descriptor required",
             ));
@@ -257,7 +262,8 @@ impl WindowsCas {
         }
         Ok(Self(Arc::new(Shared {
             core,
-            security,
+            file_security,
+            directory_security,
             operation: Mutex::new(()),
             state: Mutex::new(State {
                 accepting: true,
@@ -314,28 +320,15 @@ impl WindowsCas {
             status(error)
         })
     }
-    fn same_security(&self, proposed: &SecurityDescriptor) -> Result<bool> {
-        if proposed.is_empty() {
-            return Err(STATUS_NOT_SUPPORTED);
+    fn security(&self, directory: bool) -> &SecurityDescriptor {
+        if directory {
+            &self.0.directory_security
+        } else {
+            &self.0.file_security
         }
-        // The binding deliberately keeps the raw descriptor pointer private.
-        // FspSetSecurityDescriptor is an in-memory descriptor transformation,
-        // not an OS ACL mutation. Normalize both onto the SAME protected base,
-        // preserving owner, group, DACL and SACL changes for comparison while
-        // ignoring irrelevant self-relative layout/control encoding differences.
-        // Include SACL so unsupported audit metadata is not silently discarded.
-        const OWNER_GROUP_DACL_SACL: u32 = 0x0000_000f;
-        let expected = self
-            .0
-            .security
-            .set(OWNER_GROUP_DACL_SACL, self.0.security.as_ptr())
-            .map_err(|_| STATUS_NOT_SUPPORTED)?;
-        let candidate = self
-            .0
-            .security
-            .set(OWNER_GROUP_DACL_SACL, proposed.as_ptr())
-            .map_err(|_| STATUS_NOT_SUPPORTED)?;
-        Ok(candidate == expected)
+    }
+    fn same_security(&self, proposed: &SecurityDescriptor, directory: bool) -> Result<bool> {
+        equivalent_security(self.security(directory).as_bytes(), proposed.as_bytes())
     }
     fn parent(&self, name: &str) -> Result<(u64, String)> {
         if name.is_empty() {
@@ -460,6 +453,195 @@ fn nt_error(code: NTSTATUS) -> io::Error {
     ))
 }
 
+// Win32 self-relative descriptor wire fields are documented OS layout, not the
+// private Rust wrapper layout. Bounds are checked before any Win32 dereference.
+// The aligned copy remains owned through all descriptor queries.
+type CheckedAcl = Option<(u8, Vec<Vec<u8>>)>;
+struct CheckedSecurity {
+    storage: Vec<u32>,
+    control: u16,
+    revision: u32,
+    resource_manager_control: u8,
+    acls: [CheckedAcl; 2],
+}
+impl CheckedSecurity {
+    fn new(bytes: &[u8]) -> Result<Self> {
+        use windows_sys::Win32::Security::{
+            GetSecurityDescriptorControl, IsValidSecurityDescriptor,
+        };
+        if bytes.len() < 20 || bytes[0] != 1 {
+            return Err(STATUS_INVALID_SECURITY_DESCR);
+        }
+        let control = u16::from_le_bytes([bytes[2], bytes[3]]);
+        if control & 0x8000 == 0 {
+            return Err(STATUS_INVALID_SECURITY_DESCR);
+        }
+        let offset = |at: usize| -> Result<usize> {
+            let value = u32::from_le_bytes(
+                bytes[at..at + 4]
+                    .try_into()
+                    .map_err(|_| STATUS_INVALID_SECURITY_DESCR)?,
+            ) as usize;
+            if value != 0 && (value < 20 || !value.is_multiple_of(4) || value >= bytes.len()) {
+                return Err(STATUS_INVALID_SECURITY_DESCR);
+            }
+            Ok(value)
+        };
+        // Owner and group SID have an eight-byte header and four-byte subauthorities.
+        for at in [4, 8] {
+            let start = offset(at)?;
+            if start != 0 {
+                let head = bytes
+                    .get(start..start + 8)
+                    .ok_or(STATUS_INVALID_SECURITY_DESCR)?;
+                if head[0] != 1 || head[1] > 15 || start + 8 + head[1] as usize * 4 > bytes.len() {
+                    return Err(STATUS_INVALID_SECURITY_DESCR);
+                }
+            }
+        }
+        let mut acls = [None, None];
+        for (index, at) in [12, 16].into_iter().enumerate() {
+            let start = offset(at)?;
+            if start == 0 {
+                continue;
+            }
+            let present = if index == 0 { 0x0010 } else { 0x0004 };
+            if control & present == 0 {
+                return Err(STATUS_INVALID_SECURITY_DESCR);
+            }
+            let head = bytes
+                .get(start..start + 8)
+                .ok_or(STATUS_INVALID_SECURITY_DESCR)?;
+            let size = u16::from_le_bytes([head[2], head[3]]) as usize;
+            let count = u16::from_le_bytes([head[4], head[5]]) as usize;
+            if size < 8 || !size.is_multiple_of(4) {
+                return Err(STATUS_INVALID_SECURITY_DESCR);
+            }
+            let acl = bytes
+                .get(start..start + size)
+                .ok_or(STATUS_INVALID_SECURITY_DESCR)?;
+            let mut cursor = 8;
+            let mut entries = Vec::new();
+            for _ in 0..count {
+                let header = acl
+                    .get(cursor..cursor + 4)
+                    .ok_or(STATUS_INVALID_SECURITY_DESCR)?;
+                let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+                if size < 4 || !size.is_multiple_of(4) {
+                    return Err(STATUS_INVALID_SECURITY_DESCR);
+                }
+                let mut ace = acl
+                    .get(cursor..cursor + size)
+                    .ok_or(STATUS_INVALID_SECURITY_DESCR)?
+                    .to_vec();
+                // Only the ordinary allow/deny/audit/alarm ACE wire formats are
+                // supported. Reject object/callback/conditional ACEs rather than
+                // guess at embedded SID offsets or discard authorization data.
+                if ace[0] > 3 {
+                    return Err(STATUS_NOT_SUPPORTED);
+                }
+                if ace.len() < 16
+                    || ace[8] != 1
+                    || ace[9] > 15
+                    || 16 + ace[9] as usize * 4 != ace.len()
+                {
+                    return Err(STATUS_INVALID_SECURITY_DESCR);
+                }
+                // Provenance only: retain OI/CI/INHERIT_ONLY/NO_PROPAGATE and
+                // audit flags, every mask, and the complete validated SID.
+                if index == 1 {
+                    ace[1] &= !0x10;
+                } // DACL INHERITED_ACE only
+                entries.push(ace);
+                cursor += size;
+            }
+            // Ignore ACL spare allocation and reserved bytes, but retain revision,
+            // ACE order, ACE type, inheritance behavior, masks and SIDs.
+            acls[index] = Some((head[0], entries));
+        }
+        let mut storage = vec![0_u32; bytes.len().div_ceil(4)];
+        for (word, chunk) in storage.iter_mut().zip(bytes.chunks(4)) {
+            let mut value = [0; 4];
+            value[..chunk.len()].copy_from_slice(chunk);
+            *word = u32::from_ne_bytes(value);
+        }
+        let ptr = storage.as_mut_ptr().cast();
+        let mut checked_control = 0;
+        let mut revision = 0;
+        // SAFETY: self-relative header and every referenced SID/ACL extent were
+        // bounded above; storage is DWORD-aligned and lives through these calls.
+        if unsafe { IsValidSecurityDescriptor(ptr) } == 0
+            || unsafe { GetSecurityDescriptorControl(ptr, &mut checked_control, &mut revision) }
+                == 0
+        {
+            return Err(STATUS_INVALID_SECURITY_DESCR);
+        }
+        Ok(Self {
+            storage,
+            control: checked_control,
+            revision,
+            resource_manager_control: if control & 0x4000 != 0 { bytes[1] } else { 0 },
+            acls,
+        })
+    }
+    fn ptr(&self) -> *mut c_void {
+        self.storage.as_ptr().cast_mut().cast()
+    }
+}
+fn equivalent_security(left: &[u8], right: &[u8]) -> Result<bool> {
+    use windows_sys::Win32::Security::{
+        EqualSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
+    };
+    let left = CheckedSecurity::new(left)?;
+    let right = CheckedSecurity::new(right)?;
+    // Creation canonicalizes onto our immutable fixed ACL. Owner/group origin
+    // and DACL protection/auto-inheritance provenance do not alter the matched
+    // access ACEs. No future parent ACL change can occur: SetSecurity is rejected.
+    // OI/CI/INHERIT_ONLY/NO_PROPAGATE remain exact in each DACL ACE. SACL presence,
+    // contents and control flags remain strict, as do all other control bits.
+    const ENCODING_AND_DEFAULTED: u16 =
+        0x8000 | 0x0001 | 0x0002 | 0x0008 | 0x0100 | 0x0400 | 0x1000;
+    if left.control & !ENCODING_AND_DEFAULTED != right.control & !ENCODING_AND_DEFAULTED
+        || left.revision != right.revision
+        || left.resource_manager_control != right.resource_manager_control
+        || left.acls != right.acls
+    {
+        return Ok(false);
+    }
+    for owner in [true, false] {
+        let mut a = std::ptr::null_mut();
+        let mut b = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: owned aligned descriptors were bounded and validated above;
+        // these accessors return borrowed pointers kept alive by left/right.
+        let (a_ok, b_ok) = unsafe {
+            if owner {
+                (
+                    GetSecurityDescriptorOwner(left.ptr(), &mut a, &mut defaulted),
+                    GetSecurityDescriptorOwner(right.ptr(), &mut b, &mut defaulted),
+                )
+            } else {
+                (
+                    GetSecurityDescriptorGroup(left.ptr(), &mut a, &mut defaulted),
+                    GetSecurityDescriptorGroup(right.ptr(), &mut b, &mut defaulted),
+                )
+            }
+        };
+        if a_ok == 0 || b_ok == 0 {
+            return Err(STATUS_INVALID_SECURITY_DESCR);
+        }
+        if a.is_null() || b.is_null() {
+            if a != b {
+                return Ok(false);
+            }
+        // SAFETY: non-null SIDs belong to the validated, still-live descriptors.
+        } else if unsafe { EqualSid(a, b) } == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl FileSystemInterface for WindowsCas {
     type FileContext = ContextToken;
     const GET_VOLUME_INFO_DEFINED: bool = true;
@@ -501,7 +683,8 @@ impl FileSystemInterface for WindowsCas {
         let attr = self.0.core.lookup_path(&path(name)?).map_err(status)?;
         Ok((
             info(&attr)?.file_attributes(),
-            self.0.security.as_ptr(),
+            self.security(matches!(attr.entry.kind, EntryKind::Directory))
+                .as_ptr(),
             false,
         ))
     }
@@ -515,7 +698,10 @@ impl FileSystemInterface for WindowsCas {
     ) -> Result<(ContextToken, FileInfo)> {
         let _op = self.lock()?;
         check_options(request.create_options)?;
-        if reparse || !buffer.is_empty() || !self.same_security(&security)? {
+        let directory = request
+            .create_options
+            .is(CreateOptions::FILE_DIRECTORY_FILE);
+        if reparse || !buffer.is_empty() || !self.same_security(&security, directory)? {
             return Err(STATUS_NOT_SUPPORTED);
         }
         if !self.state()?.accepting {
@@ -525,9 +711,6 @@ impl FileSystemInterface for WindowsCas {
         if request.allocation_size > i64::MAX as u64 {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let directory = request
-            .create_options
-            .is(CreateOptions::FILE_DIRECTORY_FILE);
         let mode = mode_for(request.file_attributes, directory)?;
         let name = path(name)?;
         let (parent, leaf) = self.parent(&name)?;
@@ -878,8 +1061,11 @@ impl FileSystemInterface for WindowsCas {
     }
     fn get_security(&self, token: ContextToken) -> Result<PSecurityDescriptor> {
         let _op = self.lock()?;
-        self.context(token)?;
-        Ok(self.0.security.as_ptr())
+        let ctx = self.context(token)?;
+        let attr = self.0.core.getattr(ctx.inode).map_err(status)?;
+        Ok(self
+            .security(matches!(attr.entry.kind, EntryKind::Directory))
+            .as_ptr())
     }
     fn set_security(&self, _: ContextToken, _: u32, _: PSecurityDescriptor) -> Result<()> {
         Err(STATUS_NOT_SUPPORTED)
@@ -978,7 +1164,12 @@ mod tests {
         let core = Arc::new(WritableCas::create(&objects, &generation, &base, "r", "g").unwrap());
         // Synthetic callbacks only; this fixture is never mounted.
         let security = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;SY)")).unwrap();
-        (root, WindowsCas::new(core, security).unwrap())
+        let directory_security =
+            SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;OICI;FA;;;SY)")).unwrap();
+        (
+            root,
+            WindowsCas::new(core, security, directory_security).unwrap(),
+        )
     }
     #[test]
     fn preflight_and_filetime_are_checked() {
@@ -1085,11 +1276,77 @@ mod tests {
     #[test]
     fn security_comparison_rejects_other_subjects_and_rights() {
         let (root, adapter) = fixture();
-        assert!(adapter.same_security(&adapter.0.security).unwrap());
+        assert!(
+            adapter
+                .same_security(&adapter.0.file_security, false)
+                .unwrap()
+        );
         let other = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;WD)")).unwrap();
-        assert!(!adapter.same_security(&other).unwrap());
+        assert!(!adapter.same_security(&other, false).unwrap());
         let less = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FR;;;SY)")).unwrap();
-        assert!(!adapter.same_security(&less).unwrap());
+        assert!(!adapter.same_security(&less, false).unwrap());
+        let owner = SecurityDescriptor::from_wstr(u16cstr!("O:BAG:SYD:P(A;;FA;;;SY)")).unwrap();
+        assert!(!adapter.same_security(&owner, false).unwrap());
+        let inheritance =
+            SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;OICI;FA;;;SY)")).unwrap();
+        assert!(!adapter.same_security(&inheritance, false).unwrap());
+        let unprotected =
+            SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:(A;;FA;;;SY)")).unwrap();
+        assert!(adapter.same_security(&unprotected, false).unwrap());
+        let extra =
+            SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")).unwrap();
+        assert!(!adapter.same_security(&extra, false).unwrap());
+        let inherit_only =
+            SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;OIIO;FA;;;SY)")).unwrap();
+        assert!(!adapter.same_security(&inherit_only, false).unwrap());
+        assert!(
+            adapter
+                .same_security(&adapter.0.directory_security, true)
+                .unwrap()
+        );
+        let group = SecurityDescriptor::from_wstr(u16cstr!("O:SYG:BAD:P(A;;FA;;;SY)")).unwrap();
+        assert!(!adapter.same_security(&group, false).unwrap());
+        let audit =
+            SecurityDescriptor::from_wstr(u16cstr!("O:SYG:SYD:P(A;;FA;;;SY)S:(AU;SA;FA;;;SY)"))
+                .unwrap();
+        assert!(!adapter.same_security(&audit, false).unwrap());
+        let bytes = adapter.0.file_security.as_bytes();
+        let mut null_dacl = bytes.to_vec();
+        null_dacl[16..20].fill(0);
+        assert!(!equivalent_security(bytes, &null_dacl).unwrap());
+        let mut absent_dacl = null_dacl.clone();
+        let control = u16::from_le_bytes([absent_dacl[2], absent_dacl[3]]) & !0x0004;
+        absent_dacl[2..4].copy_from_slice(&control.to_le_bytes());
+        assert!(!equivalent_security(bytes, &absent_dacl).unwrap());
+        let mut rearranged = bytes[..20].to_vec();
+        // Repack referenced components in reverse order, with different offsets
+        // and padding. This is the documented self-relative Windows wire format.
+        for at in [16, 12, 8, 4] {
+            let old = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            if old == 0 {
+                continue;
+            }
+            let length = if at < 12 {
+                8 + bytes[old + 1] as usize * 4
+            } else {
+                u16::from_le_bytes([bytes[old + 2], bytes[old + 3]]) as usize
+            };
+            rearranged.extend_from_slice(&[0; 4]);
+            let new = rearranged.len() as u32;
+            rearranged[at..at + 4].copy_from_slice(&new.to_le_bytes());
+            rearranged.extend_from_slice(&bytes[old..old + length]);
+        }
+        let control = u16::from_le_bytes([rearranged[2], rearranged[3]]) | 0x0003;
+        rearranged[2..4].copy_from_slice(&control.to_le_bytes());
+        assert!(equivalent_security(bytes, &rearranged).unwrap());
+        let dacl = u32::from_le_bytes(rearranged[16..20].try_into().unwrap()) as usize;
+        rearranged[dacl + 8 + 1] |= 0x10; // inherited DACL ACE provenance
+        let control = u16::from_le_bytes([rearranged[2], rearranged[3]]);
+        rearranged[2..4].copy_from_slice(&((control & !0x1000) | 0x0400).to_le_bytes());
+        assert!(equivalent_security(bytes, &rearranged).unwrap());
+        let mut malformed = rearranged.clone();
+        malformed[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(equivalent_security(bytes, &malformed).is_err());
         drop(adapter);
         fs::remove_dir_all(root).unwrap();
     }

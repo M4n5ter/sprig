@@ -326,11 +326,16 @@ pub(crate) fn serve(
         );
     }
     winfsp_wrs::init().map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e.to_string()))?;
-    let security = SecurityDescriptor::from_wstr(
-        &U16CString::from_str(current_user_sddl()?).map_err(io::Error::other)?,
+    let sddl = current_user_sddl()?;
+    let security =
+        SecurityDescriptor::from_wstr(&U16CString::from_str(&sddl).map_err(io::Error::other)?)
+            .map_err(io::Error::other)?;
+    // Inherit the same current-user-only access, never the token default DACL.
+    let directory_security = SecurityDescriptor::from_wstr(
+        &U16CString::from_str(sddl.replace("(A;;", "(A;OICI;")).map_err(io::Error::other)?,
     )
     .map_err(io::Error::other)?;
-    let adapter = WindowsCas::new(core, security)?;
+    let adapter = WindowsCas::new(core, security, directory_security)?;
     let record = session::begin(generation, revision)?;
     let mut params = Params::default();
     params
@@ -621,11 +626,16 @@ fn current_user_sddl() -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
     let token = unsafe { File::from_raw_handle(token) };
+    let user = token_sid(&token, 1)?; // TokenUser.
+    let group = token_sid(&token, 5)?; // TokenPrimaryGroup; no ACE grants group access.
+    Ok(format!("O:{user}G:{group}D:P(A;;FA;;;{user})"))
+}
+fn token_sid(token: &File, information_class: u32) -> io::Result<String> {
     let mut needed = 0;
     unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            1,
+            information_class,
             std::ptr::null_mut(),
             0,
             &mut needed,
@@ -639,7 +649,7 @@ fn current_user_sddl() -> io::Result<String> {
     if unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            1,
+            information_class,
             data.as_mut_ptr().cast(),
             needed,
             &mut needed,
@@ -648,7 +658,7 @@ fn current_user_sddl() -> io::Result<String> {
     {
         return Err(io::Error::last_os_error());
     }
-    let sid = data[0] as *mut c_void; // TOKEN_USER begins with SID_AND_ATTRIBUTES.Sid.
+    let sid = data[0] as *mut c_void; // Both TOKEN_USER and TOKEN_PRIMARY_GROUP begin with their SID pointer.
     let mut sid_text = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
         return Err(io::Error::last_os_error());
@@ -666,8 +676,7 @@ fn current_user_sddl() -> io::Result<String> {
     unsafe {
         LocalFree(sid_text.cast());
     }
-    let sid = value?;
-    Ok(format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})"))
+    value
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {

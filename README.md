@@ -905,7 +905,8 @@ retain their own licenses; this does not relicense external filesystem runtimes.
 
 Build with `cargo build --locked --release --features windows-mount` using the
 MSVC toolchain and an explicitly installed WinFsp 2.1 runtime and developer SDK.
-Sprig does not install or update the runtime. This optional adapter is currently
+Sprig does not install or update the runtime. The current mount lifecycle requires
+an elevated process for its checked volume-wide flush. This optional adapter is currently
 under runtime validation; ordinary native and unmounted SDK workspaces remain
 independent of it. After creating an owned workspace with `--writable`, use the
 same `mount`, `checkpoint` and `unmount` commands as on Linux.
@@ -913,6 +914,8 @@ same `mount`, `checkpoint` and `unmount` commands as on Linux.
 The mounted view accepts regular files and directories with Windows-representable
 names and timestamps. It rejects hardlink aliases, symlinks, named streams,
 custom ACL changes and unsupported metadata instead of silently converting them.
+Creation canonicalizes inherited ACL provenance only when the effective fixed
+account, rights and inheritance policy are unchanged.
 The native and unmounted SDK backends retain their hardlink support. This is not
 full NTFS or Linux filesystem parity. The mounted security descriptor is fixed
 for the current account; keep the backing Store private to that account.
@@ -931,5 +934,7 @@ component and mounted lifecycle tests. Default CI does not install it.
 WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 ([upstream](https://github.com/winfsp/winfsp)). WinFsp retains its own
 [license and FLOSS exception](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/License.txt).
-The optional `winfsp_wrs` binding is MIT-licensed; Sprig's MIT license does not
+The optional `winfsp_wrs` binding is MIT-licensed and is vendored with a small
+read-only descriptor accessor; its license and patch provenance are preserved
+in `vendor/winfsp_wrs`. Sprig's MIT license does not
 relicense the runtime or replace its terms.

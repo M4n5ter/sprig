@@ -535,12 +535,14 @@ Sprig 采用 [MIT 许可证](LICENSE)。第三方依赖保留各自的许可证�
 
 使用 MSVC 工具链以及明确安装的 WinFsp 2.1 runtime 和开发 SDK，通过
 `cargo build --locked --release --features windows-mount` 构建。
-Sprig 不负责安装或更新运行时。此可选适配器目前正在进行真实运行验证，普通原生工作区
+Sprig 不负责安装或更新运行时。当前挂载生命周期的卷级刷新要求以提升权限的进程运行。
+此可选适配器目前正在进行真实运行验证，普通原生工作区
 和未挂载 SDK 工作区不依赖它。通过 `--writable` 创建工作区后，使用与 Linux 相同的
 `mount`、`checkpoint` 和 `unmount` 命令。
 
 挂载视图支持名称与时间戳可由 Windows 表示的普通文件和目录。硬链接别名、符号链接、
 命名数据流、自定义 ACL 修改及不支持的元数据均明确拒绝，不做静默转换。
+仅在有效账户、权限和继承规则相同的情况下，创建操作规范化继承 ACL 的来源标记。
 原生及未挂载 SDK 后端仍保留硬链接能力。这不代表完整 NTFS 或 Linux 文件系统对等。
 挂载安全描述符固定为当前账户；请确保后备 Store 仅供该账户访问。
 
@@ -555,4 +557,5 @@ CLI 不强制卸载、不杀进程、不安装驱动，也不重启机器。
 WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 （[上游](https://github.com/winfsp/winfsp)）。WinFsp 保留自身的
 [许可证及 FLOSS 例外](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/License.txt)。
-可选 `winfsp_wrs` 绑定采用 MIT；Sprig 的 MIT 不重新授权运行时，也不替代其条款。
+可选 `winfsp_wrs` 绑定采用 MIT，本仓库保留其源码，仅增加只读描述符访问接口；
+`vendor/winfsp_wrs` 保留原许可证及修改来源。Sprig 的 MIT 不重新授权运行时，也不替代其条款。

@@ -1,8 +1,10 @@
 //! Shared immutable pages for the canonical, sorted flat manifest JSON stream.
 //!
-//! This is a bounded representation, not a second manifest model. CDC cuts may
-//! split JSON records. Reads reassemble and validate the exact canonical bytes
-//! before returning the ordinary public `Manifest`. A writer finishes its one
+//! This is a bounded representation, not a second manifest model. Path-only
+//! entry groups keep value edits from moving later groups. Physical pages align
+//! with entries except when a single oversized entry must span several pages.
+//! Reads reassemble and validate the exact canonical bytes before returning the
+//! ordinary public `Manifest`. A writer finishes its one
 //! object batch before returning any usable root; the caller still owns durable
 //! root/revision publication. Readers reuse one caller-owned packed snapshot.
 
@@ -11,35 +13,55 @@ use std::fmt;
 use std::io::{self, BufRead, Cursor, Read, Write};
 use std::path::Path;
 
-use fastcdc::v2020::FastCDC;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::content::{self, Entry, EntryKind, Manifest, ObjectBatch};
 use crate::{Result, metadata, packed};
 
-const MIN_PAGE_BYTES: usize = 16 * 1024;
-const AVG_PAGE_BYTES: usize = 64 * 1024;
+const MIN_GROUP_ENTRIES: usize = 64;
+const ANCHOR_PERIOD_ENTRIES: usize = 128;
+const MAX_GROUP_ENTRIES: usize = 256;
 const MAX_PAGE_BYTES: usize = 256 * 1024;
 // Bound decoded metadata and references. Never silently truncate a larger manifest.
 const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
-const MAX_PAGES: usize = MAX_MANIFEST_BYTES / MIN_PAGE_BYTES;
+// At most ceil(N / MIN_GROUP_ENTRIES) logical groups. Within each group,
+// ordinary greedy entry-aligned runs use at most 2 * raw_bytes / MAX_PAGE_BYTES
+// pages plus one per run: every adjacent pair exceeds MAX_PAGE_BYTES. Isolating
+// each oversized entry adds one run and at most ceil(entry_bytes / MAX_PAGE_BYTES)
+// fragments; since each such entry exceeds MAX_PAGE_BYTES, the total is bounded
+// by groups + 3 * raw_bytes / MAX_PAGE_BYTES. Small group ends and isolated
+// remainders are valid non-final pages, so the old 16 KiB minimum cannot apply.
+const MAX_PAGES: usize =
+    MAX_ENTRIES.div_ceil(MIN_GROUP_ENTRIES) + 3 * MAX_MANIFEST_BYTES.div_ceil(MAX_PAGE_BYTES);
 const MAX_ENCODED_PAGE_BYTES: usize = 512 * 1024;
-const MAX_PAGE_CHUNKS: usize = MAX_ENCODED_PAGE_BYTES / MIN_PAGE_BYTES + 1;
-const MANIFEST_DOMAIN: &[u8] = b"sprig-manifest-pages-v1\0";
-const PAGE_DOMAIN: &[u8] = b"sprig-manifest-json-page-v1\0";
+// Format envelope for the locked metadata encoder: zstd 1.5.7 level 1,
+// pledged size, 1 MiB window, no intermediate flush, <=256 KiB input.
+// Pre-split pieces are >=8 KiB. Nonexpanding blocks
+// (at most 32, each 3-byte header), frame header <=18, checksum 4 and final
+// empty block <=3 give N+121. Keep ample margin, not a claim about arbitrary
+// streaming zstd encoders. Revisit when encoder settings/dependency change.
+const MAX_PAGE_ENCODING_OVERHEAD: usize = 4096;
+const MAX_TOTAL_ENCODED_BYTES: u64 =
+    (MAX_MANIFEST_BYTES + MAX_PAGES * MAX_PAGE_ENCODING_OVERHEAD) as u64;
+// Encoded objects still use the ordinary content codec's 16 KiB minimum chunk.
+const MIN_OBJECT_CHUNK_BYTES: usize = 16 * 1024;
+const MAX_PAGE_CHUNKS: usize = MAX_ENCODED_PAGE_BYTES / MIN_OBJECT_CHUNK_BYTES + 1;
+const MANIFEST_DOMAIN: &[u8] = b"sprig-manifest-path-pages-v2\0";
+const PAGE_DOMAIN: &[u8] = b"sprig-manifest-path-json-page-v2\0";
+const ANCHOR_DOMAIN: &[u8] = b"sprig-manifest-path-anchor-v1\0";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ManifestFormat {
-    #[serde(rename = "sprig_manifest_pages_v1")]
-    FlatJsonCdcZstdV1,
+    #[serde(rename = "sprig_manifest_path_pages_v2")]
+    FlatJsonPathZstdV2,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum PageFormat {
-    #[serde(rename = "sprig_manifest_json_page_v1")]
-    JsonFragmentZstdV1,
+    #[serde(rename = "sprig_manifest_path_json_page_v2")]
+    JsonFragmentZstdV2,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,21 +238,104 @@ impl Write for LimitedBytes {
     }
 }
 
-fn page_length(bytes: &[u8]) -> usize {
-    let input = &bytes[..bytes.len().min(MAX_PAGE_BYTES)];
-    FastCDC::new(
-        input,
-        MIN_PAGE_BYTES as _,
-        AVG_PAGE_BYTES as _,
-        MAX_PAGE_BYTES as _,
-    )
-    .next()
-    .expect("nonempty manifest JSON has a CDC page")
-    .length
+// Both bounded sinks already track accepted bytes. Reuse that position rather
+// than incrementing a second counter for every serde fragment. Callers start
+// each canonical emission with an empty/zero-position sink.
+trait PositionedWrite: Write {
+    fn position(&self) -> usize;
+}
+impl PositionedWrite for LimitedBytes {
+    fn position(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
-/// Store compressed CDC pages and finish the single durability batch before
-/// returning their root. The caller must then durably publish that root.
+/// Identical to serde_json's canonical BTreeMap emission. The first span owns
+/// the opening brace, later spans their leading commas, and the last span the
+/// closing brace. Every offset is recorded in the same bounded serialization.
+fn emit_canonical(manifest: &Manifest, writer: &mut impl PositionedWrite) -> Result<Vec<usize>> {
+    let mut ends = Vec::with_capacity(manifest.len());
+    writer.write_all(b"{")?;
+    for (number, (path, entry)) in manifest.iter().enumerate() {
+        if number != 0 {
+            writer.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *writer, path)?;
+        writer.write_all(b":")?;
+        serde_json::to_writer(&mut *writer, entry)?;
+        ends.push(writer.position());
+    }
+    writer.write_all(b"}")?;
+    if let Some(last) = ends.last_mut() {
+        *last = writer.position();
+    }
+    Ok(ends)
+}
+
+fn path_anchor(path: &str) -> bool {
+    let mut hash = blake3::Hasher::new();
+    hash.update(ANCHOR_DOMAIN);
+    hash.update(&(path.len() as u64).to_le_bytes());
+    hash.update(path.as_bytes());
+    hash.finalize().as_bytes()[0] & (ANCHOR_PERIOD_ENTRIES - 1) as u8 == 0
+}
+
+fn finish_page(lengths: &mut Vec<usize>, pending: &mut usize) -> Result<()> {
+    if *pending != 0 {
+        if *pending > MAX_PAGE_BYTES || lengths.len() == MAX_PAGES {
+            return Err(invalid("manifest exceeds the page representation limit"));
+        }
+        lengths.push(*pending);
+        *pending = 0;
+    }
+    Ok(())
+}
+
+/// Path-only logical groups are not stored as another tree. Byte-cap cuts stay
+/// inside a group and never reset its path schedule. Entry sizes can therefore
+/// affect only the physical pages of their own group, not all following groups.
+fn page_lengths(manifest: &Manifest, ends: &[usize]) -> Result<Vec<usize>> {
+    if manifest.is_empty() || manifest.len() > MAX_ENTRIES || ends.len() != manifest.len() {
+        return Err(invalid("invalid manifest entry spans"));
+    }
+    let mut lengths = Vec::new();
+    let mut previous = 0;
+    let mut pending = 0;
+    let mut group_entries = 0;
+    for (path, &end) in manifest.keys().zip(ends) {
+        if end <= previous || end > MAX_MANIFEST_BYTES {
+            return Err(invalid("invalid manifest entry byte offset"));
+        }
+        let length = end - previous;
+        previous = end;
+        if length > MAX_PAGE_BYTES {
+            finish_page(&mut lengths, &mut pending)?;
+            let mut remaining = length;
+            while remaining != 0 {
+                pending = remaining.min(MAX_PAGE_BYTES);
+                remaining -= pending;
+                finish_page(&mut lengths, &mut pending)?;
+            }
+        } else {
+            if pending + length > MAX_PAGE_BYTES {
+                finish_page(&mut lengths, &mut pending)?;
+            }
+            pending += length;
+        }
+        group_entries += 1;
+        if group_entries == MAX_GROUP_ENTRIES
+            || (group_entries >= MIN_GROUP_ENTRIES && path_anchor(path))
+        {
+            finish_page(&mut lengths, &mut pending)?;
+            group_entries = 0;
+        }
+    }
+    finish_page(&mut lengths, &mut pending)?;
+    Ok(lengths)
+}
+
+/// Store compressed path-group pages and finish the single durability batch
+/// before returning their root. The caller must then durably publish that root.
 pub(crate) fn write(manifest: &Manifest, objects: &Path) -> Result<StoredManifest> {
     if manifest.len() > MAX_ENTRIES {
         return Err(invalid("manifest exceeds the entry-count limit"));
@@ -240,30 +345,36 @@ pub(crate) fn write(manifest: &Manifest, objects: &Path) -> Result<StoredManifes
         bytes: Vec::new(),
         limit: MAX_MANIFEST_BYTES,
     };
-    serde_json::to_writer(&mut output, manifest)?;
+    let ends = emit_canonical(manifest, &mut output)?;
+    let lengths = page_lengths(manifest, &ends)?;
     let raw = output.bytes;
     let mut root = StoredManifest {
-        format: ManifestFormat::FlatJsonCdcZstdV1,
+        format: ManifestFormat::FlatJsonPathZstdV2,
         raw_bytes: raw.len() as u64,
         hash: digest(MANIFEST_DOMAIN, &raw),
         pages: Vec::new(),
     };
     let mut batch = ObjectBatch::open(objects)?;
     let mut remaining = raw.as_slice();
-    while !remaining.is_empty() {
-        let length = page_length(remaining);
+    for length in lengths {
         let bytes = &remaining[..length];
         let encoded = metadata::encode(bytes)?;
-        if encoded.len() > MAX_ENCODED_PAGE_BYTES || root.pages.len() == MAX_PAGES {
+        if encoded.len() > MAX_ENCODED_PAGE_BYTES
+            || encoded.len() > length + MAX_PAGE_ENCODING_OVERHEAD
+            || root.pages.len() == MAX_PAGES
+        {
             return Err(invalid("manifest exceeds the page representation limit"));
         }
         root.pages.push(StoredPage {
-            format: PageFormat::JsonFragmentZstdV1,
+            format: PageFormat::JsonFragmentZstdV2,
             raw_bytes: length as u32,
             hash: digest(PAGE_DOMAIN, bytes),
             encoded: batch.put_reader(&mut Cursor::new(encoded))?,
         });
         remaining = &remaining[length..];
+    }
+    if !remaining.is_empty() {
+        return Err(invalid("manifest pages do not cover the canonical bytes"));
     }
     validate_root(&root)?;
     batch.finish()?;
@@ -280,13 +391,10 @@ fn validate_root(root: &StoredManifest) -> Result<()> {
         return Err(invalid("invalid manifest root bounds or hash"));
     }
     let mut total = 0_u64;
-    for (number, page) in root.pages.iter().enumerate() {
+    let mut encoded_total = 0_u64;
+    for page in &root.pages {
         let length = page.raw_bytes as usize;
-        if length == 0
-            || length > MAX_PAGE_BYTES
-            || (number + 1 != root.pages.len() && length < MIN_PAGE_BYTES)
-            || !valid_hash(&page.hash)
-        {
+        if length == 0 || length > MAX_PAGE_BYTES || !valid_hash(&page.hash) {
             return Err(invalid("invalid manifest page bounds or hash"));
         }
         let EntryKind::File { size, chunks } = &page.encoded else {
@@ -294,6 +402,7 @@ fn validate_root(root: &StoredManifest) -> Result<()> {
         };
         if *size == 0
             || *size > MAX_ENCODED_PAGE_BYTES as u64
+            || *size > page.raw_bytes as u64 + MAX_PAGE_ENCODING_OVERHEAD as u64
             || chunks.is_empty()
             || chunks.len() > MAX_PAGE_CHUNKS
             || chunks.len() as u64 > *size
@@ -302,6 +411,10 @@ fn validate_root(root: &StoredManifest) -> Result<()> {
         {
             return Err(invalid("invalid encoded manifest page storage"));
         }
+        encoded_total = encoded_total
+            .checked_add(*size)
+            .filter(|total| *total <= MAX_TOTAL_ENCODED_BYTES)
+            .ok_or_else(|| invalid("manifest encoded byte budget exceeded"))?;
         total = total
             .checked_add(page.raw_bytes as u64)
             .ok_or_else(|| invalid("manifest page length overflow"))?;
@@ -391,6 +504,11 @@ struct CanonicalCheck<'a> {
     expected: &'a [u8],
     offset: usize,
 }
+impl PositionedWrite for CanonicalCheck<'_> {
+    fn position(&self) -> usize {
+        self.offset
+    }
+}
 impl Write for CanonicalCheck<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let remaining = &self.expected[self.offset..];
@@ -408,7 +526,7 @@ impl Write for CanonicalCheck<'_> {
     }
 }
 
-fn parse_canonical(raw: &[u8], entry_limit: usize) -> Result<Manifest> {
+fn parse_canonical(raw: &[u8], entry_limit: usize) -> Result<(Manifest, Vec<usize>)> {
     let mut decoder = serde_json::Deserializer::from_slice(raw);
     let manifest =
         Deserializer::deserialize_map(&mut decoder, OrderedManifestVisitor { entry_limit })?;
@@ -418,11 +536,11 @@ fn parse_canonical(raw: &[u8], entry_limit: usize) -> Result<Manifest> {
         expected: raw,
         offset: 0,
     };
-    serde_json::to_writer(&mut check, &manifest)?;
+    let ends = emit_canonical(&manifest, &mut check)?;
     if check.offset != raw.len() {
         return Err(invalid("trailing noncanonical manifest JSON"));
     }
-    Ok(manifest)
+    Ok((manifest, ends))
 }
 
 /// Flatten pages through a single validated caller-owned index snapshot.
@@ -451,14 +569,16 @@ fn read_with(
     if raw.len() as u64 != root.raw_bytes || digest(MANIFEST_DOMAIN, &raw) != root.hash {
         return Err(invalid("manifest byte length or canonical digest mismatch"));
     }
-    let mut remaining = raw.as_slice();
-    for page in &root.pages {
-        if page_length(remaining) != page.raw_bytes as usize {
-            return Err(invalid("noncanonical manifest CDC page boundaries"));
-        }
-        remaining = &remaining[page.raw_bytes as usize..];
+    let (manifest, ends) = parse_canonical(&raw, MAX_ENTRIES)?;
+    let lengths = page_lengths(&manifest, &ends)?;
+    if !lengths
+        .iter()
+        .copied()
+        .eq(root.pages.iter().map(|page| page.raw_bytes as usize))
+    {
+        return Err(invalid("noncanonical manifest path-group page boundaries"));
     }
-    parse_canonical(&raw, MAX_ENTRIES)
+    Ok(manifest)
 }
 
 /// Metadata object chunks only. File-payload chunks remain in the flattened
@@ -487,6 +607,54 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    fn temp_dir() -> TestDir {
+        let path = std::env::temp_dir().join(format!(
+            "sprig-manifest-pages-{}-{}",
+            std::process::id(),
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        TestDir(fs::canonicalize(path).unwrap())
+    }
+
+    fn planned(manifest: &Manifest) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
+        let mut output = LimitedBytes {
+            bytes: Vec::new(),
+            limit: MAX_MANIFEST_BYTES,
+        };
+        let ends = emit_canonical(manifest, &mut output).unwrap();
+        let lengths = page_lengths(manifest, &ends).unwrap();
+        assert_eq!(output.bytes, serde_json::to_vec(manifest).unwrap());
+        assert_eq!(lengths.iter().sum::<usize>(), output.bytes.len());
+        (output.bytes, ends, lengths)
+    }
+
+    fn split_root(raw: &[u8], lengths: &[usize], objects: &Path) -> StoredManifest {
+        assert_eq!(lengths.iter().sum::<usize>(), raw.len());
+        let mut root = StoredManifest {
+            format: ManifestFormat::FlatJsonPathZstdV2,
+            raw_bytes: raw.len() as u64,
+            hash: digest(MANIFEST_DOMAIN, raw),
+            pages: Vec::new(),
+        };
+        let mut batch = ObjectBatch::open(objects).unwrap();
+        let mut offset = 0;
+        for &length in lengths {
+            let bytes = &raw[offset..offset + length];
+            root.pages.push(StoredPage {
+                format: PageFormat::JsonFragmentZstdV2,
+                raw_bytes: length as u32,
+                hash: digest(PAGE_DOMAIN, bytes),
+                encoded: batch
+                    .put_reader(&mut Cursor::new(metadata::encode(bytes).unwrap()))
+                    .unwrap(),
+            });
+            offset += length;
+        }
+        batch.finish().unwrap();
+        root
+    }
+
     fn fixture() -> Manifest {
         let mut manifest = Manifest::new();
         manifest.insert(
@@ -538,11 +706,11 @@ mod tests {
         let storage = batch.put_reader(&mut Cursor::new(encoded)).unwrap();
         batch.finish().unwrap();
         StoredManifest {
-            format: ManifestFormat::FlatJsonCdcZstdV1,
+            format: ManifestFormat::FlatJsonPathZstdV2,
             raw_bytes: raw.len() as u64,
             hash: digest(MANIFEST_DOMAIN, raw),
             pages: vec![StoredPage {
-                format: PageFormat::JsonFragmentZstdV1,
+                format: PageFormat::JsonFragmentZstdV2,
                 raw_bytes: raw.len() as u32,
                 hash: digest(PAGE_DOMAIN, raw),
                 encoded: storage,
@@ -552,13 +720,7 @@ mod tests {
 
     #[test]
     fn roundtrip_corruption_and_limits() {
-        let path = std::env::temp_dir().join(format!(
-            "sprig-manifest-pages-{}-{}",
-            std::process::id(),
-            NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        let temp = TestDir(fs::canonicalize(path).unwrap());
+        let temp = temp_dir();
         let objects = temp.0.join("objects");
         let original = fixture();
         let root = write(&original, &objects).unwrap();
@@ -605,10 +767,24 @@ mod tests {
             )
             .is_err()
         );
-        let wrong_domain = String::from_utf8(encoded_root.clone())
-            .unwrap()
-            .replace("sprig_manifest_pages_v1", "sprig_manifest_pages_v2");
-        assert!(serde_json::from_str::<StoredManifest>(&wrong_domain).is_err());
+        for (current, old) in [
+            ("sprig_manifest_path_pages_v2", "sprig_manifest_pages_v1"),
+            (
+                "sprig_manifest_path_json_page_v2",
+                "sprig_manifest_json_page_v1",
+            ),
+        ] {
+            let wrong_format = String::from_utf8(encoded_root.clone())
+                .unwrap()
+                .replace(current, old);
+            assert!(serde_json::from_str::<StoredManifest>(&wrong_format).is_err());
+        }
+        let mut wrong_domain = root.clone();
+        wrong_domain.hash = digest(
+            b"sprig-manifest-pages-v1\0",
+            &serde_json::to_vec(&original).unwrap(),
+        );
+        assert!(read(&wrong_domain, &reader).is_err());
         let mut too_many = root.clone();
         too_many.pages = vec![root.pages[0].clone(); MAX_PAGES + 1];
         assert!(
@@ -665,5 +841,350 @@ mod tests {
             let bad = raw_root(&raw, &objects, Some(bytes));
             assert!(read(&bad, &packed::Reader::open(&objects).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn path_groups_ignore_id_seeds_and_value_edits() {
+        let temp = temp_dir();
+        let objects = temp.0.join("objects");
+        let original: Manifest = fixture().into_iter().take(334).collect();
+        let mut expected_lengths = None;
+        for seed in 0_u64..8 {
+            let mut manifest = original.clone();
+            for (path, entry) in &mut manifest {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"sprig-path-page-test-identity\0");
+                hash.update(&seed.to_le_bytes());
+                hash.update(path.as_bytes());
+                entry.id = hash.finalize().to_hex().to_string();
+            }
+            let (raw, ends, lengths) = planned(&manifest);
+            assert!(lengths.len() >= 2);
+            if let Some(expected) = &expected_lengths {
+                assert_eq!(&lengths, expected);
+            } else {
+                expected_lengths = Some(lengths.clone());
+            }
+            let (parsed, parsed_ends) = parse_canonical(&raw, MAX_ENTRIES).unwrap();
+            assert_eq!(parsed, manifest);
+            assert_eq!(parsed_ends, ends);
+            let before = write(&manifest, &objects).unwrap();
+            assert_eq!(write(&manifest, &objects).unwrap(), before);
+            assert_eq!(
+                read(&before, &packed::Reader::open(&objects).unwrap()).unwrap(),
+                manifest
+            );
+
+            let entry = manifest.get_mut("file-0000").unwrap();
+            let EntryKind::File { chunks, .. } = &mut entry.kind else {
+                unreachable!();
+            };
+            chunks[0] = blake3::hash(b"edited payload").to_hex().to_string();
+            let (_, _, edited_lengths) = planned(&manifest);
+            assert_eq!(edited_lengths, lengths);
+            let after = write(&manifest, &objects).unwrap();
+            assert_ne!(before.pages[0].hash, after.pages[0].hash);
+            assert_eq!(&before.pages[1..], &after.pages[1..]);
+            assert_eq!(
+                read(&after, &packed::Reader::open(&objects).unwrap()).unwrap(),
+                manifest
+            );
+
+            // A value's encoded length can change without moving later groups.
+            manifest
+                .get_mut("file-0000")
+                .unwrap()
+                .id
+                .push_str("-longer");
+            let longer = write(&manifest, &objects).unwrap();
+            assert_eq!(&after.pages[1..], &longer.pages[1..]);
+        }
+    }
+
+    #[test]
+    fn canonical_emission_insert_delete_rename_and_wrong_partitions() {
+        let temp = temp_dir();
+        let objects = temp.0.join("objects");
+        let original = fixture();
+        let before = write(&original, &objects).unwrap();
+        for operation in 0..3 {
+            let mut changed = original.clone();
+            match operation {
+                0 => {
+                    let mut entry = changed["file-1000"].clone();
+                    entry.id = "inserted-identity".into();
+                    changed.insert("file-1000-new".into(), entry);
+                }
+                1 => {
+                    changed.remove("file-1000").unwrap();
+                }
+                2 => {
+                    let entry = changed.remove("file-1000").unwrap();
+                    changed.insert("file-1000-renamed".into(), entry);
+                }
+                _ => unreachable!(),
+            }
+            let after = write(&changed, &objects).unwrap();
+            // The first three groups contain at most 768 entries. All precede
+            // these edits, without assuming constant-size insertion churn.
+            assert_eq!(&before.pages[..3], &after.pages[..3]);
+            assert_eq!(write(&changed, &objects).unwrap(), after);
+            assert_eq!(
+                read(&after, &packed::Reader::open(&objects).unwrap()).unwrap(),
+                changed
+            );
+        }
+
+        // The emitter must match serde even for escaped strings, UTF-8 paths,
+        // wide signed timestamps, symlink byte arrays and optional link groups.
+        let mut escaped = original.clone();
+        let mut entry = escaped["file-0000"].clone();
+        entry.id = "escaped-\"-\\-\n".into();
+        entry.link_group = Some("linked-\"-\\".into());
+        escaped.insert("é-雪".into(), entry);
+        let (raw, ends, _) = planned(&escaped);
+        assert_eq!(parse_canonical(&raw, MAX_ENTRIES).unwrap(), (escaped, ends));
+
+        let small: Manifest = original.into_iter().take(334).collect();
+        let (raw, _, lengths) = planned(&small);
+        assert!(lengths.len() > 1 && raw.len() < MAX_PAGE_BYTES);
+        for wrong_lengths in [vec![raw.len()], vec![1, raw.len() - 1]] {
+            let root = split_root(&raw, &wrong_lengths, &objects);
+            validate_root(&root).unwrap();
+            let error = read(&root, &packed::Reader::open(&objects).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("page boundaries"), "{error}");
+        }
+    }
+
+    #[test]
+    fn oversized_entry_fragments_reset_without_moving_later_groups() {
+        let temp = temp_dir();
+        let objects = temp.0.join("objects");
+        let mut manifest = fixture();
+        let small = write(&manifest, &objects).unwrap();
+        let (_, small_ends, _) = planned(&manifest);
+        // Each serialized chunk hash occupies 67 bytes including its separator.
+        // This makes an actual entry just over two page caps, not a 64 MiB test.
+        let count = 2 * MAX_PAGE_BYTES / 67 + 1;
+        manifest.get_mut("file-0300").unwrap().kind = EntryKind::File {
+            size: count as u64,
+            chunks: vec!["a".repeat(64); count],
+        };
+        let (_, ends, _) = planned(&manifest);
+        let index = manifest
+            .keys()
+            .position(|path| path == "file-0300")
+            .unwrap();
+        let entry_bytes = ends[index] - ends[index - 1];
+        assert!(entry_bytes > 2 * MAX_PAGE_BYTES);
+        assert!(entry_bytes < 2 * MAX_PAGE_BYTES + MIN_OBJECT_CHUNK_BYTES);
+        let before = write(&manifest, &objects).unwrap();
+        assert_eq!(
+            read(&before, &packed::Reader::open(&objects).unwrap()).unwrap(),
+            manifest
+        );
+        let mut group_entries = 0;
+        let group_end = manifest
+            .keys()
+            .enumerate()
+            .find_map(|(position, path)| {
+                group_entries += 1;
+                if group_entries == MAX_GROUP_ENTRIES
+                    || (group_entries >= MIN_GROUP_ENTRIES && path_anchor(path))
+                {
+                    group_entries = 0;
+                    if position >= index {
+                        return Some(position);
+                    }
+                }
+                None
+            })
+            .unwrap();
+        let suffix = |root: &StoredManifest, end: usize| {
+            let mut total = 0;
+            root.pages
+                .iter()
+                .position(|page| {
+                    total += page.raw_bytes as usize;
+                    total == end
+                })
+                .unwrap()
+                + 1
+        };
+        let small_suffix = suffix(&small, small_ends[group_end]);
+        let large_suffix = suffix(&before, ends[group_end]);
+        assert!(small_suffix < small.pages.len());
+        assert_eq!(&small.pages[small_suffix..], &before.pages[large_suffix..]);
+        let mut offset = 0;
+        let tail_page = before
+            .pages
+            .iter()
+            .position(|page| {
+                offset += page.raw_bytes as usize;
+                offset == ends[index]
+            })
+            .unwrap();
+        assert_eq!(
+            before.pages[tail_page - 1].raw_bytes as usize,
+            MAX_PAGE_BYTES
+        );
+        assert_eq!(
+            before.pages[tail_page - 2].raw_bytes as usize,
+            MAX_PAGE_BYTES
+        );
+        assert!((before.pages[tail_page].raw_bytes as usize) < MIN_OBJECT_CHUNK_BYTES);
+        assert!(tail_page + 1 < before.pages.len());
+        let EntryKind::File { size, chunks } = &mut manifest.get_mut("file-0300").unwrap().kind
+        else {
+            unreachable!();
+        };
+        *size += 1;
+        chunks.push("b".repeat(64));
+        let after = write(&manifest, &objects).unwrap();
+        assert_eq!(
+            &before.pages[tail_page + 1..],
+            &after.pages[tail_page + 1..]
+        );
+        assert_ne!(before.pages[tail_page].hash, after.pages[tail_page].hash);
+        let mut point = packed::PointReader::open(&objects).unwrap();
+        assert_eq!(read_point(&after, &mut point).unwrap(), manifest);
+    }
+
+    #[test]
+    fn encoded_envelope_rejects_before_object_reads() {
+        // Exercise incompressible data around the locked encoder's block cuts.
+        // These representative checks complement, not replace, the bound proof.
+        let mut random = 0x9e3779b97f4a7c15_u64;
+        for length in [1, 8191, 8192, 131071, 131072, MAX_PAGE_BYTES] {
+            let bytes: Vec<u8> = (0..length)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    random as u8
+                })
+                .collect();
+            let encoded = metadata::encode(&bytes).unwrap();
+            assert!(encoded.len() <= length + MAX_PAGE_ENCODING_OVERHEAD);
+        }
+        let temp = temp_dir();
+        let objects = temp.0.join("objects");
+        let original = fixture();
+        let root = write(&original, &objects).unwrap();
+        for size in [u64::MAX, root.pages[0].raw_bytes as u64 + 4097] {
+            let mut bad = root.clone();
+            bad.pages[0].encoded = EntryKind::File {
+                size,
+                chunks: vec!["0".repeat(64)],
+            };
+            assert!(validate_root(&bad).is_err());
+            // No reader callback may run for an invalid declared envelope.
+            let error = read_with(&bad, &mut |_| panic!("invalid root reached object IO"));
+            assert!(error.is_err());
+        }
+        let mut aggregate = root.clone();
+        let mut page = root.pages[0].clone();
+        page.raw_bytes = 8192;
+        page.encoded = EntryKind::File {
+            size: 8192 + 4096,
+            chunks: vec!["0".repeat(64)],
+        };
+        aggregate.pages = vec![page; MAX_PAGES];
+        aggregate.raw_bytes = MAX_MANIFEST_BYTES as u64;
+        let error =
+            read_with(&aggregate, &mut |_| panic!("budget failure reached IO")).unwrap_err();
+        assert!(error.to_string().contains("encoded byte budget"), "{error}");
+        assert_eq!(MAX_TOTAL_ENCODED_BYTES, 128 * 1024 * 1024 + 36 * 1024);
+    }
+
+    #[test]
+    fn path_page_caps_and_bounded_canonical_sink() {
+        assert_eq!(MAX_PAGES, 16_393);
+        let source = fixture();
+        let single: Manifest = source
+            .iter()
+            .take(1)
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect();
+        // Synthetic spans exercise the planner at the exact 64 MiB cap without
+        // allocating a second huge JSON document or claiming a huge roundtrip.
+        for bytes in [
+            MAX_PAGE_BYTES - 1,
+            MAX_PAGE_BYTES,
+            MAX_PAGE_BYTES + 1,
+            2 * MAX_PAGE_BYTES + 1,
+            MAX_MANIFEST_BYTES,
+        ] {
+            let lengths = page_lengths(&single, &[bytes]).unwrap();
+            assert_eq!(lengths.iter().sum::<usize>(), bytes);
+            assert_eq!(lengths.len(), bytes.div_ceil(MAX_PAGE_BYTES));
+            assert!(
+                lengths
+                    .iter()
+                    .all(|&length| length != 0 && length <= MAX_PAGE_BYTES)
+            );
+        }
+        assert!(page_lengths(&single, &[MAX_MANIFEST_BYTES + 1]).is_err());
+        assert!(page_lengths(&single, &[0]).is_err());
+        assert!(page_lengths(&single, &[]).is_err());
+        let pair: Manifest = source
+            .iter()
+            .take(2)
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect();
+        let half = MAX_PAGE_BYTES / 2 + 1;
+        assert_eq!(
+            page_lengths(&pair, &[half, 2 * half]).unwrap(),
+            vec![half, half]
+        );
+
+        let no_anchors: Manifest = source
+            .iter()
+            .filter(|(path, _)| path.is_empty() || !path_anchor(path))
+            .take(MAX_GROUP_ENTRIES + 1)
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect();
+        assert_eq!(no_anchors.len(), MAX_GROUP_ENTRIES + 1);
+        let tiny_ends: Vec<usize> = (1..=no_anchors.len()).collect();
+        assert_eq!(page_lengths(&no_anchors, &tiny_ends).unwrap(), vec![256, 1]);
+        assert!(page_lengths(&no_anchors, &vec![1; no_anchors.len()]).is_err());
+
+        // Alternating tiny and oversized spans stress the page-bound proof.
+        let alternating: Manifest = source
+            .iter()
+            .take(511)
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect();
+        let mut end = 0;
+        let ends: Vec<usize> = (0..alternating.len())
+            .map(|index| {
+                end += if index % 2 == 0 {
+                    1
+                } else {
+                    MAX_PAGE_BYTES + 1
+                };
+                end
+            })
+            .collect();
+        let lengths = page_lengths(&alternating, &ends).unwrap();
+        assert!(end <= MAX_MANIFEST_BYTES);
+        assert_eq!(lengths.iter().sum::<usize>(), end);
+        assert!(
+            lengths.len()
+                <= alternating.len().div_ceil(MIN_GROUP_ENTRIES) + 3 * end.div_ceil(MAX_PAGE_BYTES)
+        );
+
+        let canonical = serde_json::to_vec(&single).unwrap();
+        for limit in [canonical.len() - 1, canonical.len()] {
+            let mut output = LimitedBytes {
+                bytes: Vec::new(),
+                limit,
+            };
+            let result = emit_canonical(&single, &mut output);
+            assert_eq!(result.is_ok(), limit == canonical.len());
+            assert!(output.bytes.len() <= limit);
+        }
+        assert!(parse_canonical(&canonical, 0).is_err());
+        assert_eq!(parse_canonical(&canonical, 1).unwrap().0, single);
     }
 }

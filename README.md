@@ -570,20 +570,25 @@ STORE/
   file-cache/         # Disposable, bounded verified whole-file clone sources
 ```
 
-Revision manifests are canonical sorted JSON streams split into content-defined
-pages. Each page is independently compressed with checksummed Zstandard and stored
+Revision manifests are canonical sorted JSON streams split into path-defined entry
+groups, then entry-aligned pages of at most 256 KiB. Oversized entries use fixed
+fragments within their group. Paths, not random entry IDs or content values,
+define logical group boundaries. Each page is independently compressed with checksummed Zstandard and stored
 in the same immutable object packs as file chunks; unchanged pages are shared
 across history. A small revision envelope records parents, clock, message and the
 typed page root. Its canonical JSON hash identifies the revision. Reads verify
 encoded objects, page and root domain-separated hashes, lengths, canonical order,
-unique paths and CDC boundaries before reconstructing the public manifest.
+unique paths and exact path-group/page boundaries before reconstructing the public manifest.
 Metadata backups remain compressed complete Store states. Roots are retained unless explicitly retired by the retention command.
 
-Current limits are 64 MiB canonical manifest bytes, one million entries and 4,096
-pages. Native capture still scans files; page sharing is a storage representation,
+Current limits are 64 MiB canonical manifest bytes, one million entries and 16,393
+pages. Encoded pages are capped at their decoded length plus 4 KiB and a root
+at 128 MiB + 36 KiB total encoded bytes, before object reads. Native capture still scans files; page sharing is a storage representation,
 not a claim of watcher-based change detection or constant-time history reads.
-Complete manifest reads decode pages and may cost more than a single compressed
-document. Ordinary reads pin one point index; graph inspection, doctor and GC
+Path-defined groups stabilize reuse across value/ID edits; they do not guarantee
+smaller storage for every manifest. More frames and path-boundary validation can
+cost additional CPU. Complete manifest reads still decode and validate every page
+and may cost more than a single compressed document. Ordinary reads pin one point index; graph inspection, doctor and GC
 reuse a fully validated object-index snapshot. GC protects metadata pages as well
 as file chunks. Workspace observations and Store backups are not a shared tree.
 The current `state.json` stays uncompressed. `init --no-compression` chooses raw
@@ -650,7 +655,8 @@ also does not measure kernel/RAM caches or filesystem-global metadata. Statistic
 are not an atomic snapshot of externally modified native trees; quiesce writers
 for reproducible measurements. `doctor` lists orphan/temporary entries.
 
-The current storage schema is **10**.
+The current storage schema is **13**. Other schemas are rejected without
+modification; no automatic migration is provided.
 
 ## Guarantees and boundaries
 

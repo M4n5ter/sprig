@@ -31,7 +31,7 @@ use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 10;
+const STORAGE_SCHEMA: u32 = 13;
 const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
 
 #[derive(Serialize, Deserialize)]

@@ -657,7 +657,10 @@ are not an atomic snapshot of externally modified native trees; quiesce writers
 for reproducible measurements. `doctor` lists orphan/temporary entries.
 
 The current storage schema is **14**. Other schemas are rejected without
-modification; no automatic migration is provided.
+modification; no automatic migration is provided. Keep older stores and their
+compatible Sprig executable together to retain access to their history. To try
+this version, initialize a separate new store. Importing working files into it
+starts new history; it does not migrate old revisions or recovery records.
 
 Workspace and retained-trash metadata contain observation descriptors, not inline
 physical-identity maps. Each immutable map is checksummed and content-addressed;
@@ -918,7 +921,7 @@ sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 
 The CLI is a thin adapter over the Rust library. Tests cover history, concurrent
 workspaces, merges, line attribution, transactions, recovery, storage integrity,
-native backends and CLI parsing. No project license has been selected.
+native backends and CLI parsing.
 
 The [Linux mapped-workspace check](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
 on Ubuntu 24.04 verified C compilation/execution, existing ELF execution, private

@@ -380,6 +380,8 @@ STORE/
 `stats.object_bytes` 汇总索引和 loose 布局中唯一对象解码后的字节数（文件内容块和元数据页块），包括未引用对象。`object_storage_bytes` 包含对象目录中的所有文件，包括索引、锁、孤立数据包和临时文件。Unix 上的 `object_allocated_bytes` 累加这些文件报告的已分配块，并不代表共享/CoW 存储上的独占物理占用；Windows 返回 null。`reachable_logical_bytes` 累加受保护修订中的文件长度，相同内容在不同修订中会重复计入。`storage` 逐个顶层区域拆账，`store_logical_bytes` 与 `store_allocated_bytes` 包含原生树、upper、日志、修订、备份、缓存及孤立文件；虚拟挂载的 lower/merged 视图不重复计入，实际后备内容已经统计。硬链接别名在每个区域内只计一次。分配量来自 Unix blocks 或 Windows `FILE_STANDARD_INFO`，不代表共享/CoW 卷上的独占物理 extent，也不包含内核/RAM 缓存或文件系统全局元数据。外部正在修改的原生树统计不是原子快照，可复现测量需要先停止写入。`doctor` 列出孤立/临时条目。
 
 当前存储结构（schema）为 **14**。其他结构版本会被拒绝且不会修改；不提供自动迁移。
+请同时保留旧存储库及与其兼容的 Sprig 可执行文件，以继续访问旧历史。体验此版本时，
+应另行初始化新的存储库。将工作文件导入新库只会开始新的历史，不会迁移旧修订或恢复记录。
 
 工作区及保留回收项只存 observation 描述符，物理文件身份映射保存在
 `observations/` 内的不可变内容寻址文件。普通列表不会隐式加载映射；捕获和
@@ -533,7 +535,7 @@ cargo build --locked --features projection
 sudo python3 tests/projection_workflow.py --binary target/debug/sprig
 ```
 
-CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。项目尚未选择许可证。
+CLI 是 Rust 库的一层轻量适配。测试覆盖历史、并发工作区、合并、逐行归属、事务、恢复、存储完整性、原生后端和命令行解析。
 
 Ubuntu 24.04 的 [Linux 映射工作区检查](https://github.com/M4n5ter/sprig/actions/runs/40002776336)
 已验证 C 编译与执行、现有 ELF 执行、私有和共享映射、别名与进程间一致性、`msync`、

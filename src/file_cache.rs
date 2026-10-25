@@ -155,13 +155,19 @@ impl<'a> Session<'a> {
         if allow_population || cache.inventory.borrow().charges.contains_key(&key) {
             #[cfg(test)]
             self.counters.probes.set(self.counters.probes.get() + 1);
-            match cached(reader, chunks, size, &cache.root, &key, target) {
+            match cached(reader, chunks, size, cache, &key, target) {
                 Ok(Some(output)) => {
                     #[cfg(test)]
                     self.counters.hits.set(self.counters.hits.get() + 1);
                     return Ok(output);
                 }
-                Ok(None) => cache.inventory.borrow_mut().forget(&key)?,
+                Ok(None) => {
+                    let mut inventory = cache.inventory.borrow_mut();
+                    if inventory.charges.contains_key(&key) {
+                        inventory.directory_clean = false;
+                    }
+                    inventory.forget(&key)?;
+                }
                 Err(error) if target.try_exists()? => return Err(error),
                 Err(_) => cache.disabled.set(true),
             }
@@ -258,11 +264,11 @@ fn cached(
     reader: &packed::Reader,
     chunks: &[String],
     size: u64,
-    root: &Path,
+    cache: &Cache,
     key: &str,
     target: &Path,
 ) -> Result<Option<File>> {
-    let path = root.join(key);
+    let path = cache.root.join(key);
     let mut input = match platform::open_regular(&path) {
         Ok(input) => input,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -272,6 +278,7 @@ fn cached(
         drop(input);
         // This is explicitly disposable derived content, never an object/ref.
         fs::remove_file(path)?;
+        cache.inventory.borrow_mut().directory_clean = false;
         return Ok(None);
     }
     if let Some(output) = crate::copy_tree::native_clone(&input, &path, target)? {
@@ -318,10 +325,10 @@ fn populate(cache: &Cache, key: &str, size: u64, target: &Path, protected: bool)
         cached.sync_all()?;
         drop(cached);
         platform::rename(&pending, &path)?;
-        platform::sync_directory(root)?;
+        cache.inventory.borrow_mut().sync_directory(root)?;
     } else {
         // Unsupported cloning removed its temporary target and wrote no cache.
-        cache.inventory.borrow_mut().forget(key)?;
+        cache.inventory.borrow_mut().release_after_cleanup(key)?;
     }
     Ok(true)
 }
@@ -359,6 +366,11 @@ struct Inventory {
     charges: BTreeMap<String, u64>,
     total: u64,
     protection: Option<Protection>,
+    // True only after a successful directory barrier under this cache lease.
+    // Capacity-releasing deletions invalidate it before another reservation.
+    directory_clean: bool,
+    #[cfg(test)]
+    directory_syncs: usize,
     #[cfg(test)]
     protection_scanned_entries: usize,
     #[cfg(test)]
@@ -410,7 +422,7 @@ impl Inventory {
             // Bound memory even when a previous interrupted cache is oversized.
             result.evict(root, 0, 0)?;
         }
-        platform::sync_directory(root)?;
+        result.sync_directory(root)?;
         Ok(result)
     }
 
@@ -517,6 +529,7 @@ impl Inventory {
             // No cached() input handle is alive here (important on Windows).
             // Only update accounting after a successful deletion.
             fs::remove_file(root.join(&key))?;
+            self.directory_clean = false;
             self.forget(&key)?;
         }
         Ok(())
@@ -565,6 +578,7 @@ impl Inventory {
                 self.protected_victim_queries += 1;
             }
             fs::remove_file(root.join(&victim))?;
+            self.directory_clean = false;
             self.forget(&victim)?;
         }
         self.reserve(root, key, charge)?;
@@ -576,9 +590,34 @@ impl Inventory {
             return Err("cache reservation already exists".into());
         }
         self.evict(root, charge, 1)?;
-        // Preserve the existing eviction-before-publication durability boundary.
-        platform::sync_directory(root)?;
+        // Only skip a proven no-op barrier: scan and every successful fill
+        // already sync the directory. Deletions must be durable before reuse.
+        if !self.directory_clean {
+            self.sync_directory(root)?;
+        }
         self.insert_charge(key, charge)
+    }
+
+    fn release_after_cleanup(&mut self, key: &str) -> Result<()> {
+        // Unsupported cloning may have created then removed a pending target.
+        // Its deletion must be durable before this charge can be reused.
+        self.directory_clean = false;
+        self.forget(key)
+    }
+
+    fn sync_directory(&mut self, root: &Path) -> Result<()> {
+        // A failed/unknown sync must never establish a clean directory.
+        self.directory_clean = false;
+        #[cfg(test)]
+        {
+            self.directory_syncs += 1;
+            if tests::FAIL_DIRECTORY_SYNC.get() {
+                return Err(std::io::Error::other("injected cache directory sync failure").into());
+            }
+        }
+        platform::sync_directory(root)?;
+        self.directory_clean = true;
+        Ok(())
     }
 }
 
@@ -596,7 +635,10 @@ mod tests {
     use crate::content::{self, EntryKind};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    thread_local! { static FAIL_FILL: Cell<bool> = const { Cell::new(false) }; }
+    thread_local! {
+        static FAIL_FILL: Cell<bool> = const { Cell::new(false) };
+        pub(super) static FAIL_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
 
     pub(super) fn inject_fill_fault() -> Result<()> {
         if FAIL_FILL.get() {
@@ -610,6 +652,138 @@ mod tests {
         fn drop(&mut self) {
             FAIL_FILL.set(false);
         }
+    }
+
+    struct DirectorySyncFault;
+    impl Drop for DirectorySyncFault {
+        fn drop(&mut self) {
+            FAIL_DIRECTORY_SYNC.set(false);
+        }
+    }
+
+    #[test]
+    fn clean_reservations_skip_only_redundant_directory_barriers() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-clean-reserve-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let mut inventory = Inventory::scan(&root)?;
+        assert!(inventory.directory_clean);
+        assert_eq!(inventory.directory_syncs, 1);
+        for i in 0..32 {
+            let key = format!("{i:064x}");
+            inventory.reserve(&root, &key, 8192)?;
+            // No-op reservation did not add a barrier. Publication still does.
+            assert_eq!(inventory.directory_syncs, 1 + i);
+            fs::write(root.join(key), [0; 4096])?;
+            inventory.sync_directory(&root)?;
+        }
+        assert_eq!(inventory.directory_syncs, 33);
+        // A real eviction must fence deletions before capacity is reserved.
+        inventory.reserve(&root, &"f".repeat(64), BUDGET)?;
+        assert_eq!(inventory.directory_syncs, 34);
+        assert_eq!(inventory.charges.len(), 1);
+        assert!(inventory.directory_clean);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_cleanup_requires_fence_before_next_reservation() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-unsupported-fence-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let mut inventory = Inventory::scan(&root)?;
+        let key = "a".repeat(64);
+        inventory.reserve(&root, &key, 8192)?;
+        assert_eq!(inventory.directory_syncs, 1);
+        let pending = root.join(format!("pending-{key}"));
+        fs::write(&pending, b"partial clone")?;
+        fs::remove_file(&pending)?;
+        inventory.release_after_cleanup(&key)?;
+        assert!(!inventory.directory_clean);
+        assert_eq!(inventory.total, 0);
+        inventory.reserve(&root, &"b".repeat(64), 8192)?;
+        assert_eq!(inventory.directory_syncs, 2);
+        assert!(inventory.directory_clean);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_deletion_fence_preserves_dirty_state_and_blocks_reservation() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-reserve-fence-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let key = "a".repeat(64);
+        fs::write(root.join(&key), b"old")?;
+        let mut inventory = Inventory::scan(&root)?;
+        FAIL_DIRECTORY_SYNC.set(true);
+        let fault = DirectorySyncFault;
+        assert!(inventory.reserve(&root, &"b".repeat(64), BUDGET).is_err());
+        assert!(!inventory.directory_clean);
+        assert!(!inventory.charges.contains_key(&"b".repeat(64)));
+        assert!(!root.join(key).exists());
+        drop(fault);
+        // Reopening always reestablishes the barrier, even with no entries.
+        let mut reopened = Inventory::scan(&root)?;
+        assert!(reopened.directory_clean);
+        assert_eq!(reopened.directory_syncs, 1);
+        reopened.reserve(&root, &"c".repeat(64), 8192)?;
+        assert_eq!(reopened.directory_syncs, 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_hit_deletion_fence_failure_disables_fills_but_preserves_cas_output() -> Result<()> {
+        for absent in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "sprig-corrupt-fence-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            ));
+            fs::create_dir(&root)?;
+            let objects = root.join("objects");
+            let bytes = vec![b'x'; 65536];
+            let EntryKind::File { size, chunks } = content::put_bytes(&bytes, &objects)? else {
+                unreachable!()
+            };
+            let key = cache_key(size, &chunks)?;
+            let root_cache = root.join("file-cache");
+            fs::create_dir(&root_cache)?;
+            fs::write(root_cache.join(&key), b"corrupt")?;
+            let session = Session::new(&objects);
+            let cache = session.cache(true).unwrap();
+            if absent {
+                // Model an absent resident: never infer its deletion is durable.
+                fs::remove_file(root_cache.join(&key))?;
+            }
+            let reader = packed::Reader::open(&objects)?;
+            FAIL_DIRECTORY_SYNC.set(true);
+            let fault = DirectorySyncFault;
+            session.materialize(&reader, &chunks, size, &root.join("out"))?;
+            assert_eq!(fs::read(root.join("out"))?, bytes);
+            assert!(cache.disabled.get());
+            assert!(!cache.inventory.borrow().directory_clean);
+            assert_eq!(cache.inventory.borrow().directory_syncs, 2);
+            assert!(!cache.inventory.borrow().charges.contains_key(&key));
+            drop(fault);
+            session.materialize(&reader, &chunks, size, &root.join("next"))?;
+            assert_eq!(cache.inventory.borrow().directory_syncs, 2);
+            drop(session);
+            drop(reader);
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -992,6 +1166,7 @@ mod tests {
             assert_eq!(inventory.total, ENTRY_BUDGET as u64 * 8192);
             assert_eq!(inventory.protection_scanned_entries, ENTRY_BUDGET);
             assert_eq!(inventory.protected_victim_queries, index + 1);
+            assert_eq!(inventory.directory_syncs, index + 1);
         }
         // Large policy is unchanged: it may evict the first protected key, but
         // both incremental counters and the unprotected-victim index must track it.

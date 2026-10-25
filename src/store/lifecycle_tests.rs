@@ -292,7 +292,7 @@ fn query_operations_decode_each_reference_once_without_cross_operation_cache() -
 }
 
 #[test]
-fn backup_reuses_exact_validated_bytes_and_recovers_retained_workspaces() -> Result<()> {
+fn canonical_backup_validates_state_and_recovers_retained_workspaces() -> Result<()> {
     let root = std::env::temp_dir().join(format!("sprig-backup-bytes-{}", new_id()?));
     fs::create_dir(&root)?;
     let source = root.join("source");
@@ -303,8 +303,9 @@ fn backup_reuses_exact_validated_bytes_and_recovers_retained_workspaces() -> Res
     fs::write(imported.path.join("uncommitted"), b"preserve trash")?;
     let trash = store.drop_entry("workspace", "main")?;
     let before = store.state()?;
-    // State accepts unknown fields and noncanonical whitespace. Preserve that
-    // policy without skipping validation or normalizing recoverable evidence.
+    let canonical = serde_json::to_vec(&before)?;
+    // Keep the existing policy: accept unknown fields and whitespace, then
+    // back up the validated canonical State rather than its representation.
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(store.root.join("state.json"))?)?;
     document["future_annotation"] = serde_json::json!({"preserve": true});
@@ -316,7 +317,7 @@ fn backup_reuses_exact_validated_bytes_and_recovers_retained_workspaces() -> Res
         .join("backups")
         .join(format!("{}.json.zst", before.generation));
     let (saved, hash): (State, _) = metadata::read(&backup)?;
-    assert_eq!(hash, blake3::hash(&exact));
+    assert_eq!(hash, blake3::hash(&canonical));
     assert_eq!(saved.generation, before.generation);
     assert!(saved.trash.contains_key(&trash.token));
     Store::recover_state(&store.root, before.generation)?;
@@ -332,7 +333,7 @@ fn backup_reuses_exact_validated_bytes_and_recovers_retained_workspaces() -> Res
 }
 
 #[test]
-fn backup_bytes_are_never_reused_without_full_state_validation() -> Result<()> {
+fn backup_requires_full_state_validation() -> Result<()> {
     let root = std::env::temp_dir().join(format!("sprig-invalid-backup-{}", new_id()?));
     let store = Store::init(&root)?;
     let original = fs::read(store.root.join("state.json"))?;
@@ -356,7 +357,7 @@ fn backup_bytes_are_never_reused_without_full_state_validation() -> Result<()> {
 }
 
 #[test]
-fn parallel_checkpoint_queries_and_exact_backup_recovery_compose() -> Result<()> {
+fn parallel_checkpoint_queries_and_canonical_backup_recovery_compose() -> Result<()> {
     let root = std::env::temp_dir().join(format!("sprig-integrated-pressure-{}", new_id()?));
     let source = root.join("source");
     fs::create_dir_all(&source)?;
@@ -368,7 +369,9 @@ fn parallel_checkpoint_queries_and_exact_backup_recovery_compose() -> Result<()>
     for index in 0..12 {
         fs::write(workspace.path.join(format!("file-{index}")), b"after")?;
     }
-    let generation = store.state()?.generation;
+    let before = store.state()?;
+    let generation = before.generation;
+    let canonical = serde_json::to_vec(&before)?;
     let state_path = store.root.join("state.json");
     let document: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
     let exact = serde_json::to_vec_pretty(&document)?;
@@ -385,7 +388,7 @@ fn parallel_checkpoint_queries_and_exact_backup_recovery_compose() -> Result<()>
         .join(format!("{generation}.json.zst"));
     let (saved, hash): (State, _) = metadata::read(&backup)?;
     assert_eq!(saved.generation, generation);
-    assert_eq!(hash, blake3::hash(&exact));
+    assert_eq!(hash, blake3::hash(&canonical));
     Store::recover_state(&store.root, generation)?;
     for index in 0..12 {
         assert_eq!(store.read("main", &format!("file-{index}"))?, b"before");

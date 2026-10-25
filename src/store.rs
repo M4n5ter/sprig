@@ -2220,20 +2220,15 @@ impl Store {
     }
 
     fn state(&self) -> Result<State> {
-        self.state_bytes().map(|(state, _)| state)
-    }
-
-    fn state_bytes(&self) -> Result<(State, Vec<u8>)> {
         require_file(&self.root.join("state.json"))?;
-        let bytes = fs::read(self.root.join("state.json"))?;
-        let state: State = serde_json::from_slice(&bytes)?;
+        let state: State = serde_json::from_slice(&fs::read(self.root.join("state.json"))?)?;
         validate_state(&state)?;
-        Ok((state, bytes))
+        Ok(state)
     }
 
     fn save(&self, _lock: &StoreLock, state: &mut State) -> Result<()> {
         fault("save-before-backup")?;
-        let (current, current_bytes) = self.state_bytes()?;
+        let current = self.state()?;
         if current.generation != state.generation {
             return Err(failure(
                 "metadata generation changed; transaction not published",
@@ -2243,9 +2238,7 @@ impl Store {
             .root
             .join("backups")
             .join(format!("{}.json.zst", current.generation));
-        // Preserve the exact validated published state, rather than allocating
-        // and serializing the increasingly large workspace/trash map again.
-        write_immutable(&backup, &metadata::encode(&current_bytes)?)?;
+        write_immutable(&backup, &metadata::encode(&serde_json::to_vec(&current)?)?)?;
         fault("save-after-backup")?;
         state.generation = state
             .generation

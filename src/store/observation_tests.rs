@@ -312,7 +312,7 @@ fn observation_recovery_and_collection_faults_never_erase_published_roots() -> R
 }
 
 #[test]
-fn backup_retry_and_recovery_keep_exact_bytes_or_fail_closed_on_representation_conflict()
+fn canonical_backup_retry_accepts_equivalent_state_and_recovery_collision_fails_closed()
 -> Result<()> {
     for rewrite_after_backup in [false, true] {
         let (root, source, store) = fixture()?;
@@ -333,31 +333,25 @@ fn backup_retry_and_recovery_keep_exact_bytes_or_fail_closed_on_representation_c
             .join("backups")
             .join(format!("{generation}.json.zst"));
         let backup = fs::read(&backup_path)?;
+        let (_, hash): (State, _) = metadata::read(&backup_path)?;
+        assert_eq!(hash, blake3::hash(&canonical));
         if rewrite_after_backup {
-            // Models a canonical backup from an earlier implementation/failure
-            // alongside equivalent noncanonical current bytes. Never overwrite
-            // either representation silently or claim recovery succeeded.
             fs::write(&state_path, &pretty)?;
-            assert!(
-                store
-                    .branch("retry", "main")
-                    .unwrap_err()
-                    .to_string()
-                    .contains("collision")
-            );
-            assert!(
-                Store::recover_state(&store.root, generation)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("collision")
-            );
-            assert_eq!(fs::read(&state_path)?, pretty);
-            assert_eq!(fs::read(&backup_path)?, backup);
-            // Explicitly repair the test fixture, not production behavior.
-            fs::write(&state_path, &canonical)?;
-        } else {
-            store.branch("retry", "main")?;
         }
+        // Recovery has always preserved exact current bytes. A representation
+        // collision must remain fail-closed without replacing either file.
+        assert!(
+            Store::recover_state(&store.root, generation)
+                .unwrap_err()
+                .to_string()
+                .contains("collision")
+        );
+        assert_eq!(fs::read(&state_path)?, pretty);
+        assert_eq!(fs::read(&backup_path)?, backup);
+        // Ordinary save canonicalizes equivalent state, so retry must succeed
+        // whether whitespace changed before or after the interrupted backup.
+        store.branch("retry", "main")?;
+        assert_eq!(fs::read(&backup_path)?, backup);
         Store::recover_state(&store.root, generation)?;
         assert!(!store.state()?.branches.contains_key("failed"));
         assert!(!store.state()?.branches.contains_key("retry"));

@@ -354,3 +354,47 @@ fn backup_bytes_are_never_reused_without_full_state_validation() -> Result<()> {
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn parallel_checkpoint_queries_and_exact_backup_recovery_compose() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("sprig-integrated-pressure-{}", new_id()?));
+    let source = root.join("source");
+    fs::create_dir_all(&source)?;
+    for index in 0..12 {
+        fs::write(source.join(format!("file-{index}")), b"before")?;
+    }
+    let store = Store::init(&root.join("store"))?;
+    let workspace = store.import(&source, "main", CopyMode::Copy)?;
+    for index in 0..12 {
+        fs::write(workspace.path.join(format!("file-{index}")), b"after")?;
+    }
+    let generation = store.state()?.generation;
+    let state_path = store.root.join("state.json");
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+    let exact = serde_json::to_vec_pretty(&document)?;
+    fs::write(&state_path, &exact)?;
+    store.checkpoint("main", "parallel files", None)?;
+    for index in 0..12 {
+        REVISION_READS.with(|count| count.set(0));
+        assert_eq!(store.read("main", &format!("file-{index}"))?, b"after");
+        assert_eq!(REVISION_READS.with(Cell::get), 1);
+    }
+    let backup = store
+        .root
+        .join("backups")
+        .join(format!("{generation}.json.zst"));
+    let (saved, hash): (State, _) = metadata::read(&backup)?;
+    assert_eq!(saved.generation, generation);
+    assert_eq!(hash, blake3::hash(&exact));
+    Store::recover_state(&store.root, generation)?;
+    for index in 0..12 {
+        assert_eq!(store.read("main", &format!("file-{index}"))?, b"before");
+        // Metadata recovery must not silently replace the native workspace.
+        assert_eq!(
+            fs::read(workspace.path.join(format!("file-{index}")))?,
+            b"after"
+        );
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

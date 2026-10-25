@@ -7,6 +7,8 @@ use crate::writable::WritableCas;
 
 impl Store {
     pub(super) fn writable_core(&self, workspace: &Workspace) -> Result<WritableCas> {
+        #[cfg(test)]
+        super::lifecycle_tests::CORE_OPENS.with(|count| count.set(count.get() + 1));
         let WorkspaceBackend::Writable { revision } = &workspace.backend else {
             return Err(failure("workspace does not own a writable CAS journal"));
         };
@@ -24,23 +26,18 @@ impl Store {
         )?)
     }
 
-    pub(super) fn writable_generation(
+    pub(super) fn writable_generation_with_manifest(
         &self,
         revision: &str,
+        manifest: &Manifest,
     ) -> Result<(String, Observed, WorkspaceBackend)> {
-        let manifest = self.revision(revision)?.manifest;
         let directory = self.new_native()?;
         let generation = self.root.join("native").join(&directory);
         platform::create_dir(&generation.join("tree"), 0o700)?;
         // The pin precedes publication and also protects abandoned preparations.
         write_new(&generation.join("writable-base"), revision.as_bytes())?;
-        let core = WritableCas::create(
-            &self.objects(),
-            &generation,
-            &manifest,
-            revision,
-            &directory,
-        )?;
+        let core =
+            WritableCas::create(&self.objects(), &generation, manifest, revision, &directory)?;
         core.sync()?;
         drop(core);
         sync_directory(&generation)?;
@@ -63,7 +60,7 @@ impl Store {
             message: "retained writable base".into(),
             manifest: manifest.clone(),
         })?;
-        self.writable_generation(&revision)
+        self.writable_generation_with_manifest(&revision, manifest)
     }
 
     /// Creates an owned CAS workspace without requiring a filesystem mount.
@@ -99,8 +96,15 @@ impl Store {
         let _lock = self.lock()?;
         let mut state = self.state()?;
         fresh_name(&state, name, true)?;
-        let revision = self.resolve(&state, reference)?;
-        self.restore_writable_locked(&mut state, &revision, name, name, true)
+        let (revision, data) = self.resolve_revision(&state, reference)?;
+        self.restore_writable_manifest_locked(
+            &mut state,
+            &revision,
+            &data.manifest,
+            name,
+            name,
+            true,
+        )
     }
 
     pub(super) fn restore_writable_locked(
@@ -111,7 +115,28 @@ impl Store {
         name: &str,
         new_branch: bool,
     ) -> Result<WorkspaceResult> {
-        let (directory, observed, backend) = self.writable_generation(revision)?;
+        let data = self.revision(revision)?;
+        self.restore_writable_manifest_locked(
+            state,
+            revision,
+            &data.manifest,
+            branch,
+            name,
+            new_branch,
+        )
+    }
+
+    fn restore_writable_manifest_locked(
+        &self,
+        state: &mut State,
+        revision: &str,
+        manifest: &Manifest,
+        branch: &str,
+        name: &str,
+        new_branch: bool,
+    ) -> Result<WorkspaceResult> {
+        let (directory, observed, backend) =
+            self.writable_generation_with_manifest(revision, manifest)?;
         let workspace = Workspace {
             backend,
             directory,
@@ -239,6 +264,13 @@ impl Store {
     }
 
     pub(super) fn stop_writable(&self, workspace: &Workspace) -> Result<()> {
+        self.stop_writable_core(workspace).map(drop)
+    }
+
+    // Keep the acquired generation lease through capture/sync instead of
+    // dropping it and rebuilding the same replay state immediately afterward.
+    // The ordinary unmount and checked sync barrier are unchanged.
+    pub(super) fn stop_writable_core(&self, workspace: &Workspace) -> Result<WritableCas> {
         #[cfg(all(target_os = "linux", feature = "projection"))]
         {
             let generation = self.root.join("native").join(&workspace.directory);
@@ -255,7 +287,7 @@ impl Store {
             match self.writable_core(workspace) {
                 Ok(core) => {
                     core.sync()?;
-                    return Ok(());
+                    return Ok(core);
                 }
                 Err(error)
                     if started.elapsed() < std::time::Duration::from_secs(5)

@@ -1,6 +1,8 @@
 //! One atomic state file publishes branch heads and workspace generations together.
 
 mod collection;
+#[cfg(test)]
+mod lifecycle_tests;
 mod storage;
 mod writable;
 
@@ -243,8 +245,7 @@ impl Store {
 
     fn capture_workspace(&self, workspace: &Workspace) -> Result<(Manifest, Observed)> {
         if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
-            self.stop_writable(workspace)?;
-            let core = self.writable_core(workspace)?;
+            let core = self.stop_writable_core(workspace)?;
             if core.recovery_info()?.read_only {
                 return Err(failure(
                     "writable journal has an incomplete tail or abandoned mapped session; normal capture refused; inspect writable-status and explicitly recover-writable into a new workspace",
@@ -316,8 +317,7 @@ impl Store {
     fn sync_workspace(&self, workspace: &Workspace) -> Result<()> {
         match workspace.backend {
             WorkspaceBackend::Writable { .. } => {
-                self.stop_writable(workspace)?;
-                self.writable_core(workspace)?.sync()?;
+                self.stop_writable_core(workspace)?.sync()?;
                 Ok(())
             }
             WorkspaceBackend::Native => sync_native_tree(&self.tree(&workspace.directory)),
@@ -733,26 +733,27 @@ impl Store {
             .get(branch)
             .ok_or_else(|| failure("branch not found"))?
             .clone();
-        self.restore_locked(&mut state, &revision, branch, name, false)
+        let data = self.revision(&revision)?;
+        self.restore_locked(&mut state, &revision, &data, branch, name, false)
     }
 
     pub fn restore(&self, reference: &str, name: &str) -> Result<WorkspaceResult> {
         let _lock = self.lock()?;
         let mut state = self.state()?;
         fresh_name(&state, name, true)?;
-        let revision = self.resolve(&state, reference)?;
-        self.restore_locked(&mut state, &revision, name, name, true)
+        let (revision, data) = self.resolve_revision(&state, reference)?;
+        self.restore_locked(&mut state, &revision, &data, name, name, true)
     }
 
     fn restore_locked(
         &self,
         state: &mut State,
         revision: &str,
+        data: &Revision,
         branch: &str,
         name: &str,
         new_branch: bool,
     ) -> Result<WorkspaceResult> {
-        let data = self.revision(revision)?;
         let directory = self.new_native()?;
         content::materialize(&data.manifest, &self.objects(), &self.tree(&directory))?;
         let observed = observe_manifest(&self.tree(&directory), &data.manifest)?;
@@ -940,21 +941,23 @@ impl Store {
             parents.push(pending.candidate_revision.clone());
             clock = clock.max(self.revision(&pending.candidate_revision)?.clock);
         }
-        let revision = if parent.manifest == final_manifest {
-            previous.clone()
+        let (revision, final_manifest) = if parent.manifest == final_manifest {
+            (previous.clone(), final_manifest)
         } else {
-            self.put_revision(&Revision {
+            let data = Revision {
                 parents,
                 clock: clock
                     .checked_add(1)
                     .ok_or_else(|| failure("logical clock exhausted"))?,
                 message: message.to_owned(),
                 manifest: final_manifest,
-            })?
+            };
+            (self.put_revision(&data)?, data.manifest)
         };
         if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
             self.retain_generation(state, name, &workspace)?;
-            let (directory, observed, backend) = self.writable_generation(&revision)?;
+            let (directory, observed, backend) =
+                self.writable_generation_with_manifest(&revision, &final_manifest)?;
             workspace.directory = directory;
             workspace.backend = backend;
             final_observed = observed;
@@ -1386,7 +1389,10 @@ impl Store {
             .ok_or_else(|| failure("trash token not found"))?
             .clone();
         match item.workspace {
-            None => self.restore_locked(&mut state, &item.revision, name, name, true),
+            None => {
+                let data = self.revision(&item.revision)?;
+                self.restore_locked(&mut state, &item.revision, &data, name, name, true)
+            }
             Some(old) => {
                 let _lease = self.lease(&old)?;
                 if matches!(old.backend, WorkspaceBackend::Writable { .. }) {
@@ -2163,6 +2169,8 @@ impl Store {
     }
 
     fn revision(&self, id: &str) -> Result<Revision> {
+        #[cfg(test)]
+        lifecycle_tests::REVISION_READS.with(|count| count.set(count.get() + 1));
         let stored = self.stored_revision(id)?;
         let mut reader = packed::PointReader::open(&self.objects())?;
         let manifest = manifest_pages::read_point(&stored.manifest, &mut reader)?;
@@ -2175,6 +2183,13 @@ impl Store {
     }
 
     fn resolve(&self, state: &State, reference: &str) -> Result<String> {
+        self.resolve_revision(state, reference).map(|(id, _)| id)
+    }
+
+    // An operation-local value, never a cross-operation or timestamp cache.
+    // Callers that need the manifest retain this verified decode instead of
+    // immediately reopening the same immutable revision.
+    fn resolve_revision(&self, state: &State, reference: &str) -> Result<(String, Revision)> {
         let id = if let Some(name) = reference.strip_prefix("workspace:") {
             workspace(state, name)?.base_revision.clone()
         } else if let Some(id) = state.branches.get(reference) {
@@ -2186,8 +2201,8 @@ impl Store {
                 "unknown branch/revision; workspace:NAME resolves its committed base",
             ));
         };
-        self.revision(&id)?;
-        Ok(id)
+        let data = self.revision(&id)?;
+        Ok((id, data))
     }
 
     fn new_native(&self) -> Result<String> {

@@ -413,6 +413,7 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     platform::create_dir(&target, 0o700)?;
     platform::set_path_mode(&target, 0o700)?;
     let reader = packed::Reader::open(objects)?;
+    let cache = crate::file_cache::Session::new(objects);
     let mut directories = Vec::new();
     let mut linked_files: BTreeMap<&str, PathBuf> = BTreeMap::new();
     for (relative, entry) in manifest {
@@ -436,8 +437,7 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
                     platform::hard_link(first, &path)?;
                     continue;
                 }
-                let output =
-                    crate::file_cache::materialize(&reader, chunks, *size, objects, &path)?;
+                let output = cache.materialize(&reader, chunks, *size, &path)?;
                 platform::set_mode(&output, entry.mode)?;
                 output
                     .set_times(FileTimes::new().set_modified(modified_time(entry.modified_ns)?))?;

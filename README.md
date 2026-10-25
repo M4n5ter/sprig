@@ -34,6 +34,11 @@ filesystem can clone a working file without copying its payload immediately.
 Chunk storage shares identical historical content. Neither makes tree scanning,
 hashing, metadata or retained native generations free.
 
+Native restoration uses at most one nonblocking whole-file cache session per
+tree, and bypasses that cache for files outside its eligible size range. Cache
+content is still verified before use; contention or an unusable cache before
+destination creation falls back to authoritative CAS content, never unchecked bytes.
+
 ## Build and try it
 
 Build with stable Rust and a C linker. The following examples use a POSIX shell

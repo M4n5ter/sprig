@@ -752,6 +752,7 @@ mod tests {
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
             ));
             fs::create_dir(&root)?;
+            let root = root.canonicalize()?;
             let objects = root.join("objects");
             let bytes = vec![b'x'; 65536];
             let EntryKind::File { size, chunks } = content::put_bytes(&bytes, &objects)? else {

@@ -250,3 +250,43 @@ fn copied_pending_rename_merges_with_original_path_edit() -> Result<()> {
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn query_operations_decode_each_reference_once_without_cross_operation_cache() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("sprig-query-reuse-{}", new_id()?));
+    fs::create_dir(&root)?;
+    let source = root.join("source");
+    fs::create_dir(&source)?;
+    fs::write(source.join("file"), b"first")?;
+    let store = Store::init(&root.join("store"))?;
+    let workspace = store.import(&source, "main", CopyMode::Auto)?;
+    macro_rules! once {
+        ($operation:expr, $count:expr) => {{
+            REVISION_READS.with(|count| count.set(0));
+            $operation?;
+            assert_eq!(REVISION_READS.with(Cell::get), $count);
+        }};
+    }
+    once!(store.read("main", "file"), 1);
+    once!(store.ls("main", ""), 1);
+    once!(store.stat("main", "file"), 1);
+    once!(store.glob("main", "*"), 1);
+    once!(store.grep("main", "first"), 1);
+    once!(store.diff("main", "main"), 2);
+    once!(store.diff_files("main", "main"), 2);
+    fs::write(workspace.path.join("file"), b"second")?;
+    store.checkpoint("main", "new head", None)?;
+    assert_eq!(store.read("main", "file")?, b"second");
+    let revision = store.state()?.branches["main"].clone();
+    let path = store
+        .root
+        .join("revisions")
+        .join(format!("{revision}.json.zst"));
+    #[cfg(unix)]
+    platform::set_path_mode(&path, 0o600)?;
+    fs::write(path, b"damaged revision")?;
+    assert!(store.read("main", "file").is_err());
+    assert!(store.stat("main", "file").is_err());
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

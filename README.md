@@ -38,6 +38,12 @@ Native restoration uses at most one nonblocking whole-file cache session per
 tree, and bypasses that cache for files outside its eligible size range. Cache
 content is still verified before use; contention or an unusable cache before
 destination creation falls back to authoritative CAS content, never unchecked bytes.
+The experimental small-file policy admits files from 1 KiB upward under the same
+256 MiB / 4,096-entry disposable-cache limits. Each exclusive session inventories
+cache allocations once, and every hit still verifies requested chunk hashes.
+This policy is not a proven improvement for cold, unique small-file trees: cache
+population, cloning attempts and eviction have costs that must be measured on the
+target filesystem. It neither deletes nor compacts retained native generations.
 
 ## Build and try it
 

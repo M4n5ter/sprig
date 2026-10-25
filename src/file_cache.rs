@@ -67,7 +67,7 @@ impl<'a> Session<'a> {
 }
 
 fn cache_eligible(size: u64) -> bool {
-    (64 * 1024..=BUDGET - 4096).contains(&size)
+    (1024..=BUDGET - 4096).contains(&size)
 }
 
 fn materialize_cas(
@@ -497,6 +497,81 @@ mod tests {
     }
 
     #[test]
+    fn small_cached_files_verify_contents_and_keep_independent_writable_inodes() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-small-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let objects = root.join("objects");
+        // Non-monotonic sizes avoid relying on traversal or fixture ordering.
+        for size in [49152usize, 1024, 8192] {
+            let bytes = vec![(size / 1024) as u8; size];
+            let EntryKind::File { size, chunks } = content::put_bytes(&bytes, &objects)? else {
+                unreachable!()
+            };
+            let reader = packed::Reader::open(&objects)?;
+            let session = Session::new(&objects);
+            let first = root.join(format!("first-{size}"));
+            session.materialize(&reader, &chunks, size, &first)?;
+            assert_eq!(fs::read(&first)?, bytes);
+            let cache = session.cache.get().unwrap().as_ref().unwrap();
+            let key = blake3::hash(&serde_json::to_vec(&("sprig-file-cache-1", size, &chunks))?)
+                .to_hex()
+                .to_string();
+            let cached = cache.root.join(&key);
+            // Exercise verified hits on copy-only filesystems too; whether the
+            // platform actually shared physical blocks is measured separately.
+            if !cached.exists() {
+                fs::write(&cached, &bytes)?;
+            }
+            let second = root.join(format!("second-{size}"));
+            session.materialize(&reader, &chunks, size, &second)?;
+            assert_eq!(fs::read(&second)?, bytes);
+            fs::write(&second, b"changed workspace")?;
+            assert_eq!(fs::read(&cached)?, bytes);
+            assert_eq!(fs::read(&first)?, bytes);
+            #[cfg(unix)]
+            platform::set_path_mode(&cached, 0o600)?;
+            fs::write(&cached, vec![b'!'; bytes.len()])?;
+            let repaired = root.join(format!("repaired-{size}"));
+            session.materialize(&reader, &chunks, size, &repaired)?;
+            assert_eq!(fs::read(repaired)?, bytes);
+            drop(session);
+            drop(reader);
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cache_inventory_entry_limit_is_independent_of_small_file_traversal() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-cache-count-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        for index in (0..4100).rev() {
+            fs::write(root.join(format!("{index:064x}")), b"")?;
+        }
+        let mut inventory = Inventory::scan(&root)?;
+        assert_eq!(inventory.charges.len(), 4096);
+        assert_eq!(fs::read_dir(&root)?.count(), 4096);
+        assert_eq!(inventory.total, 4096 * 4096);
+        let key = "f".repeat(64);
+        inventory.reserve(&root, &key, 8192)?;
+        fs::write(root.join(&key), b"cache")?;
+        assert_eq!(inventory.charges.len(), 4096);
+        assert_eq!(fs::read_dir(&root)?.count(), 4096);
+        assert!(inventory.total <= BUDGET);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn ineligible_files_never_initialize_the_cache() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "sprig-cache-ineligible-{}-{}",
@@ -527,7 +602,9 @@ mod tests {
         );
         assert!(session.cache.get().is_none());
         assert!(!root.join("file-cache").exists());
-        assert!(!cache_eligible(64 * 1024 - 1));
+        assert!(!cache_eligible(1023));
+        assert!(cache_eligible(1024));
+        assert!(cache_eligible(64 * 1024 - 1));
         assert!(cache_eligible(64 * 1024));
         assert!(cache_eligible(BUDGET - 4096));
         assert!(!cache_eligible(BUDGET - 4095));

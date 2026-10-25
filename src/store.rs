@@ -324,8 +324,11 @@ impl Store {
                     "writable journal has an incomplete tail or abandoned mapped session; normal capture refused; inspect writable-status and explicitly recover-writable into a new workspace",
                 ));
             }
-            core.sync()?;
-            return Ok((core.snapshot()?, Observed::new()));
+            crate::lifecycle_trace::measure("writable.capture_sync", || core.sync())?;
+            return Ok((
+                crate::lifecycle_trace::measure("writable.capture_snapshot", || core.snapshot())?,
+                Observed::new(),
+            ));
         }
         self.ensure_mounted(workspace)?;
         match &workspace.backend {
@@ -928,6 +931,7 @@ impl Store {
         message: &str,
         expected: Option<&str>,
     ) -> Result<CommitResult> {
+        let _trace = crate::lifecycle_trace::Span::new("store.checkpoint");
         let _lock = self.lock()?;
         let mut state = self.state()?;
         let workspace = workspace(&state, name)?.clone();
@@ -937,9 +941,11 @@ impl Store {
             && self.mount_state(&workspace) == "mounted";
         let result = (|| {
             let (manifest, observed) = self.capture_workspace(&_lock, &workspace)?;
-            self.commit_workspace(
-                &_lock, &mut state, name, workspace, manifest, observed, message,
-            )
+            crate::lifecycle_trace::measure("store.checkpoint_commit", || {
+                self.commit_workspace(
+                    &_lock, &mut state, name, workspace, manifest, observed, message,
+                )
+            })
         })();
         self.finish_writable_commit(&state, name, result, remount)
     }
@@ -1074,7 +1080,9 @@ impl Store {
         self.sync_workspace(&workspace)?;
         workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace);
-        self.save(_lock, state)?;
+        crate::lifecycle_trace::measure("store.checkpoint_state_publish", || {
+            self.save(_lock, state)
+        })?;
         Ok(CommitResult {
             committed: true,
             revision,

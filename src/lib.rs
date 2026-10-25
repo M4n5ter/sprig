@@ -9,6 +9,7 @@ pub mod blame;
 pub mod content;
 pub mod copy_tree;
 mod file_cache;
+mod lifecycle_trace;
 mod manifest_pages;
 pub mod merge;
 mod metadata;

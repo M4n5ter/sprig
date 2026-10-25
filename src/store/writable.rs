@@ -7,6 +7,7 @@ use crate::writable::WritableCas;
 
 impl Store {
     pub(super) fn writable_core(&self, workspace: &Workspace) -> Result<WritableCas> {
+        let _trace = crate::lifecycle_trace::Span::new("writable.core_open_replay");
         #[cfg(test)]
         super::lifecycle_tests::CORE_OPENS.with(|count| count.set(count.get() + 1));
         let WorkspaceBackend::Writable { revision } = &workspace.backend else {
@@ -31,6 +32,7 @@ impl Store {
         revision: &str,
         manifest: &Manifest,
     ) -> Result<(String, Observed, WorkspaceBackend)> {
+        let _trace = crate::lifecycle_trace::Span::new("writable.generation_persist");
         let directory = self.new_native()?;
         let generation = self.root.join("native").join(&directory);
         platform::create_dir(&generation.join("tree"), 0o700)?;
@@ -38,7 +40,7 @@ impl Store {
         write_new(&generation.join("writable-base"), revision.as_bytes())?;
         let core =
             WritableCas::create(&self.objects(), &generation, manifest, revision, &directory)?;
-        core.sync()?;
+        crate::lifecycle_trace::measure("writable.new_generation_sync", || core.sync())?;
         drop(core);
         sync_directory(&generation)?;
         Ok((
@@ -93,6 +95,7 @@ impl Store {
     }
 
     pub fn restore_writable(&self, reference: &str, name: &str) -> Result<WorkspaceResult> {
+        let _trace = crate::lifecycle_trace::Span::new("writable.restore_store");
         let _lock = self.lock()?;
         let mut state = self.state()?;
         fresh_name(&state, name, true)?;
@@ -155,7 +158,9 @@ impl Store {
             state.branches.insert(branch.into(), revision.into());
         }
         state.workspaces.insert(name.into(), workspace.clone());
-        self.save(_lock, state)?;
+        crate::lifecycle_trace::measure("writable.restore_state_publish", || {
+            self.save(_lock, state)
+        })?;
         Ok(self.workspace_result(name, &workspace))
     }
 
@@ -233,6 +238,7 @@ impl Store {
     }
 
     pub(super) fn mount_writable(&self, workspace: &Workspace, initialize: bool) -> Result<()> {
+        let _trace = crate::lifecycle_trace::Span::new("writable.mount");
         let WorkspaceBackend::Writable { revision } = &workspace.backend else {
             return Err(failure("not a writable CAS workspace"));
         };
@@ -277,6 +283,7 @@ impl Store {
     // dropping it and rebuilding the same replay state immediately afterward.
     // The ordinary unmount and checked sync barrier are unchanged.
     pub(super) fn stop_writable_core(&self, workspace: &Workspace) -> Result<WritableCas> {
+        let mut trace = crate::lifecycle_trace::Span::new("writable.stop_core");
         #[cfg(all(target_os = "linux", feature = "projection"))]
         {
             let generation = self.root.join("native").join(&workspace.directory);
@@ -292,7 +299,7 @@ impl Store {
         loop {
             match self.writable_core(workspace) {
                 Ok(core) => {
-                    core.sync()?;
+                    crate::lifecycle_trace::measure("writable.replayed_core_sync", || core.sync())?;
                     return Ok(core);
                 }
                 Err(error)
@@ -301,6 +308,7 @@ impl Store {
                             .downcast_ref::<io::Error>()
                             .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock) =>
                 {
+                    trace.retry();
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(error) => return Err(error),
@@ -360,6 +368,7 @@ impl Store {
         result: Result<CommitResult>,
         remount: bool,
     ) -> Result<CommitResult> {
+        let _trace = crate::lifecycle_trace::Span::new("writable.finish_commit_remount");
         if !remount {
             return result.map_err(|error| {
                 if state.workspaces.get(name).is_some_and(|workspace| matches!(workspace.backend, WorkspaceBackend::Writable { .. })) {

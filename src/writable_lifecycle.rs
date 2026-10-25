@@ -189,6 +189,7 @@ pub(crate) fn start(
     manifest: &Manifest,
     initialize: bool,
 ) -> Result<()> {
+    let _trace = crate::lifecycle_trace::Span::new("writable.server_start");
     require_root()?;
     content::validate_manifest(manifest)?;
     let _ = source(generation, revision)?;
@@ -253,7 +254,9 @@ pub(crate) fn start(
         });
     }
     let mut child = command.spawn()?;
-    if let Err(error) = wait_ready(&mut child) {
+    if let Err(error) =
+        crate::lifecycle_trace::measure("writable.server_readiness", || wait_ready(&mut child))
+    {
         // No absent-mount/PID inference and no signal: startup may still own
         // the inherited control lock. Keep all journal and log evidence.
         return Err(io::Error::other(format!("{error}; writable startup outcome may be uncertain; generation and server retained for inspection")).into());
@@ -265,11 +268,14 @@ pub(crate) fn start(
 
 /// Normal unmount preserves EBUSY and never destroys dirty journal evidence.
 pub(crate) fn stop(generation: &Path) -> Result<()> {
+    let _trace = crate::lifecycle_trace::Span::new("writable.server_stop");
     require_root()?;
     let _control = Control::acquire(generation)?;
     let stopped = if inspect(generation)? == MountState::Mounted {
         let record = crate::writable_session::request_stop(generation)?;
-        normal_unmount(&generation.join("tree"))?;
+        crate::lifecycle_trace::measure("writable.normal_unmount", || {
+            normal_unmount(&generation.join("tree"))
+        })?;
         Some(record)
     } else {
         None
@@ -277,9 +283,11 @@ pub(crate) fn stop(generation: &Path) -> Result<()> {
     if inspect(generation)? != MountState::Unmounted {
         return Err(invalid("writable CAS mount remains after normal unmount").into());
     }
-    wait_journal_release(generation)?;
+    crate::lifecycle_trace::measure("writable.lease_wait", || wait_journal_release(generation))?;
     if let Some(record) = stopped {
-        crate::writable_session::finish_stop(generation, &record)?;
+        crate::lifecycle_trace::measure("writable.stop_certificate", || {
+            crate::writable_session::finish_stop(generation, &record)
+        })?;
     }
     Ok(())
 }
@@ -296,24 +304,29 @@ fn wait_journal_release(generation: &Path) -> io::Result<()> {
         return Err(invalid("unsafe writable journal lease"));
     }
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        // SAFETY: live owned regular-file descriptor. Nonblocking polling is
-        // bounded and no signals, force-unmounts or lock-file deletion occur.
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(());
+    crate::lifecycle_trace::measure_counted("writable.lease_poll", |retries| {
+        loop {
+            // SAFETY: live owned regular-file descriptor. Nonblocking polling is
+            // bounded and no signals, force-unmounts or lock-file deletion occur.
+            if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock
+                && error.kind() != io::ErrorKind::Interrupted
+            {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "writable server still holds its journal lease; generation retained",
+                ));
+            }
+            *retries += 1;
+            std::thread::sleep(Duration::from_millis(25));
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock && error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "writable server still holds its journal lease; generation retained",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    })
 }
 
 #[cfg(test)]

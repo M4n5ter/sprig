@@ -1012,11 +1012,15 @@ impl Inner {
                         return Err(not_empty());
                     }
                 }
-                for path in self
-                    .paths
-                    .keys()
-                    .filter(|p| *p == &old || p.starts_with(&format!("{old}/")))
-                {
+                // The exact source and its slash-prefixed descendants are
+                // separate ranges; similarly named siblings are not moved.
+                let prefix = format!("{old}/");
+                for path in std::iter::once(&old).chain(
+                    self.paths
+                        .range(prefix.clone()..)
+                        .map(|(path, _)| path)
+                        .take_while(|path| path.starts_with(&prefix)),
+                ) {
                     validate_path(&format!("{new}{}", &path[old.len()..]))?;
                 }
                 validate_time(*now_ns)?;
@@ -1320,11 +1324,14 @@ impl Inner {
                 if let Some(victim) = self.paths.remove(&new) {
                     self.nodes.get_mut(&victim).unwrap().links.remove(&new);
                 }
-                let moved: Vec<_> = self
-                    .paths
-                    .iter()
-                    .filter(|(p, _)| *p == &old || p.starts_with(&format!("{old}/")))
-                    .map(|(p, i)| (p.clone(), *i))
+                let prefix = format!("{old}/");
+                let moved: Vec<_> = std::iter::once((old.clone(), source))
+                    .chain(
+                        self.paths
+                            .range(prefix.clone()..)
+                            .take_while(|(path, _)| path.starts_with(&prefix))
+                            .map(|(path, inode)| (path.clone(), *inode)),
+                    )
                     .collect();
                 for (path, inode) in moved {
                     let renamed = format!("{new}{}", &path[old.len()..]);
@@ -2001,6 +2008,192 @@ mod tests {
         assert_eq!(recovered.snapshot().unwrap(), snapshot);
         assert_eq!(fs::read(&journal_path).unwrap(), partial_body);
         drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_rename_ranges_preserve_namespace_handles_and_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-writable-rename-ranges-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(&generation).unwrap();
+        let mut base = Manifest::new();
+        for path in [
+            "",
+            "old",
+            "old/子目录",
+            "old-extra",
+            "old2",
+            "destination",
+            "destination/empty",
+        ] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: format!("dir:{path}"),
+                    link_group: None,
+                    mode: 0o755,
+                    modified_ns: 1,
+                    kind: EntryKind::Directory,
+                },
+            );
+        }
+        let kind = content::put_bytes(b"rename contents", &objects).unwrap();
+        for path in [
+            "old/data",
+            "old/子目录/文件",
+            "old-extra/keep",
+            "old2/keep",
+            "old-file",
+            "old-file-extra",
+        ] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: path.into(),
+                    link_group: None,
+                    mode: 0o644,
+                    modified_ns: 2,
+                    kind: kind.clone(),
+                },
+            );
+        }
+        for index in 0..64 {
+            let path = format!("unrelated-{index:03}");
+            base.insert(
+                path.clone(),
+                Entry {
+                    id: format!("dir:{path}"),
+                    link_group: None,
+                    mode: 0o755,
+                    modified_ns: 1,
+                    kind: EntryKind::Directory,
+                },
+            );
+            let path = format!("{path}/keep");
+            base.insert(
+                path.clone(),
+                Entry {
+                    id: path,
+                    link_group: None,
+                    mode: 0o644,
+                    modified_ns: 2,
+                    kind: kind.clone(),
+                },
+            );
+        }
+        let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
+        let original = engine.paths().unwrap();
+        let source = engine.lookup_path("old").unwrap();
+        let nested = engine.lookup_path("old/子目录").unwrap();
+        let file = engine.lookup_path("old/子目录/文件").unwrap();
+        let regular = engine.lookup_path("old-file").unwrap();
+        let destination = engine.lookup_path("destination").unwrap();
+        let replaced = engine.lookup_path("destination/empty").unwrap();
+        let root_links = engine.getattr(ROOT_INODE).unwrap().nlink;
+        let source_handle = engine.open_handle(source.inode, false).unwrap();
+        let file_handle = engine.open_handle(file.inode, false).unwrap();
+        let regular_handle = engine.open_handle(regular.inode, false).unwrap();
+        let replaced_handle = engine.open_handle(replaced.inode, false).unwrap();
+
+        engine
+            .rename(ROOT_INODE, "old-file", ROOT_INODE, "renamed-文件")
+            .unwrap();
+        assert_eq!(
+            engine.lookup_path("renamed-文件").unwrap().inode,
+            regular.inode
+        );
+        engine
+            .rename(ROOT_INODE, "old", destination.inode, "搬迁")
+            .unwrap();
+        assert_eq!(engine.getattr(ROOT_INODE).unwrap().nlink, root_links - 1);
+        assert_eq!(engine.getattr(destination.inode).unwrap().nlink, 4);
+        assert_eq!(
+            engine.lookup(source.inode, "..").unwrap().inode,
+            destination.inode
+        );
+        assert_eq!(
+            engine.lookup(nested.inode, "..").unwrap().inode,
+            source.inode
+        );
+        engine
+            .rename(destination.inode, "搬迁", destination.inode, "empty")
+            .unwrap();
+        assert_eq!(engine.getattr(destination.inode).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(source.inode).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(replaced.inode).unwrap().nlink, 0);
+        assert!(engine.readdir(replaced.inode).unwrap().is_empty());
+        for handle in [file_handle, regular_handle] {
+            assert_eq!(engine.read(handle, 0, 100).unwrap(), b"rename contents");
+        }
+
+        let expected: BTreeMap<_, _> = original
+            .into_iter()
+            .filter_map(|(path, node)| {
+                let renamed = match path.as_str() {
+                    "destination/empty" => return None,
+                    "old-file" => "renamed-文件".to_owned(),
+                    "old" => "destination/empty".to_owned(),
+                    _ => path
+                        .strip_prefix("old/")
+                        .map(|suffix| format!("destination/empty/{suffix}"))
+                        .unwrap_or(path),
+                };
+                Some((renamed, (node.inode, node.entry.id)))
+            })
+            .collect();
+        let identities = |engine: &WritableCas| -> BTreeMap<_, _> {
+            engine
+                .paths()
+                .unwrap()
+                .into_iter()
+                .map(|(path, node)| (path, (node.inode, node.entry.id)))
+                .collect()
+        };
+        assert_eq!(identities(&engine), expected);
+        let snapshot = engine.snapshot().unwrap();
+        for (path, entry) in &base {
+            if path.starts_with("unrelated-")
+                || path.starts_with("old-extra")
+                || path.starts_with("old2")
+                || path == "old-file-extra"
+            {
+                assert_eq!(&snapshot[path], entry);
+            }
+        }
+        let dirty = engine.dirty_paths().unwrap();
+        for path in [
+            "old-file",
+            "renamed-文件",
+            "old/子目录/文件",
+            "destination/搬迁/子目录/文件",
+            "destination/empty/子目录/文件",
+        ] {
+            assert!(dirty.contains(path));
+        }
+        for handle in [source_handle, file_handle, regular_handle, replaced_handle] {
+            engine.release(handle).unwrap();
+        }
+        engine.sync().unwrap();
+        drop(engine);
+
+        let engine = WritableCas::open(&objects, &generation, &base, "r", "g").unwrap();
+        assert_eq!(identities(&engine), expected);
+        assert_eq!(engine.snapshot().unwrap(), snapshot);
+        assert_eq!(engine.dirty_paths().unwrap(), dirty);
+        assert_eq!(engine.getattr(replaced.inode).unwrap().nlink, 0);
+        assert_eq!(
+            engine.read_inode(file.inode, 0, 100).unwrap(),
+            b"rename contents"
+        );
+        drop(engine);
         fs::remove_dir_all(root).unwrap();
     }
 

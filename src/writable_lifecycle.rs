@@ -295,30 +295,188 @@ fn wait_journal_release(generation: &Path) -> io::Result<()> {
     if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
         return Err(invalid("unsafe writable journal lease"));
     }
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let started = Instant::now();
+    wait_for_journal_lease(
+        || {
+            // SAFETY: live owned regular-file descriptor. Only acquisition of
+            // the actual exclusive lease proves the journal has been released.
+            if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        },
+        || started.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+fn wait_for_journal_lease(
+    mut acquire: impl FnMut() -> io::Result<()>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<()> {
+    let timeout = Duration::from_secs(15);
+    let mut delay = Duration::from_millis(1);
     loop {
-        // SAFETY: live owned regular-file descriptor. Nonblocking polling is
-        // bounded and no signals, force-unmounts or lock-file deletion occur.
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(());
+        match acquire() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock && error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-        if Instant::now() >= deadline {
+        // Preserve acquire-before-timeout semantics: expiry never substitutes
+        // for lock ownership. Short initial sleeps avoid rounding prompt daemon
+        // teardown up to 25 ms; persistent contention returns to that same cap.
+        let remaining = timeout.saturating_sub(elapsed());
+        if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "writable server still holds its journal lease; generation retained",
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        // No spin, signals, force-unmount, lock deletion or deadline reset.
+        // Clip the last sleep rather than deliberately sleeping past the budget.
+        sleep(delay.min(remaining));
+        delay = (delay * 2).min(Duration::from_millis(25));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn simulate_lease_wait(
+        release_at: Option<Duration>,
+        initial_errors: &[io::ErrorKind],
+        oversleep: Duration,
+    ) -> (io::Result<()>, Vec<Duration>, usize, Duration) {
+        use std::cell::{Cell, RefCell};
+        let now = Cell::new(Duration::ZERO);
+        let attempts = Cell::new(0);
+        let sleeps = RefCell::new(Vec::new());
+        let mut errors = initial_errors.iter().copied();
+        let result = wait_for_journal_lease(
+            || {
+                attempts.set(attempts.get() + 1);
+                if let Some(error) = errors.next() {
+                    return Err(error.into());
+                }
+                if release_at.is_some_and(|release| now.get() >= release) {
+                    Ok(())
+                } else {
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+            },
+            || now.get(),
+            |delay| {
+                sleeps.borrow_mut().push(delay);
+                now.set(now.get() + delay + oversleep);
+            },
+        );
+        (result, sleeps.into_inner(), attempts.get(), now.get())
+    }
+
+    #[test]
+    fn lease_backoff_immediate_release_never_sleeps() {
+        let (result, sleeps, attempts, elapsed) =
+            simulate_lease_wait(Some(Duration::ZERO), &[], Duration::ZERO);
+        result.unwrap();
+        assert!(sleeps.is_empty());
+        assert_eq!(attempts, 1);
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn lease_backoff_prompt_release_requires_actual_acquisition() {
+        let (result, sleeps, attempts, elapsed) =
+            simulate_lease_wait(Some(Duration::from_millis(2)), &[], Duration::ZERO);
+        result.unwrap();
+        assert_eq!(sleeps, [Duration::from_millis(1), Duration::from_millis(2)]);
+        assert_eq!(attempts, 3);
+        assert_eq!(elapsed, Duration::from_millis(3));
+    }
+
+    #[test]
+    fn lease_backoff_late_release_caps_sleep_and_keeps_original_deadline() {
+        let (result, sleeps, attempts, elapsed) =
+            simulate_lease_wait(Some(Duration::from_millis(14999)), &[], Duration::ZERO);
+        result.unwrap();
+        assert_eq!(
+            &sleeps[..6],
+            &[1, 2, 4, 8, 16, 25].map(Duration::from_millis)
+        );
+        assert!(
+            sleeps
+                .iter()
+                .all(|delay| !delay.is_zero() && *delay <= Duration::from_millis(25))
+        );
+        assert_eq!(elapsed, Duration::from_secs(15));
+        assert_eq!(attempts, sleeps.len() + 1);
+    }
+
+    #[test]
+    fn lease_backoff_never_release_times_out_without_oversleep_or_spin() {
+        let (result, sleeps, attempts, elapsed) = simulate_lease_wait(None, &[], Duration::ZERO);
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "writable server still holds its journal lease; generation retained"
+        );
+        assert_eq!(elapsed, Duration::from_secs(15));
+        assert_eq!(attempts, sleeps.len() + 1);
+        assert!(sleeps.len() < 610);
+        assert_eq!(sleeps.last(), Some(&Duration::from_millis(19)));
+        assert!(
+            sleeps
+                .iter()
+                .all(|delay| !delay.is_zero() && *delay <= Duration::from_millis(25))
+        );
+    }
+
+    #[test]
+    fn lease_backoff_interrupted_acquisition_sleeps_and_rechecks_lock() {
+        let (result, sleeps, attempts, _) = simulate_lease_wait(
+            Some(Duration::ZERO),
+            &[io::ErrorKind::Interrupted, io::ErrorKind::Interrupted],
+            Duration::ZERO,
+        );
+        result.unwrap();
+        assert_eq!(sleeps, [Duration::from_millis(1), Duration::from_millis(2)]);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn lease_backoff_fatal_error_is_returned_unchanged_without_sleep() {
+        let result = wait_for_journal_lease(
+            || Err(io::Error::from_raw_os_error(libc::EIO)),
+            || panic!("fatal errors must not consult timeout"),
+            |_| panic!("fatal errors must not sleep"),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn lease_backoff_preserves_acquisition_before_timeout_after_scheduler_delay() {
+        let (result, sleeps, attempts, elapsed) =
+            simulate_lease_wait(Some(Duration::from_millis(1)), &[], Duration::from_secs(16));
+        result.unwrap();
+        assert_eq!(sleeps, [Duration::from_millis(1)]);
+        assert_eq!(attempts, 2);
+        assert!(elapsed > Duration::from_secs(15));
+    }
+
+    #[test]
+    fn lease_backoff_scheduler_delay_does_not_reset_timeout() {
+        let (result, sleeps, attempts, elapsed) =
+            simulate_lease_wait(None, &[], Duration::from_secs(16));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(sleeps, [Duration::from_millis(1)]);
+        assert_eq!(attempts, 2);
+        assert!(elapsed > Duration::from_secs(15));
+    }
 
     #[test]
     fn writable_binding_requires_one_exact_restrictive_mount() {

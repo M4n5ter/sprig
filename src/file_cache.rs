@@ -119,7 +119,16 @@ impl<'a> Session<'a> {
             }
         }
         self.cache
-            .get_or_init(|| open_cache(self.objects).ok())
+            .get_or_init(|| {
+                open_cache(self.objects)
+                    .and_then(|cache| {
+                        if let Some(keys) = &self.working_set {
+                            cache.inventory.borrow_mut().protect(keys.clone())?;
+                        }
+                        Ok(cache)
+                    })
+                    .ok()
+            })
             .as_ref()
             .filter(|cache| !cache.disabled.get())
     }
@@ -152,7 +161,7 @@ impl<'a> Session<'a> {
                     self.counters.hits.set(self.counters.hits.get() + 1);
                     return Ok(output);
                 }
-                Ok(None) => cache.inventory.borrow_mut().forget(&key),
+                Ok(None) => cache.inventory.borrow_mut().forget(&key)?,
                 Err(error) if target.try_exists()? => return Err(error),
                 Err(_) => cache.disabled.set(true),
             }
@@ -161,7 +170,7 @@ impl<'a> Session<'a> {
         if allow_population && !cache.disabled.get() {
             #[cfg(test)]
             self.counters.fills.set(self.counters.fills.get() + 1);
-            let protected = small.then_some(self.working_set.as_ref()).flatten();
+            let protected = small && self.working_set.is_some();
             match populate(cache, &key, size, target, protected) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -275,13 +284,7 @@ fn cached(
 }
 
 // false is a deliberate admission decline, not a clone or IO failure.
-fn populate(
-    cache: &Cache,
-    key: &str,
-    size: u64,
-    target: &Path,
-    protected: Option<&BTreeSet<String>>,
-) -> Result<bool> {
+fn populate(cache: &Cache, key: &str, size: u64, target: &Path, protected: bool) -> Result<bool> {
     let root = &cache.root;
     if !cache_eligible(size) {
         return Ok(true);
@@ -293,11 +296,11 @@ fn populate(
         .max(platform::allocated_bytes(target, &metadata)?)
         .checked_add(4096)
         .ok_or("cache size overflow")?;
-    if let Some(protected) = protected {
+    if protected {
         if !cache
             .inventory
             .borrow_mut()
-            .reserve_protected(root, key, charge, protected)?
+            .reserve_protected(root, key, charge)?
         {
             return Ok(false);
         }
@@ -318,7 +321,7 @@ fn populate(
         platform::sync_directory(root)?;
     } else {
         // Unsupported cloning removed its temporary target and wrote no cache.
-        cache.inventory.borrow_mut().forget(key);
+        cache.inventory.borrow_mut().forget(key)?;
     }
     Ok(true)
 }
@@ -355,6 +358,19 @@ fn verify(file: &mut File, reader: &packed::Reader, chunks: &[String], size: u64
 struct Inventory {
     charges: BTreeMap<String, u64>,
     total: u64,
+    protection: Option<Protection>,
+    #[cfg(test)]
+    protection_scanned_entries: usize,
+    #[cfg(test)]
+    protected_victim_queries: usize,
+}
+
+struct Protection {
+    keys: BTreeSet<String>,
+    bytes: u64,
+    entries: usize,
+    // Ordered victims avoid rescanning a protected lexical prefix per eviction.
+    victims: BTreeSet<String>,
 }
 
 impl Inventory {
@@ -398,10 +414,91 @@ impl Inventory {
         Ok(result)
     }
 
-    fn forget(&mut self, key: &str) {
-        if let Some(charge) = self.charges.remove(key) {
-            self.total -= charge;
+    fn protect(&mut self, keys: BTreeSet<String>) -> Result<()> {
+        if self.protection.is_some() || keys.len() > ENTRY_BUDGET {
+            return Err("invalid cache protection initialization".into());
         }
+        let mut protection = Protection {
+            keys,
+            bytes: 0,
+            entries: 0,
+            victims: BTreeSet::new(),
+        };
+        for (key, charge) in &self.charges {
+            if protection.keys.contains(key) {
+                protection.bytes = protection
+                    .bytes
+                    .checked_add(*charge)
+                    .ok_or("cache size overflow")?;
+                protection.entries += 1;
+            } else {
+                protection.victims.insert(key.clone());
+            }
+        }
+        #[cfg(test)]
+        {
+            self.protection_scanned_entries += self.charges.len();
+        }
+        self.protection = Some(protection);
+        Ok(())
+    }
+
+    fn insert_charge(&mut self, key: &str, charge: u64) -> Result<()> {
+        if self.charges.contains_key(key) {
+            return Err("cache reservation already exists".into());
+        }
+        let total = self
+            .total
+            .checked_add(charge)
+            .ok_or("cache size overflow")?;
+        if let Some(protection) = &mut self.protection {
+            if protection.keys.contains(key) {
+                let bytes = protection
+                    .bytes
+                    .checked_add(charge)
+                    .ok_or("cache size overflow")?;
+                let entries = protection
+                    .entries
+                    .checked_add(1)
+                    .ok_or("cache entry overflow")?;
+                protection.bytes = bytes;
+                protection.entries = entries;
+            } else {
+                protection.victims.insert(key.to_owned());
+            }
+        }
+        self.total = total;
+        self.charges.insert(key.to_owned(), charge);
+        Ok(())
+    }
+
+    fn forget(&mut self, key: &str) -> Result<()> {
+        let Some(charge) = self.charges.get(key).copied() else {
+            return Ok(());
+        };
+        let total = self
+            .total
+            .checked_sub(charge)
+            .ok_or("cache accounting underflow")?;
+        if let Some(protection) = &mut self.protection {
+            if protection.keys.contains(key) {
+                let bytes = protection
+                    .bytes
+                    .checked_sub(charge)
+                    .ok_or("cache protection underflow")?;
+                let entries = protection
+                    .entries
+                    .checked_sub(1)
+                    .ok_or("cache protection underflow")?;
+                protection.bytes = bytes;
+                protection.entries = entries;
+            } else if !protection.victims.remove(key) {
+                return Err("cache victim index mismatch".into());
+            }
+        }
+        self.total = total;
+        self.charges.remove(key);
+        Ok(())
     }
 
     fn evict(&mut self, root: &Path, additional: u64, additional_entries: usize) -> Result<()> {
@@ -420,38 +517,31 @@ impl Inventory {
             // No cached() input handle is alive here (important on Windows).
             // Only update accounting after a successful deletion.
             fs::remove_file(root.join(&key))?;
-            self.forget(&key);
+            self.forget(&key)?;
         }
         Ok(())
     }
 
-    fn reserve_protected(
-        &mut self,
-        root: &Path,
-        key: &str,
-        charge: u64,
-        protected: &BTreeSet<String>,
-    ) -> Result<bool> {
+    fn reserve_protected(&mut self, root: &Path, key: &str, charge: u64) -> Result<bool> {
         if self.charges.contains_key(key) {
             return Err("cache reservation already exists".into());
         }
-        let mut protected_charge = 0_u64;
-        let mut protected_count = 0_usize;
-        for (present, bytes) in &self.charges {
-            if protected.contains(present) {
-                protected_charge = protected_charge
-                    .checked_add(*bytes)
-                    .ok_or("cache size overflow")?;
-                protected_count += 1;
-            }
-        }
-        // Check feasibility before removing anything. A physical-charge surprise
-        // declines small admission rather than cycling through the working set.
-        if protected_charge
+        let protection = self
+            .protection
+            .as_ref()
+            .ok_or("missing cache protection plan")?;
+        // These counters are initialized once under the lease and maintained by
+        // every reservation/removal, including the unchanged large-file policy.
+        if protection
+            .bytes
             .checked_add(charge)
             .ok_or("cache size overflow")?
             > BUDGET
-            || protected_count + 1 > ENTRY_BUDGET
+            || protection
+                .entries
+                .checked_add(1)
+                .ok_or("cache entry overflow")?
+                > ENTRY_BUDGET
         {
             return Ok(false);
         }
@@ -463,13 +553,19 @@ impl Inventory {
             || self.charges.len() + 1 > ENTRY_BUDGET
         {
             let victim = self
-                .charges
-                .keys()
-                .find(|candidate| !protected.contains(*candidate))
+                .protection
+                .as_ref()
+                .unwrap()
+                .victims
+                .first()
                 .ok_or("cache admission accounting mismatch")?
                 .clone();
+            #[cfg(test)]
+            {
+                self.protected_victim_queries += 1;
+            }
             fs::remove_file(root.join(&victim))?;
-            self.forget(&victim);
+            self.forget(&victim)?;
         }
         self.reserve(root, key, charge)?;
         Ok(true)
@@ -482,12 +578,7 @@ impl Inventory {
         self.evict(root, charge, 1)?;
         // Preserve the existing eviction-before-publication durability boundary.
         platform::sync_directory(root)?;
-        self.total = self
-            .total
-            .checked_add(charge)
-            .ok_or("cache size overflow")?;
-        self.charges.insert(key.to_owned(), charge);
-        Ok(())
+        self.insert_charge(key, charge)
     }
 }
 
@@ -852,16 +943,91 @@ mod tests {
         inventory.reserve(&root, &old, BUDGET / 2)?;
         fs::write(root.join(&old), b"old")?;
         let protected = BTreeSet::from([current.clone(), incoming.clone()]);
-        assert!(inventory.reserve_protected(&root, &incoming, 8192, &protected)?);
+        inventory.protect(protected)?;
+        assert!(inventory.reserve_protected(&root, &incoming, 8192)?);
         fs::write(root.join(&incoming), b"incoming")?;
         assert!(!root.join(&old).exists());
         assert_eq!(fs::read(root.join(&current))?, b"current");
         let before = inventory.charges.clone();
         // Charges simulate a filesystem with much greater actual allocation
         // than the planner's logical lower bound. No current key may be pruned.
-        assert!(!inventory.reserve_protected(&root, &"d".repeat(64), BUDGET, &protected)?);
+        assert!(!inventory.reserve_protected(&root, &"d".repeat(64), BUDGET)?);
         assert_eq!(inventory.charges, before);
         assert_eq!(fs::read(root.join(&incoming))?, b"incoming");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn near_capacity_protection_counters_and_victim_index_are_incremental() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-cache-index-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let key = |index: usize| format!("{index:064x}");
+        let half = ENTRY_BUDGET / 2;
+        let mut inventory = Inventory::default();
+        // Half are current protected keys, half obsolete. All have the same
+        // small physical-accounting charge, so entry pressure is the boundary.
+        for index in 0..ENTRY_BUDGET {
+            inventory.insert_charge(&key(index), 8192)?;
+            fs::write(root.join(key(index)), b"")?;
+        }
+        let protected: BTreeSet<_> = (0..half)
+            .chain(ENTRY_BUDGET..ENTRY_BUDGET + half)
+            .map(key)
+            .collect();
+        inventory.protect(protected)?;
+        assert_eq!(inventory.protection_scanned_entries, ENTRY_BUDGET);
+        for index in 0..half {
+            let incoming = key(ENTRY_BUDGET + index);
+            assert!(inventory.reserve_protected(&root, &incoming, 8192)?);
+            fs::write(root.join(&incoming), b"")?;
+            let protection = inventory.protection.as_ref().unwrap();
+            assert_eq!(protection.entries, half + index + 1);
+            assert_eq!(protection.bytes, (half + index + 1) as u64 * 8192);
+            assert_eq!(protection.victims.len(), half - index - 1);
+            assert_eq!(inventory.total, ENTRY_BUDGET as u64 * 8192);
+            assert_eq!(inventory.protection_scanned_entries, ENTRY_BUDGET);
+            assert_eq!(inventory.protected_victim_queries, index + 1);
+        }
+        // Large policy is unchanged: it may evict the first protected key, but
+        // both incremental counters and the unprotected-victim index must track it.
+        let large = "f".repeat(64);
+        inventory.reserve(&root, &large, 8192)?;
+        fs::write(root.join(&large), b"")?;
+        assert!(!root.join(key(0)).exists());
+        let protection = inventory.protection.as_ref().unwrap();
+        assert_eq!(protection.entries, ENTRY_BUDGET - 1);
+        assert_eq!(protection.victims, BTreeSet::from([large.clone()]));
+        fs::remove_file(root.join(&large))?;
+        inventory.forget(&large)?;
+        assert!(inventory.protection.as_ref().unwrap().victims.is_empty());
+        assert!(inventory.reserve_protected(&root, &key(0), 8192)?);
+        // Model a reserved fill that fails before publication: accounting keeps
+        // the reservation until the session is disabled/dropped or a confirmed
+        // unsupported clone explicitly forgets it.
+        assert_eq!(inventory.protection.as_ref().unwrap().entries, ENTRY_BUDGET);
+        inventory.forget(&key(0))?;
+        assert_eq!(
+            inventory.protection.as_ref().unwrap().entries,
+            ENTRY_BUDGET - 1
+        );
+        assert_eq!(inventory.protection_scanned_entries, ENTRY_BUDGET);
+        assert_eq!(inventory.protected_victim_queries, half);
+        let protection = inventory.protection.as_ref().unwrap();
+        assert_eq!(
+            protection.bytes,
+            inventory
+                .charges
+                .iter()
+                .filter(|(k, _)| protection.keys.contains(*k))
+                .map(|(_, charge)| charge)
+                .sum::<u64>()
+        );
+        assert_eq!(inventory.total, inventory.charges.values().sum::<u64>());
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1001,6 +1167,10 @@ mod tests {
             .charges
             .insert(key.clone(), BUDGET - 4096);
         cache.inventory.borrow_mut().total = BUDGET - 4096;
+        cache
+            .inventory
+            .borrow_mut()
+            .protect(session.working_set.clone().unwrap())?;
         session.materialize(&reader, &missing_chunks, size, &root.join("missing-one"))?;
         assert_eq!(fs::read(root.join("missing-one"))?, missing_bytes);
         assert!(!session.small_admission.get());

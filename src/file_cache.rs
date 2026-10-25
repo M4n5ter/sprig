@@ -173,6 +173,8 @@ fn populate(cache: &Cache, key: &str, size: u64, target: &Path) -> Result<()> {
         .checked_add(4096)
         .ok_or("cache size overflow")?;
     cache.inventory.borrow_mut().reserve(root, key, charge)?;
+    #[cfg(test)]
+    tests::inject_fill_fault()?;
     let path = root.join(key);
     let input = platform::open_regular(target)?;
     let pending = root.join(format!("pending-{key}"));
@@ -321,6 +323,22 @@ mod tests {
     use super::*;
     use crate::content::{self, EntryKind};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    thread_local! { static FAIL_FILL: Cell<bool> = const { Cell::new(false) }; }
+
+    pub(super) fn inject_fill_fault() -> Result<()> {
+        if FAIL_FILL.get() {
+            return Err(std::io::Error::other("injected cache fill failure").into());
+        }
+        Ok(())
+    }
+
+    struct FillFault;
+    impl Drop for FillFault {
+        fn drop(&mut self) {
+            FAIL_FILL.set(false);
+        }
+    }
 
     #[test]
     fn cache_is_disposable_bounded_verified_and_never_a_mutable_alias() -> Result<()> {
@@ -477,7 +495,13 @@ mod tests {
         let pending = cache.root.join(format!("pending-{key}"));
         fs::create_dir(&pending)?;
         fs::write(pending.join("evidence"), b"keep")?;
+        // NTFS may decline cloning before inspecting the destination. Inject a
+        // real fill error after reservation deterministically on every platform,
+        // rather than treating unsupported cloning as an IO failure.
+        FAIL_FILL.set(true);
+        let fault = FillFault;
         session.materialize(&reader, &chunks, size, &root.join("first"))?;
+        drop(fault);
         assert_eq!(fs::read(root.join("first"))?, bytes);
         assert!(cache.disabled.get());
         assert!(cache.inventory.borrow().total >= size + 4096);
@@ -530,6 +554,10 @@ mod tests {
             let second = root.join(format!("second-{size}"));
             session.materialize(&reader, &chunks, size, &second)?;
             assert_eq!(fs::read(&second)?, bytes);
+            // The public materializer reapplies manifest permissions after a
+            // clone; APFS clonefile also copies the cache inode's read-only mode.
+            #[cfg(unix)]
+            platform::set_path_mode(&second, 0o600)?;
             fs::write(&second, b"changed workspace")?;
             assert_eq!(fs::read(&cached)?, bytes);
             assert_eq!(fs::read(&first)?, bytes);

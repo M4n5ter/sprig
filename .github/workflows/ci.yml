@@ -91,6 +91,12 @@ jobs:
           test -c /dev/fuse
           set -o pipefail
           sudo python3 tests/projection_workflow.py --binary "$PWD/target/debug/sprig" | tee projection-result.json
+      - name: Verify held file descriptor survives ordinary hardlink creation
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tests/test_writable_link_fd.py
+          sudo python3 tests/writable_link_fd.py --binary "$PWD/target/debug/sprig" | tee writable-link-fd-result.json
       - name: Verify owned writable CAS lifecycle on synthetic data
         shell: bash
         run: |
@@ -103,4 +109,5 @@ jobs:
           path: |
             projection-result.json
             writable-result.json
+            writable-link-fd-result.json
           if-no-files-found: ignore

@@ -31,6 +31,10 @@ use crate::writable::{NodeAttr, SetAttr, WritableCas};
 
 const TTL: Duration = Duration::ZERO;
 const MAX_IO_BYTES: usize = 1024 * 1024;
+// Core inode numbers are never reused within a mounted session. Every entry
+// reply for an inode, including hardlink aliases, must keep this generation.
+// A mismatch tells the kernel the old inode (and its live mappings) is stale.
+const INODE_GENERATION: u64 = 1;
 
 struct Handle {
     inode: u64,
@@ -360,7 +364,7 @@ impl Filesystem for WritableFuse {
         {
             Ok(attr) => {
                 self.remember(attr.ino);
-                reply.entry(&TTL, &attr, 1);
+                reply.entry(&TTL, &attr, INODE_GENERATION);
             }
             Err(error) => reply.error(errno(&error)),
         }
@@ -758,7 +762,13 @@ impl Filesystem for WritableFuse {
         match result {
             Ok((attr, handle)) => {
                 self.remember(attr.ino);
-                reply.created(&TTL, &attr, 1, handle, fuser::consts::FOPEN_KEEP_CACHE);
+                reply.created(
+                    &TTL,
+                    &attr,
+                    INODE_GENERATION,
+                    handle,
+                    fuser::consts::FOPEN_KEEP_CACHE,
+                );
             }
             Err(error) => reply.error(errno(&error)),
         }
@@ -786,7 +796,7 @@ impl Filesystem for WritableFuse {
         match result {
             Ok(attr) => {
                 self.remember(attr.ino);
-                reply.entry(&TTL, &attr, 1);
+                reply.entry(&TTL, &attr, INODE_GENERATION);
             }
             Err(error) => reply.error(errno(&error)),
         }
@@ -813,7 +823,7 @@ impl Filesystem for WritableFuse {
         match result {
             Ok(attr) => {
                 self.remember(attr.ino);
-                reply.entry(&TTL, &attr, 1);
+                reply.entry(&TTL, &attr, INODE_GENERATION);
             }
             Err(error) => reply.error(errno(&error)),
         }
@@ -881,7 +891,7 @@ impl Filesystem for WritableFuse {
         match result {
             Ok(attr) => {
                 self.remember(attr.ino);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, INODE_GENERATION);
             }
             Err(error) => reply.error(errno(&error)),
         }

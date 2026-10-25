@@ -97,6 +97,12 @@ left on disk so you can inspect it. The `s` helper below uses this same store.
 - `restore REFERENCE NAME` reconstructs a committed revision into a new workspace
   and a new same-named branch.
 
+Native forks derive logical identities from the checked copy itself, preserving
+renames and hardlink groups without first chunking uncommitted files into CAS.
+They still copy or clone every file and retain the existing source-change checks
+and durability barriers. Fork is not a CAS health audit; checkpoint captures the
+copied bytes, while revision reads and `doctor` continue to verify stored content.
+
 These commands do not replace an existing workspace. History references accept
 full revision IDs, branch names or `workspace:NAME`. The explicit workspace form
 means its **committed base**, never its uncommitted files. `merge OURS THEIRS OUTPUT`

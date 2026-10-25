@@ -691,10 +691,8 @@ impl Store {
         if matches!(source.backend, WorkspaceBackend::Writable { .. }) {
             return self.fork_writable_source(&mut state, &source, name);
         }
-        // Capture identities first so a pending native rename stays identifiable.
-        // The objects are deduplicated and remain unpublished until checkpoint.
-        let (manifest, _) = self.capture_workspace(&source)?;
         if matches!(source.backend, WorkspaceBackend::Projection { .. }) {
+            let (manifest, _) = self.capture_workspace(&source)?;
             if mode != CopyMode::Auto {
                 return Err(failure(
                     "native copy policy does not apply to a projected fork",
@@ -703,9 +701,15 @@ impl Store {
             return self.fork_projected_locked(&mut state, &source, &manifest, name, false);
         }
         let directory = self.new_native()?;
-        let copy_stats =
-            copy_tree::copy_tree(&self.tree(&source.directory), &self.tree(&directory), mode)?;
-        let observed = observe_manifest(&self.tree(&directory), &manifest)?;
+        // Reconcile against the checked source identities before rebinding to
+        // destination inodes. Fork copies uncommitted bytes; it need not hash
+        // and publish them to CAS before doing that same copy.
+        let (copy_stats, copied) = copy_tree::copy_tree_with_identities(
+            &self.tree(&source.directory),
+            &self.tree(&directory),
+            mode,
+        )?;
+        let observed = content::observe_copied(&copied, &source.observed)?;
         let mut fork = Workspace {
             backend: WorkspaceBackend::Native,
             branch: name.to_owned(),

@@ -11,6 +11,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,29 @@ pub struct CopyStats {
     pub symlinks: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PhysicalIdentity {
+    pub device: u64,
+    pub inode: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CopiedKind {
+    Directory,
+    File,
+    Symlink,
+}
+
+/// Copy-time identity evidence only: this cannot describe or publish CAS content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CopiedIdentity {
+    pub source: PhysicalIdentity,
+    pub destination: PhysicalIdentity,
+    pub kind: CopiedKind,
+}
+
+pub(crate) type CopyIdentities = BTreeMap<String, CopiedIdentity>;
+
 struct CopiedFile {
     metadata: Metadata,
     target: PathBuf,
@@ -52,6 +76,30 @@ pub struct NativeBackendInfo {
 }
 
 pub fn copy_tree(source: &Path, target: &Path, mode: CopyMode) -> io::Result<CopyStats> {
+    copy_tree_inner(source, target, mode, &mut None)
+}
+
+/// Returns source identities from the checked copy and independent destination
+/// identities, including the root at "". Identity capture never reads file bytes
+/// in addition to the ordinary copy/clone operation.
+pub(crate) fn copy_tree_with_identities(
+    source: &Path,
+    target: &Path,
+    mode: CopyMode,
+) -> io::Result<(CopyStats, CopyIdentities)> {
+    let mut identities = Some(CopyIdentities::new());
+    let stats = copy_tree_inner(source, target, mode, &mut identities)?;
+    let identities = identities.expect("identity collector was enabled");
+    validate_copy_identities(&identities)?;
+    Ok((stats, identities))
+}
+
+fn copy_tree_inner(
+    source: &Path,
+    target: &Path,
+    mode: CopyMode,
+    identities: &mut Option<CopyIdentities>,
+) -> io::Result<CopyStats> {
     let source = normalized_root(source)?;
     let target = normalized_root(target)?;
     let metadata = platform::symlink_metadata(&source)?;
@@ -78,7 +126,9 @@ pub fn copy_tree(source: &Path, target: &Path, mode: CopyMode) -> io::Result<Cop
     }
     let mut stats = CopyStats::default();
     let mut files = BTreeMap::new();
-    copy_entry(&source, &target, mode, &mut stats, &mut files)?;
+    copy_entry(
+        &source, &target, mode, &mut stats, &mut files, "", identities,
+    )?;
     platform::sync_directory(
         target
             .parent()
@@ -94,11 +144,19 @@ fn copy_entry(
     mode: CopyMode,
     stats: &mut CopyStats,
     files: &mut BTreeMap<(u64, u128), CopiedFile>,
+    relative: &str,
+    identities: &mut Option<CopyIdentities>,
 ) -> io::Result<()> {
     let metadata = platform::symlink_metadata(source)?;
     platform::validate_capture_metadata(source, &metadata)?;
+    if identities.is_some() {
+        validate_identity_path(relative)?;
+        validate_modified_time(
+            metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
+        )?;
+    }
     if metadata.file_type().is_symlink() {
-        copy_symlink(source, target)?;
+        copy_symlink(source, target, identities.is_some())?;
         #[cfg(target_os = "macos")]
         set_symlink_permissions(target, metadata.mode() & 0o777)?;
         set_symlink_modified(
@@ -106,6 +164,14 @@ fn copy_entry(
             metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
         )?;
         stats.symlinks += 1;
+        if let Some(identities) = identities {
+            record_identity(
+                identities,
+                relative,
+                &metadata,
+                &platform::symlink_metadata(target)?,
+            )?;
+        }
     } else if metadata.is_dir() {
         platform::create_dir(target, 0o700)?;
         platform::set_path_mode(target, 0o700)?;
@@ -113,12 +179,26 @@ fn copy_entry(
         let mut children = fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
         children.sort_by_key(|entry| entry.file_name());
         for child in children {
+            let child_relative = if identities.is_some() {
+                let name = child.file_name().into_string().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 path rejected")
+                })?;
+                if relative.is_empty() {
+                    name
+                } else {
+                    format!("{relative}/{name}")
+                }
+            } else {
+                String::new()
+            };
             copy_entry(
                 &child.path(),
                 &target.join(child.file_name()),
                 mode,
                 stats,
                 files,
+                &child_relative,
+                identities,
             )?;
         }
         if !unchanged(&metadata, &platform::symlink_metadata(source)?) {
@@ -130,6 +210,14 @@ fn copy_entry(
         platform::set_mode(&directory, metadata.mode() & 0o777)?;
         directory.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
         platform::sync_directory_file(&directory)?;
+        if let Some(identities) = identities {
+            record_identity(
+                identities,
+                relative,
+                &metadata,
+                &platform::file_metadata(&directory)?,
+            )?;
+        }
     } else if metadata.is_file() {
         let mut input = platform::open_regular(source)?;
         let before = platform::file_metadata(&input)?;
@@ -150,6 +238,14 @@ fn copy_entry(
                 return Err(io::Error::other("linked source changed while copying"));
             }
             stats.hardlinks += 1;
+            if let Some(identities) = identities {
+                record_identity(
+                    identities,
+                    relative,
+                    &before,
+                    &platform::symlink_metadata(target)?,
+                )?;
+            }
             return Ok(());
         }
         let cloned = if mode == CopyMode::Copy {
@@ -184,6 +280,14 @@ fn copy_entry(
         platform::set_mode(&output, metadata.mode() & 0o777)?;
         output.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
         output.sync_all()?;
+        if let Some(identities) = identities {
+            record_identity(
+                identities,
+                relative,
+                &before,
+                &platform::file_metadata(&output)?,
+            )?;
+        }
         files.insert(
             key,
             CopiedFile {
@@ -197,6 +301,126 @@ fn copy_entry(
             source.display()
         )));
     }
+    Ok(())
+}
+
+fn physical_identity(metadata: &Metadata) -> PhysicalIdentity {
+    PhysicalIdentity {
+        device: metadata.dev(),
+        inode: platform::inode(metadata),
+    }
+}
+
+fn copied_kind(metadata: &Metadata) -> io::Result<CopiedKind> {
+    if metadata.file_type().is_symlink() {
+        Ok(CopiedKind::Symlink)
+    } else if metadata.is_dir() {
+        Ok(CopiedKind::Directory)
+    } else if metadata.is_file() {
+        Ok(CopiedKind::File)
+    } else {
+        Err(io::Error::other("special file has no copy identity"))
+    }
+}
+
+fn record_identity(
+    identities: &mut CopyIdentities,
+    relative: &str,
+    source: &Metadata,
+    destination: &Metadata,
+) -> io::Result<()> {
+    let kind = copied_kind(source)?;
+    let source = physical_identity(source);
+    let destination_kind = copied_kind(destination)?;
+    let destination = physical_identity(destination);
+    if kind != destination_kind || source == destination {
+        return Err(io::Error::other(
+            "copy destination changed type or shares the source inode",
+        ));
+    }
+    if identities
+        .insert(
+            relative.to_owned(),
+            CopiedIdentity {
+                source,
+                destination,
+                kind,
+            },
+        )
+        .is_some()
+    {
+        return Err(io::Error::other("duplicate copied path identity"));
+    }
+    Ok(())
+}
+
+fn validate_copy_identities(identities: &CopyIdentities) -> io::Result<()> {
+    if identities.get("").map(|entry| entry.kind) != Some(CopiedKind::Directory) {
+        return Err(io::Error::other("copy identities require a root directory"));
+    }
+    let mut source_files = BTreeMap::new();
+    let mut destination_files = BTreeMap::new();
+    for (path, entry) in identities {
+        validate_identity_path(path)?;
+        if !path.is_empty() {
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if identities.get(parent).map(|entry| entry.kind) != Some(CopiedKind::Directory) {
+                return Err(io::Error::other("copied path has no directory ancestor"));
+            }
+        }
+        if entry.source == entry.destination {
+            return Err(io::Error::other("copy shares a mutable source inode"));
+        }
+        if entry.kind == CopiedKind::File
+            && (source_files
+                .insert(entry.source, entry.destination)
+                .is_some_and(|previous| previous != entry.destination)
+                || destination_files
+                    .insert(entry.destination, entry.source)
+                    .is_some_and(|previous| previous != entry.source))
+        {
+            return Err(io::Error::other("copy changed regular-file link topology"));
+        }
+    }
+    if destination_files
+        .keys()
+        .any(|identity| source_files.contains_key(identity))
+    {
+        return Err(io::Error::other("copy links to a source-tree file"));
+    }
+    Ok(())
+}
+
+fn validate_identity_path(path: &str) -> io::Result<()> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    platform::validate_relative_path(path)?;
+    if path.contains('\0')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid relative copy identity path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_modified_time(nanoseconds: i128) -> io::Result<()> {
+    let absolute = nanoseconds.unsigned_abs();
+    let seconds: u64 = (absolute / 1_000_000_000)
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mtime out of range"))?;
+    let duration = Duration::new(seconds, (absolute % 1_000_000_000) as u32);
+    let time = if nanoseconds < 0 {
+        UNIX_EPOCH.checked_sub(duration)
+    } else {
+        UNIX_EPOCH.checked_add(duration)
+    };
+    time.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mtime out of range"))?;
     Ok(())
 }
 
@@ -349,12 +573,23 @@ pub(crate) fn set_symlink_modified(_path: &Path, _modified_ns: i128) -> io::Resu
 }
 
 #[cfg(unix)]
-fn copy_symlink(source: &Path, target: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(fs::read_link(source)?, target)
+fn copy_symlink(source: &Path, target: &Path, validate_target: bool) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let link = fs::read_link(source)?;
+    if validate_target {
+        let bytes = link.as_os_str().as_bytes();
+        if bytes.is_empty() || bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid symbolic link target",
+            ));
+        }
+    }
+    std::os::unix::fs::symlink(link, target)
 }
 
 #[cfg(windows)]
-fn copy_symlink(_source: &Path, _target: &Path) -> io::Result<()> {
+fn copy_symlink(_source: &Path, _target: &Path, _validate_target: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "symbolic links are not supported on Windows",
@@ -502,6 +737,168 @@ fn unchanged(left: &Metadata, right: &Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> io::Result<Self> {
+            static NONCE: AtomicU64 = AtomicU64::new(0);
+            let path = fs::canonicalize(std::env::temp_dir())?.join(format!(
+                "sprig-copy-identities-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                NONCE.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn copy_report_tracks_each_node_and_preserves_link_isolation() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let source = fixture.0.join("source");
+        let target = fixture.0.join("target");
+        fs::create_dir_all(source.join("nested"))?;
+        fs::write(source.join("a"), b"shared bytes")?;
+        fs::hard_link(source.join("a"), source.join("nested/b"))?;
+        fs::write(source.join("independent"), b"shared bytes")?;
+        fs::write(source.join("empty"), [])?;
+        // An alias outside the copied tree must not become part of its report.
+        fs::hard_link(source.join("independent"), fixture.0.join("outside"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(source.join("a"), fs::Permissions::from_mode(0o751))?;
+            std::os::unix::fs::symlink("missing-target", source.join("dangling"))?;
+        }
+
+        let (stats, identities) = copy_tree_with_identities(&source, &target, CopyMode::Copy)?;
+        assert_eq!(stats.copied, 3);
+        assert_eq!(stats.cloned, 0);
+        assert_eq!(stats.hardlinks, 1);
+        assert_eq!(identities.len(), if cfg!(unix) { 7 } else { 6 });
+        assert_eq!(identities[""].kind, CopiedKind::Directory);
+        assert_eq!(identities["nested"].kind, CopiedKind::Directory);
+        assert_eq!(identities["empty"].kind, CopiedKind::File);
+        assert_eq!(identities["a"].source, identities["nested/b"].source);
+        assert_eq!(
+            identities["a"].destination,
+            identities["nested/b"].destination
+        );
+        assert_ne!(identities["a"].source, identities["independent"].source);
+        assert_ne!(
+            identities["a"].destination,
+            identities["independent"].destination
+        );
+        for (path, identity) in &identities {
+            let original = platform::symlink_metadata(source.join(path))?;
+            let copied = platform::symlink_metadata(target.join(path))?;
+            assert_eq!(identity.source, physical_identity(&original));
+            assert_eq!(identity.destination, physical_identity(&copied));
+            assert_eq!(identity.kind, copied_kind(&original)?);
+            assert_eq!(identity.kind, copied_kind(&copied)?);
+            assert_ne!(identity.source, identity.destination);
+            assert_eq!(original.mode() & 0o777, copied.mode() & 0o777);
+            assert_eq!(original.mtime(), copied.mtime());
+            assert_eq!(original.mtime_nsec(), copied.mtime_nsec());
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(stats.symlinks, 1);
+            assert_eq!(identities["dangling"].kind, CopiedKind::Symlink);
+            assert_eq!(
+                fs::read_link(target.join("dangling"))?,
+                Path::new("missing-target")
+            );
+        }
+        fs::write(target.join("a"), b"fork edit")?;
+        assert_eq!(fs::read(target.join("nested/b"))?, b"fork edit");
+        assert_eq!(fs::read(source.join("a"))?, b"shared bytes");
+        assert_eq!(fs::read(source.join("nested/b"))?, b"shared bytes");
+        assert_eq!(fs::read(target.join("independent"))?, b"shared bytes");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_capture_rejects_non_utf8_names_without_changing_raw_copy() -> io::Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = Fixture::new()?;
+        let source = fixture.0.join("source");
+        fs::create_dir(&source)?;
+        let name = OsString::from_vec(vec![b'f', 0xff]);
+        fs::write(source.join(&name), b"bytes")?;
+        let raw_target = fixture.0.join("raw");
+        assert_eq!(copy_tree(&source, &raw_target, CopyMode::Copy)?.copied, 1);
+        assert_eq!(fs::read(raw_target.join(&name))?, b"bytes");
+        assert!(
+            copy_tree_with_identities(&source, &fixture.0.join("reported"), CopyMode::Copy)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_validation_rejects_bad_paths_topology_and_times() {
+        for path in ["/absolute", "a/../b", "a/./b", "a//b", "a/", "nul\0name"] {
+            assert!(validate_identity_path(path).is_err(), "{path:?}");
+        }
+        assert!(validate_identity_path("").is_ok());
+        assert!(validate_identity_path("space name/中文").is_ok());
+        assert!(validate_modified_time(0).is_ok());
+        assert!(validate_modified_time(1_000_000_001).is_ok());
+        assert!(validate_modified_time(i128::MAX).is_err());
+        assert!(validate_modified_time(i128::MIN).is_err());
+
+        let identity = |inode| PhysicalIdentity { device: 7, inode };
+        let node = |source, destination, kind| CopiedIdentity {
+            source: identity(source),
+            destination: identity(destination),
+            kind,
+        };
+        // Equal low 64 bits must not collapse distinct Windows file IDs.
+        let high = 1_u128 << 100;
+        let valid = BTreeMap::from([
+            (String::new(), node(1, 101, CopiedKind::Directory)),
+            ("a".into(), node(2, 102, CopiedKind::File)),
+            ("b".into(), node(2, 102, CopiedKind::File)),
+            ("c".into(), node(high + 2, high + 102, CopiedKind::File)),
+        ]);
+        assert!(validate_copy_identities(&valid).is_ok());
+
+        let mut bad = valid.clone();
+        bad.remove("");
+        assert!(validate_copy_identities(&bad).is_err());
+        let mut bad = valid.clone();
+        bad.get_mut("").unwrap().kind = CopiedKind::File;
+        assert!(validate_copy_identities(&bad).is_err());
+        let mut bad = valid.clone();
+        bad.insert("a/child".into(), node(3, 103, CopiedKind::File));
+        assert!(validate_copy_identities(&bad).is_err());
+        let mut bad = valid.clone();
+        bad.get_mut("b").unwrap().destination = identity(103);
+        assert!(validate_copy_identities(&bad).is_err());
+        let mut bad = valid.clone();
+        bad.get_mut("c").unwrap().destination = identity(102);
+        assert!(validate_copy_identities(&bad).is_err());
+        let mut bad = valid;
+        bad.get_mut("c").unwrap().destination = identity(2);
+        assert!(validate_copy_identities(&bad).is_err());
+    }
 
     #[test]
     fn validates_root_syntax_and_clone_error_classification() {

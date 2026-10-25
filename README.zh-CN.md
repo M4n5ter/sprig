@@ -69,6 +69,8 @@ printf '\nDemo retained at: %s\n' "$DEMO"
 - `checkout BRANCH NAME` 将分支已提交的最新修订重建为一个新工作区，并关联该分支。
 - `restore REFERENCE NAME` 将已提交的修订重建为新工作区，同时创建同名新分支。
 
+原生 fork 从已检查的复制过程中获取逻辑身份，保留重命名和硬链接组，不再先把未提交文件分块写入 CAS。它仍复制或克隆每个文件，保留原有源变化检查和持久化屏障。fork 不是 CAS 健康检查；checkpoint 才捕获复制后的字节，修订读取和 `doctor` 仍校验已存内容。
+
 这些命令不会覆盖已有工作区。历史引用可以是完整修订 ID、分支名或 `workspace:NAME`。显式工作区引用表示其**已提交的基准修订**，不包含未提交文件。`merge OURS THEIRS OUTPUT` 中，OURS 必须是分支，THEIRS 可以是任意历史引用。
 
 ## 可选的 Linux 投影后端

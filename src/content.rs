@@ -233,6 +233,17 @@ fn capture_entry(
 }
 
 fn assign_ids(manifest: &mut Manifest, observed: &mut Observed, previous: &Observed) {
+    assign_observed_ids(observed, previous);
+    for (path, current) in observed {
+        manifest
+            .get_mut(path)
+            .expect("observation has an entry")
+            .id
+            .clone_from(&current.id);
+    }
+}
+
+fn assign_observed_ids(observed: &mut Observed, previous: &Observed) {
     let mut used = BTreeSet::new();
     // Reserve same-path identities first, so an atomic editor save stays the
     // same logical file and a rename cannot steal an extant path's identity.
@@ -283,11 +294,6 @@ fn assign_ids(manifest: &mut Manifest, observed: &mut Observed, previous: &Obser
                 }
             }
         }
-        manifest
-            .get_mut(path)
-            .expect("observation has an entry")
-            .id
-            .clone_from(&current.id);
     }
 }
 
@@ -296,9 +302,30 @@ pub(crate) fn assign_link_groups(
     observed: &mut Observed,
     previous: &Observed,
 ) -> Result<()> {
+    let regular_paths = manifest
+        .iter()
+        .filter(|(_, entry)| matches!(entry.kind, EntryKind::File { .. }))
+        .map(|(path, _)| path.clone())
+        .collect();
+    assign_observed_link_groups(observed, &regular_paths, previous)?;
+    for (path, current) in observed {
+        manifest
+            .get_mut(path)
+            .expect("observed entry")
+            .link_group
+            .clone_from(&current.link_group);
+    }
+    validate_manifest(manifest)
+}
+
+fn assign_observed_link_groups(
+    observed: &mut Observed,
+    regular_paths: &BTreeSet<String>,
+    previous: &Observed,
+) -> Result<()> {
     let mut current_inodes: BTreeMap<(u64, u128), Vec<String>> = BTreeMap::new();
     for (path, current) in observed.iter() {
-        if matches!(manifest[path].kind, EntryKind::File { .. }) {
+        if regular_paths.contains(path) {
             current_inodes
                 .entry((current.device, current.inode))
                 .or_default()
@@ -346,12 +373,12 @@ pub(crate) fn assign_link_groups(
         if let Some(candidates) = old_singletons.get(key) {
             let candidate = paths
                 .iter()
-                .map(|path| manifest[path].id.as_str())
+                .map(|path| observed[path].id.as_str())
                 .find(|id| candidates.contains(id))
                 .or_else(|| candidates.first().copied())
                 .expect("nonempty singleton candidates");
             if !old_group_inodes.contains_key(candidate) && used.insert(candidate.to_owned()) {
-                let explicit = paths.len() > 1 || manifest[&paths[0]].id != candidate;
+                let explicit = paths.len() > 1 || observed[&paths[0]].id != candidate;
                 assigned.insert(*key, explicit.then(|| candidate.to_owned()));
             }
         }
@@ -360,7 +387,7 @@ pub(crate) fn assign_link_groups(
         if assigned.contains_key(key) {
             continue;
         }
-        let candidate = &manifest[&paths[0]].id;
+        let candidate = &observed[&paths[0]].id;
         let group = if !old_group_inodes.contains_key(candidate.as_str())
             && used.insert(candidate.clone())
         {
@@ -382,11 +409,6 @@ pub(crate) fn assign_link_groups(
     for (key, paths) in current_inodes {
         let group = assigned.remove(&key).expect("assigned inode identity");
         for path in paths {
-            manifest
-                .get_mut(&path)
-                .expect("observed entry")
-                .link_group
-                .clone_from(&group);
             observed
                 .get_mut(&path)
                 .expect("observed entry")
@@ -394,7 +416,96 @@ pub(crate) fn assign_link_groups(
                 .clone_from(&group);
         }
     }
-    validate_manifest(manifest)
+    Ok(())
+}
+
+/// Reconcile logical identities against the source inodes checked by the copy,
+/// then rebind them to the independent destination. No content is published to
+/// CAS: the copy is the byte operation; the next checkpoint captures its bytes.
+pub(crate) fn observe_copied(
+    copied: &crate::copy_tree::CopyIdentities,
+    previous: &Observed,
+) -> Result<Observed> {
+    use crate::copy_tree::CopiedKind;
+    if !matches!(
+        copied.get("").map(|entry| entry.kind),
+        Some(CopiedKind::Directory)
+    ) {
+        return invalid("copied tree must contain a directory root");
+    }
+    let mut observed = Observed::new();
+    let mut regular_paths = BTreeSet::new();
+    let mut destinations = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for (path, entry) in copied {
+        validate_path(path)?;
+        if !path.is_empty() {
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if !matches!(
+                copied.get(parent).map(|entry| entry.kind),
+                Some(CopiedKind::Directory)
+            ) {
+                return invalid("copied tree has a missing or non-directory parent");
+            }
+        }
+        let source = (entry.source.device, entry.source.inode);
+        let destination = (entry.destination.device, entry.destination.inode);
+        if source == destination {
+            return invalid("copy shares an inode with its source");
+        }
+        if matches!(entry.kind, CopiedKind::File) {
+            regular_paths.insert(path.clone());
+            if sources
+                .insert(source, destination)
+                .is_some_and(|old| old != destination)
+                || destinations
+                    .insert(destination, source)
+                    .is_some_and(|old| old != source)
+            {
+                return invalid("copy changed regular-file hardlink topology");
+            }
+        }
+        observed.insert(
+            path.clone(),
+            Observation {
+                id: String::new(),
+                link_group: None,
+                device: source.0,
+                inode: source.1,
+            },
+        );
+    }
+    assign_observed_ids(&mut observed, previous);
+    assign_observed_link_groups(&mut observed, &regular_paths, previous)?;
+    let mut ids = BTreeSet::new();
+    let mut effective_inodes = BTreeMap::new();
+    let mut physical_groups = BTreeMap::new();
+    for (path, current) in &observed {
+        if current.id.is_empty() || !ids.insert(&current.id) {
+            return invalid("copy produced empty or duplicate logical identity");
+        }
+        if regular_paths.contains(path) {
+            let group = current.link_group.as_ref().unwrap_or(&current.id);
+            let physical = (current.device, current.inode);
+            if group.is_empty()
+                || effective_inodes
+                    .insert(group, physical)
+                    .is_some_and(|old| old != physical)
+                || physical_groups
+                    .insert(physical, group)
+                    .is_some_and(|old| old != group)
+            {
+                return invalid("copy produced inconsistent logical hardlink identities");
+            }
+        } else if current.link_group.is_some() {
+            return invalid("copy produced a non-file link group");
+        }
+    }
+    for (path, current) in &mut observed {
+        current.device = copied[path].destination.device;
+        current.inode = copied[path].destination.inode;
+    }
+    Ok(observed)
 }
 
 /// Writes a fresh tree only. The caller owns staging and atomic publication.

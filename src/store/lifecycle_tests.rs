@@ -118,3 +118,131 @@ fn stopped_owned_core_is_reused_with_lease_and_failure_checks_intact() -> Result
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn native_fork_copies_identity_without_publishing_uncommitted_content() -> Result<()> {
+    fn files(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+        fn visit(root: &Path, path: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    visit(root, &entry.path(), result)?;
+                } else {
+                    result.insert(
+                        entry.path().strip_prefix(root)?.to_owned(),
+                        fs::read(entry.path())?,
+                    );
+                }
+            }
+            Ok(())
+        }
+        let mut result = BTreeMap::new();
+        visit(root, root, &mut result)?;
+        Ok(result)
+    }
+    let root = std::env::temp_dir().join(format!("sprig-copy-identities-{}", new_id()?));
+    fs::create_dir(&root)?;
+    let root = root.canonicalize()?;
+    let source = root.join("source");
+    fs::create_dir(&source)?;
+    fs::create_dir(source.join("old-dir"))?;
+    fs::write(source.join("old-dir/file"), b"renamed file")?;
+    fs::write(source.join("a"), b"old shared inode")?;
+    fs::hard_link(source.join("a"), source.join("b"))?;
+    let store = Store::init(&root.join("store"))?;
+    let imported = store.import(&source, "main", CopyMode::Copy)?;
+    let before = store.state()?;
+    let original = before.workspaces["main"].observed.clone();
+    fs::rename(imported.path.join("old-dir"), imported.path.join("new-dir"))?;
+    fs::write(
+        imported.path.join("replacement"),
+        b"independent replacement",
+    )?;
+    // Remove then rename is portable; the old inode is retained by alias b.
+    fs::remove_file(imported.path.join("a"))?;
+    fs::rename(imported.path.join("replacement"), imported.path.join("a"))?;
+    fs::hard_link(imported.path.join("b"), imported.path.join("c"))?;
+    fs::write(imported.path.join("new"), vec![b'n'; 1024 * 1024])?;
+    let objects_before = files(&store.objects())?;
+    let revisions_before = files(&store.root.join("revisions"))?;
+    let fork = store.fork("main", "fork", CopyMode::Copy)?;
+    assert_eq!(files(&store.objects())?, objects_before);
+    assert_eq!(files(&store.root.join("revisions"))?, revisions_before);
+    assert_eq!(fork.base_revision, imported.base_revision);
+    let state = store.state()?;
+    assert_eq!(state.workspaces["main"].observed, original);
+    let observed = &state.workspaces["fork"].observed;
+    assert_eq!(observed["new-dir"].id, original["old-dir"].id);
+    assert_eq!(observed["new-dir/file"].id, original["old-dir/file"].id);
+    assert_eq!(observed["a"].id, original["a"].id);
+    assert_ne!(observed["a"].link_group, observed["b"].link_group);
+    assert_eq!(observed["b"].link_group, original["b"].link_group);
+    assert_eq!(observed["b"].link_group, observed["c"].link_group);
+    assert_ne!(observed["b"].inode, original["b"].inode);
+    assert_eq!(fs::read(fork.path.join("a"))?, b"independent replacement");
+    fs::write(fork.path.join("c"), b"fork-only alias edit")?;
+    assert_eq!(fs::read(fork.path.join("b"))?, b"fork-only alias edit");
+    assert_eq!(fs::read(imported.path.join("b"))?, b"old shared inode");
+    let committed = store.checkpoint("fork", "publish copied edits", None)?;
+    assert!(committed.committed);
+    assert_eq!(store.read("fork", "b")?, b"fork-only alias edit");
+    assert_eq!(store.read("main", "a")?, b"old shared inode");
+    let manifest = store.revision(&store.state()?.branches["fork"])?.manifest;
+    for (path, entry) in &manifest {
+        assert_eq!(entry.id, observed[path].id);
+        assert_eq!(entry.link_group, observed[path].link_group);
+    }
+    assert_ne!(files(&store.objects())?, objects_before);
+    // A failed copy must not publish a branch/workspace, even after it creates
+    // its private generation. A FIFO is deliberately unsupported.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = imported.path.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        // SAFETY: a NUL-terminated path in this newly created synthetic tree.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let state_bytes = fs::read(store.root.join("state.json"))?;
+        assert!(store.fork("main", "rejected", CopyMode::Copy).is_err());
+        assert_eq!(fs::read(store.root.join("state.json"))?, state_bytes);
+        fs::remove_file(fifo)?;
+    }
+    assert!(store.doctor()?.healthy);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn copied_pending_rename_merges_with_original_path_edit() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("sprig-fork-merge-{}", new_id()?));
+    fs::create_dir(&root)?;
+    let root = root.canonicalize()?;
+    let source = root.join("source");
+    fs::create_dir(&source)?;
+    fs::write(source.join("old"), b"base\n")?;
+    let store = Store::init(&root.join("store"))?;
+    let main = store.import(&source, "main", CopyMode::Copy)?;
+    let old_id = store.state()?.workspaces["main"].observed["old"].id.clone();
+    fs::rename(main.path.join("old"), main.path.join("renamed"))?;
+    let fork = store.fork("main", "fork", CopyMode::Auto)?;
+    assert_eq!(
+        store.state()?.workspaces["fork"].observed["renamed"].id,
+        old_id
+    );
+    store.checkpoint("fork", "rename", None)?;
+    fs::rename(main.path.join("renamed"), main.path.join("old"))?;
+    fs::write(main.path.join("old"), b"edited original\n")?;
+    store.checkpoint("main", "edit original", None)?;
+    let merged = store.merge("main", "fork", "merged", MergeStrategy::Conflict, &[], None)?;
+    assert!(merged.committed, "{merged:?}");
+    assert_eq!(store.read("merged", "renamed")?, b"edited original\n");
+    assert_eq!(fs::read(fork.path.join("renamed"))?, b"base\n");
+    assert_eq!(
+        store.revision(&store.state()?.branches["merged"])?.manifest["renamed"].id,
+        old_id
+    );
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

@@ -1294,7 +1294,7 @@ impl Store {
         let _lock = self.lock()?;
         let mut state = self.state()?;
         let old = branch_head(&state, branch, expected)?;
-        let target = self.resolve(&state, reference)?;
+        let (_, target) = self.resolve_revision(&state, reference)?;
         let old_revision = self.revision(&old)?;
         let revision = self.put_revision(&Revision {
             parents: vec![old.clone()],
@@ -1303,7 +1303,7 @@ impl Store {
                 .checked_add(1)
                 .ok_or_else(|| failure("logical clock exhausted"))?,
             message: message.to_owned(),
-            manifest: self.revision(&target)?.manifest,
+            manifest: target.manifest,
         })?;
         state.branches.insert(branch.to_owned(), revision.clone());
         self.save(&_lock, &mut state)?;
@@ -1624,8 +1624,8 @@ impl Store {
     pub fn diff(&self, from: &str, to: &str) -> Result<Vec<Change>> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let before = self.revision(&self.resolve(&state, from)?)?.manifest;
-        let after = self.revision(&self.resolve(&state, to)?)?.manifest;
+        let before = self.resolve_revision(&state, from)?.1.manifest;
+        let after = self.resolve_revision(&state, to)?.1.manifest;
         let by_id: BTreeMap<_, _> = before
             .iter()
             .map(|(path, entry)| (entry.id.as_str(), (path, entry)))
@@ -1673,8 +1673,8 @@ impl Store {
     pub fn diff_files(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let before = self.revision(&self.resolve(&state, from)?)?.manifest;
-        let after = self.revision(&self.resolve(&state, to)?)?.manifest;
+        let before = self.resolve_revision(&state, from)?.1.manifest;
+        let after = self.resolve_revision(&state, to)?.1.manifest;
         let before_ids: BTreeMap<_, _> = before
             .iter()
             .map(|(path, entry)| (entry.id.as_str(), (path, entry)))
@@ -2040,7 +2040,7 @@ impl Store {
     pub fn read_to(&self, reference: &str, path: &str, output: &mut impl Write) -> Result<()> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let revision = self.revision(&self.resolve(&state, reference)?)?;
+        let revision = self.resolve_revision(&state, reference)?.1;
         let entry = revision
             .manifest
             .get(path)
@@ -2071,7 +2071,7 @@ impl Store {
     pub fn ls(&self, reference: &str, path: &str) -> Result<Vec<crate::PathEntry>> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let manifest = self.revision(&self.resolve(&state, reference)?)?.manifest;
+        let manifest = self.resolve_revision(&state, reference)?.1.manifest;
         if !matches!(
             manifest.get(path).map(|entry| &entry.kind),
             Some(EntryKind::Directory)
@@ -2098,7 +2098,8 @@ impl Store {
     pub fn stat(&self, reference: &str, path: &str) -> Result<content::Entry> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        self.revision(&self.resolve(&state, reference)?)?
+        self.resolve_revision(&state, reference)?
+            .1
             .manifest
             .get(path)
             .cloned()
@@ -2110,7 +2111,8 @@ impl Store {
         let state = self.state()?;
         let matcher = globset::Glob::new(pattern)?.compile_matcher();
         Ok(self
-            .revision(&self.resolve(&state, reference)?)?
+            .resolve_revision(&state, reference)?
+            .1
             .manifest
             .into_keys()
             .filter(|path| matcher.is_match(path))
@@ -2121,7 +2123,7 @@ impl Store {
     pub fn grep(&self, reference: &str, pattern: &str) -> Result<Vec<crate::GrepMatch>> {
         let _lock = self.lock()?;
         let state = self.state()?;
-        let manifest = self.revision(&self.resolve(&state, reference)?)?.manifest;
+        let manifest = self.resolve_revision(&state, reference)?.1.manifest;
         let reader = packed::Reader::open(&self.objects())?;
         let mut matches = Vec::new();
         for (path, entry) in manifest {

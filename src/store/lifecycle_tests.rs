@@ -76,10 +76,14 @@ fn stopped_owned_core_is_reused_with_lease_and_failure_checks_intact() -> Result
         .writable_core(&workspace)
         .err()
         .expect("generation lease must be exclusive");
-    assert_eq!(
-        error.downcast_ref::<io::Error>().unwrap().kind(),
-        io::ErrorKind::WouldBlock
-    );
+    let error = error.downcast_ref::<io::Error>().unwrap();
+    #[cfg(unix)]
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    // Windows' share-deny lease rejects the second open before try_lock.
+    // Require the exact sharing conflict, not any open or metadata failure.
+    #[cfg(windows)]
+    assert_eq!(error.raw_os_error(), Some(32), "{error:?}"); // ERROR_SHARING_VIOLATION
+
     drop(core);
     drop(store.writable_core(&workspace)?);
     CORE_OPENS.with(|c| c.set(0));

@@ -4,7 +4,8 @@
 //! creation fall back to CAS, not to unchecked cached bytes.
 
 use crate::{Result, packed, platform};
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ const BUDGET: u64 = 256 * 1024 * 1024;
 /// Ineligible files do not create, inspect or lock the cache at all.
 pub(crate) struct Session<'a> {
     objects: &'a Path,
-    cache: OnceCell<Option<(PathBuf, File)>>,
+    cache: OnceCell<Option<Cache>>,
 }
 
 impl<'a> Session<'a> {
@@ -43,21 +44,23 @@ impl<'a> Session<'a> {
         // Try once, lazily, and retain the same lock inode through the session.
         // The initial scan is shared; every fill still reserves its own budget.
         let cache = self.cache.get_or_init(|| open_cache(self.objects).ok());
-        if let Some((root, _lock)) = cache {
-            match cached(reader, chunks, size, root, &key, target) {
+        if let Some(cache) = cache.as_ref().filter(|cache| !cache.disabled.get()) {
+            match cached(reader, chunks, size, &cache.root, &key, target) {
                 Ok(Some(output)) => return Ok(output),
-                Ok(None) => {}
+                Ok(None) => cache.inventory.borrow_mut().forget(&key),
                 // A clone can fail after creating its destination. Never
                 // overwrite an uncertain partial target or claim success.
                 Err(error) if target.try_exists()? => return Err(error),
-                Err(_) => {}
+                Err(_) => cache.disabled.set(true),
             }
         }
         let output = materialize_cas(reader, chunks, size, target)?;
-        if let Some((root, _lock)) = cache {
-            // Cache is optional. A failed fill/flush leaves only a disposable
-            // entry, which the next use verifies; durable CAS is unchanged.
-            let _ = populate(root, &key, size, target);
+        if let Some(cache) = cache.as_ref().filter(|cache| !cache.disabled.get()) {
+            // A failed fill can leave a pending entry. Keep its reservation and
+            // disable this session; the next lock owner inventories it afresh.
+            if populate(cache, &key, size, target).is_err() {
+                cache.disabled.set(true);
+            }
         }
         Ok(output)
     }
@@ -93,7 +96,14 @@ fn materialize_cas(
     Ok(output)
 }
 
-fn open_cache(objects: &Path) -> Result<(PathBuf, File)> {
+struct Cache {
+    root: PathBuf,
+    _lock: File,
+    inventory: RefCell<Inventory>,
+    disabled: Cell<bool>,
+}
+
+fn open_cache(objects: &Path) -> Result<Cache> {
     let root = objects
         .parent()
         .ok_or("object directory has no parent")?
@@ -112,8 +122,13 @@ fn open_cache(objects: &Path) -> Result<(PathBuf, File)> {
         Err(e) => return Err(e.into()),
     };
     lock.try_lock()?;
-    reserve(&root, 0)?;
-    Ok((root, lock))
+    let inventory = Inventory::scan(&root)?;
+    Ok(Cache {
+        root,
+        _lock: lock,
+        inventory: RefCell::new(inventory),
+        disabled: Cell::new(false),
+    })
 }
 
 fn cached(
@@ -145,7 +160,8 @@ fn cached(
     Ok(Some(output))
 }
 
-fn populate(root: &Path, key: &str, size: u64, target: &Path) -> Result<()> {
+fn populate(cache: &Cache, key: &str, size: u64, target: &Path) -> Result<()> {
+    let root = &cache.root;
     if !cache_eligible(size) {
         return Ok(());
     }
@@ -156,7 +172,7 @@ fn populate(root: &Path, key: &str, size: u64, target: &Path) -> Result<()> {
         .max(platform::allocated_bytes(target, &metadata)?)
         .checked_add(4096)
         .ok_or("cache size overflow")?;
-    reserve(root, charge)?;
+    cache.inventory.borrow_mut().reserve(root, key, charge)?;
     let path = root.join(key);
     let input = platform::open_regular(target)?;
     let pending = root.join(format!("pending-{key}"));
@@ -167,6 +183,9 @@ fn populate(root: &Path, key: &str, size: u64, target: &Path) -> Result<()> {
         drop(cached);
         platform::rename(&pending, &path)?;
         platform::sync_directory(root)?;
+    } else {
+        // Unsupported cloning removed its temporary target and wrote no cache.
+        cache.inventory.borrow_mut().forget(key);
     }
     Ok(())
 }
@@ -196,48 +215,103 @@ fn verify(file: &mut File, reader: &packed::Reader, chunks: &[String], size: u64
     Ok(())
 }
 
-fn reserve(root: &Path, additional: u64) -> Result<()> {
-    let mut files = Vec::new();
-    let mut total = additional;
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .ok_or("invalid cache name")?;
-        if name == "lock" {
-            continue;
+// One inventory per exclusive cache lease, never shared across sessions. Only
+// disposable cache files are listed or removed. Retained working trees and CAS
+// are outside this directory and are never candidates for eviction.
+#[derive(Default)]
+struct Inventory {
+    charges: BTreeMap<String, u64>,
+    total: u64,
+}
+
+impl Inventory {
+    fn scan(root: &Path) -> Result<Self> {
+        let mut result = Self::default();
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or("invalid cache name")?;
+            if name == "lock" {
+                continue;
+            }
+            let hash = name.strip_prefix("pending-").unwrap_or(name);
+            if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err("unexpected cache entry".into());
+            }
+            let metadata = platform::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("invalid cache file".into());
+            }
+            if name.starts_with("pending-") {
+                fs::remove_file(&path)?;
+                continue;
+            }
+            let charge = metadata
+                .len()
+                .max(platform::allocated_bytes(&path, &metadata)?)
+                .checked_add(4096)
+                .ok_or("cache size overflow")?;
+            result.total = result
+                .total
+                .checked_add(charge)
+                .ok_or("cache size overflow")?;
+            result.charges.insert(name.to_owned(), charge);
+            // Bound memory even when a previous interrupted cache is oversized.
+            result.evict(root, 0, 0)?;
         }
-        let hash = name.strip_prefix("pending-").unwrap_or(name);
-        if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err("unexpected cache entry".into());
+        platform::sync_directory(root)?;
+        Ok(result)
+    }
+
+    fn forget(&mut self, key: &str) {
+        if let Some(charge) = self.charges.remove(key) {
+            self.total -= charge;
         }
-        let metadata = platform::symlink_metadata(&path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err("invalid cache file".into());
+    }
+
+    fn evict(&mut self, root: &Path, additional: u64, additional_entries: usize) -> Result<()> {
+        while self
+            .total
+            .checked_add(additional)
+            .ok_or("cache size overflow")?
+            > BUDGET
+            || self.charges.len() + additional_entries > 4096
+        {
+            let (key, _) = self
+                .charges
+                .first_key_value()
+                .ok_or("cache reservation exceeds budget")?;
+            let key = key.clone();
+            // No cached() input handle is alive here (important on Windows).
+            // Only update accounting after a successful deletion.
+            fs::remove_file(root.join(&key))?;
+            self.forget(&key);
         }
-        if name.starts_with("pending-") {
-            fs::remove_file(&path)?;
-            continue;
+        Ok(())
+    }
+
+    fn reserve(&mut self, root: &Path, key: &str, charge: u64) -> Result<()> {
+        if self.charges.contains_key(key) {
+            return Err("cache reservation already exists".into());
         }
-        let charge = metadata
-            .len()
-            .max(platform::allocated_bytes(&path, &metadata)?)
-            .checked_add(4096)
+        self.evict(root, charge, 1)?;
+        // Preserve the existing eviction-before-publication durability boundary.
+        platform::sync_directory(root)?;
+        self.total = self
+            .total
+            .checked_add(charge)
             .ok_or("cache size overflow")?;
-        total = total.checked_add(charge).ok_or("cache size overflow")?;
-        files.push((path, charge));
+        self.charges.insert(key.to_owned(), charge);
+        Ok(())
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut count = files.len();
-    for (path, size) in files {
-        if total <= BUDGET && count < 4096 {
-            break;
-        }
-        fs::remove_file(path)?;
-        total -= size;
-        count -= 1;
-    }
+}
+
+#[cfg(test)]
+fn reserve(root: &Path, additional: u64) -> Result<()> {
+    let mut inventory = Inventory::scan(root)?;
+    inventory.evict(root, additional, 0)?;
     platform::sync_directory(root)?;
     Ok(())
 }
@@ -263,7 +337,8 @@ mod tests {
             unreachable!()
         };
         let reader = packed::Reader::open(&objects)?;
-        let (cache, lock) = open_cache(&objects)?;
+        let lock = open_cache(&objects)?;
+        let cache = lock.root.clone();
         // Contention bypasses cache, without weakening CAS validation.
         let busy = Session::new(&objects);
         busy.materialize(&reader, &chunks, size, &root.join("busy"))?;
@@ -339,6 +414,83 @@ mod tests {
         assert!(matches!(invalid.cache.get(), Some(None)));
         assert_eq!(fs::read_dir(&cache)?.count(), 1);
         drop(invalid);
+        drop(reader);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lease_inventory_reserves_without_rescanning_and_bounds_eviction() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-inventory-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let mut inventory = Inventory::scan(&root)?;
+        // A marker added after inventory creation proves reservations do not
+        // rescan. It is not an eviction candidate and must remain untouched.
+        fs::write(root.join("foreign-marker"), b"keep")?;
+        for index in 0..32 {
+            let key = format!("{index:064x}");
+            inventory.reserve(&root, &key, 8192)?;
+            fs::write(root.join(&key), b"cache")?;
+        }
+        assert_eq!(inventory.charges.len(), 32);
+        assert_eq!(inventory.total, 32 * 8192);
+        inventory.evict(&root, BUDGET, 0)?;
+        assert_eq!(inventory.total, 0);
+        assert!(inventory.charges.is_empty());
+        assert_eq!(fs::read(root.join("foreign-marker"))?, b"keep");
+        assert!(
+            inventory
+                .reserve(&root, &"e".repeat(64), BUDGET + 1)
+                .is_err()
+        );
+        assert_eq!(inventory.total, 0);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_fill_retains_reservation_and_disables_session_without_deleting_evidence() -> Result<()>
+    {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-fill-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let objects = root.join("objects");
+        let bytes = vec![b'c'; 65536];
+        let EntryKind::File { size, chunks } = content::put_bytes(&bytes, &objects)? else {
+            unreachable!()
+        };
+        let reader = packed::Reader::open(&objects)?;
+        let session = Session::new(&objects);
+        assert!(session.cache.set(Some(open_cache(&objects)?)).is_ok());
+        let cache = session.cache.get().unwrap().as_ref().unwrap();
+        let key = blake3::hash(&serde_json::to_vec(&("sprig-file-cache-1", size, &chunks))?)
+            .to_hex()
+            .to_string();
+        let pending = cache.root.join(format!("pending-{key}"));
+        fs::create_dir(&pending)?;
+        fs::write(pending.join("evidence"), b"keep")?;
+        session.materialize(&reader, &chunks, size, &root.join("first"))?;
+        assert_eq!(fs::read(root.join("first"))?, bytes);
+        assert!(cache.disabled.get());
+        assert!(cache.inventory.borrow().total >= size + 4096);
+        session.materialize(&reader, &chunks, size, &root.join("second"))?;
+        assert_eq!(fs::read(root.join("second"))?, bytes);
+        assert_eq!(cache.inventory.borrow().charges.len(), 1);
+        assert_eq!(fs::read(pending.join("evidence"))?, b"keep");
+        drop(session);
+        let next = Session::new(&objects);
+        next.materialize(&reader, &chunks, size, &root.join("third"))?;
+        assert!(matches!(next.cache.get(), Some(None)));
+        assert_eq!(fs::read(pending.join("evidence"))?, b"keep");
+        drop(next);
         drop(reader);
         fs::remove_dir_all(root)?;
         Ok(())

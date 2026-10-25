@@ -841,7 +841,16 @@ mod tests {
         let source = fixture.0.join("source");
         fs::create_dir(&source)?;
         let name = OsString::from_vec(vec![b'f', 0xff]);
-        fs::write(source.join(&name), b"bytes")?;
+        let created = fs::write(source.join(&name), b"bytes");
+        #[cfg(target_os = "macos")]
+        if let Err(error) = &created {
+            // APFS rejects this filename before any copy operation. Check that
+            // exact filesystem boundary, not an arbitrary fixture failure.
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error:?}");
+            assert_eq!(fs::read_dir(&source)?.count(), 0);
+            return Ok(());
+        }
+        created?;
         let raw_target = fixture.0.join("raw");
         assert_eq!(copy_tree(&source, &raw_target, CopyMode::Copy)?.copied, 1);
         assert_eq!(fs::read(raw_target.join(&name))?, b"bytes");

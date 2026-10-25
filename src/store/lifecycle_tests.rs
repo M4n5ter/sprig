@@ -290,3 +290,67 @@ fn query_operations_decode_each_reference_once_without_cross_operation_cache() -
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn backup_reuses_exact_validated_bytes_and_recovers_retained_workspaces() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("sprig-backup-bytes-{}", new_id()?));
+    fs::create_dir(&root)?;
+    let source = root.join("source");
+    fs::create_dir(&source)?;
+    fs::write(source.join("file"), b"committed")?;
+    let store = Store::init(&root.join("store"))?;
+    let imported = store.import(&source, "main", CopyMode::Auto)?;
+    fs::write(imported.path.join("uncommitted"), b"preserve trash")?;
+    let trash = store.drop_entry("workspace", "main")?;
+    let before = store.state()?;
+    // State accepts unknown fields and noncanonical whitespace. Preserve that
+    // policy without skipping validation or normalizing recoverable evidence.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.root.join("state.json"))?)?;
+    document["future_annotation"] = serde_json::json!({"preserve": true});
+    let exact = serde_json::to_vec_pretty(&document)?;
+    fs::write(store.root.join("state.json"), &exact)?;
+    store.branch("new", "main")?;
+    let backup = store
+        .root
+        .join("backups")
+        .join(format!("{}.json.zst", before.generation));
+    let (saved, hash): (State, _) = metadata::read(&backup)?;
+    assert_eq!(hash, blake3::hash(&exact));
+    assert_eq!(saved.generation, before.generation);
+    assert!(saved.trash.contains_key(&trash.token));
+    Store::recover_state(&store.root, before.generation)?;
+    assert!(!store.state()?.branches.contains_key("new"));
+    let recovered = store.recover(&trash.token, "recovered", CopyMode::Auto)?;
+    assert_eq!(
+        fs::read(recovered.path.join("uncommitted"))?,
+        b"preserve trash"
+    );
+    assert_eq!(store.read("recovered", "file")?, b"committed");
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn backup_bytes_are_never_reused_without_full_state_validation() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("sprig-invalid-backup-{}", new_id()?));
+    let store = Store::init(&root)?;
+    let original = fs::read(store.root.join("state.json"))?;
+    let mut state = store.state()?;
+    let backup = store
+        .root
+        .join("backups")
+        .join(format!("{}.json.zst", state.generation));
+    for bytes in [b"malformed".to_vec(), {
+        let mut value: serde_json::Value = serde_json::from_slice(&original)?;
+        value["version"] = serde_json::json!(0);
+        serde_json::to_vec(&value)?
+    }] {
+        fs::write(store.root.join("state.json"), &bytes)?;
+        assert!(store.save(&store.lock()?, &mut state).is_err());
+        assert_eq!(fs::read(store.root.join("state.json"))?, bytes);
+        assert!(!backup.exists());
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

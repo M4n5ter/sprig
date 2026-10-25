@@ -2997,6 +2997,21 @@ fn sync_inode_once(
         }
         return Ok(());
     }
+    sync_verified_file(path, metadata)?;
+    synced.insert(key, fingerprint);
+    Ok(())
+}
+
+// Flush and validate one file without allocating an inode-deduplication map.
+fn sync_verified_file(path: &Path, metadata: &platform::Metadata) -> Result<()> {
+    let key = (metadata.dev(), platform::inode(metadata));
+    let fingerprint = (
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    );
     platform::sync_file(path)?;
     let after = platform::symlink_metadata(path)?;
     if !after.is_file()
@@ -3011,14 +3026,24 @@ fn sync_inode_once(
     {
         return Err(failure("file changed during synchronization"));
     }
-    synced.insert(key, fingerprint);
     Ok(())
 }
 
+#[cfg(unix)]
+mod native_sync;
+
 fn sync_native_tree(path: &Path) -> Result<()> {
-    sync_native_entries(path, &mut BTreeMap::new())
+    #[cfg(unix)]
+    {
+        native_sync::run(path)
+    }
+    #[cfg(not(unix))]
+    {
+        sync_native_entries(path, &mut BTreeMap::new())
+    }
 }
 
+#[cfg(any(not(unix), test))]
 fn sync_native_entries(path: &Path, synced: &mut SyncedInodes) -> Result<()> {
     let metadata = platform::symlink_metadata(path)?;
     if metadata.is_dir() {

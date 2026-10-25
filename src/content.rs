@@ -524,7 +524,7 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     platform::create_dir(&target, 0o700)?;
     platform::set_path_mode(&target, 0o700)?;
     let reader = packed::Reader::open(objects)?;
-    let cache = crate::file_cache::Session::new(objects);
+    let cache = crate::file_cache::Session::for_manifest(objects, manifest)?;
     let mut directories = Vec::new();
     let mut linked_files: BTreeMap<&str, PathBuf> = BTreeMap::new();
     for (relative, entry) in manifest {

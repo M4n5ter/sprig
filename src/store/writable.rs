@@ -81,7 +81,7 @@ impl Store {
             message: format!("import {name}"),
             manifest,
         })?;
-        self.restore_writable_locked(&mut state, &revision, name, name, true)
+        self.restore_writable_locked(&_lock, &mut state, &revision, name, name, true)
     }
 
     pub fn checkout_writable(&self, branch: &str, name: &str) -> Result<WorkspaceResult> {
@@ -89,7 +89,7 @@ impl Store {
         let mut state = self.state()?;
         fresh_name(&state, name, false)?;
         let revision = branch_head(&state, branch, None)?;
-        self.restore_writable_locked(&mut state, &revision, branch, name, false)
+        self.restore_writable_locked(&_lock, &mut state, &revision, branch, name, false)
     }
 
     pub fn restore_writable(&self, reference: &str, name: &str) -> Result<WorkspaceResult> {
@@ -98,6 +98,7 @@ impl Store {
         fresh_name(&state, name, true)?;
         let (revision, data) = self.resolve_revision(&state, reference)?;
         self.restore_writable_manifest_locked(
+            &_lock,
             &mut state,
             &revision,
             &data.manifest,
@@ -109,6 +110,7 @@ impl Store {
 
     pub(super) fn restore_writable_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         revision: &str,
         branch: &str,
@@ -117,6 +119,7 @@ impl Store {
     ) -> Result<WorkspaceResult> {
         let data = self.revision(revision)?;
         self.restore_writable_manifest_locked(
+            _lock,
             state,
             revision,
             &data.manifest,
@@ -126,8 +129,10 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Explicit StoreLock is the observation access proof.
     fn restore_writable_manifest_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         revision: &str,
         manifest: &Manifest,
@@ -140,7 +145,7 @@ impl Store {
         let workspace = Workspace {
             backend,
             directory,
-            observed,
+            observed: self.put_observed(_lock, &observed)?,
             branch: branch.into(),
             base_revision: revision.into(),
             observation_epoch: None,
@@ -150,7 +155,7 @@ impl Store {
             state.branches.insert(branch.into(), revision.into());
         }
         state.workspaces.insert(name.into(), workspace.clone());
-        self.save(state)?;
+        self.save(_lock, state)?;
         Ok(self.workspace_result(name, &workspace))
     }
 
@@ -160,11 +165,12 @@ impl Store {
         fresh_name(&state, name, true)?;
         let source = workspace(&state, source)?.clone();
         let _lease = self.lease(&source)?;
-        self.fork_writable_source(&mut state, &source, name)
+        self.fork_writable_source(&_lock, &mut state, &source, name)
     }
 
     pub(super) fn fork_writable_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         source: &Workspace,
         manifest: &Manifest,
@@ -174,7 +180,7 @@ impl Store {
         let fork = Workspace {
             backend,
             directory,
-            observed,
+            observed: self.put_observed(_lock, &observed)?,
             branch: name.into(),
             base_revision: source.base_revision.clone(),
             observation_epoch: None,
@@ -184,7 +190,7 @@ impl Store {
             .branches
             .insert(name.into(), source.base_revision.clone());
         state.workspaces.insert(name.into(), fork.clone());
-        self.save(state)?;
+        self.save(_lock, state)?;
         Ok(self.workspace_result(name, &fork))
     }
 
@@ -312,6 +318,7 @@ impl Store {
         let store = Store {
             root: root.canonicalize()?,
             projection_executable: None,
+            observation_budget: ObservationBudget::default(),
         };
         store.state()?;
         let workspace = Workspace {
@@ -321,7 +328,7 @@ impl Store {
             branch: "serving".into(),
             base_revision: revision.into(),
             directory: generation.into(),
-            observed: Observed::new(),
+            observed: observations::empty_reference(),
             observation_epoch: None,
             pending: None,
         };
@@ -462,18 +469,19 @@ impl Store {
 
     pub(super) fn apply_writable_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         name: &str,
         original: Workspace,
         mutations: &[Mutation],
         message: &str,
     ) -> Result<CommitResult> {
-        let (manifest, _) = self.capture_workspace(&original)?;
+        let (manifest, _) = self.capture_workspace(_lock, &original)?;
         let (directory, observed, backend) = self.detached_writable(&manifest)?;
         let mut replacement = original.clone();
         replacement.directory = directory;
         replacement.backend = backend;
-        replacement.observed = observed;
+        replacement.observed = self.put_observed(_lock, &observed)?;
         let core = self.writable_core(&replacement)?;
         for mutation in mutations {
             writable_mutation(&core, mutation)?;
@@ -491,10 +499,18 @@ impl Store {
                 mount_error: None,
             };
             state.workspaces.insert(name.into(), replacement);
-            self.save(state)?;
+            self.save(_lock, state)?;
             Ok(result)
         } else {
-            self.commit_workspace(state, name, replacement, manifest, Observed::new(), message)
+            self.commit_workspace(
+                _lock,
+                state,
+                name,
+                replacement,
+                manifest,
+                Observed::new(),
+                message,
+            )
         }
     }
 }
@@ -731,6 +747,7 @@ impl Store {
         fresh_name(&state, name, true)?;
         let source = workspace(&state, source)?.clone();
         let _lease = self.lease(&source)?;
+        self.verify_observed(&_lock, &source.observed)?;
         let remount = self.mount_state(&source) == "mounted";
         let result = (|| {
             self.stop_writable(&source)?;
@@ -738,7 +755,7 @@ impl Store {
             core.sync()?;
             let manifest = core.snapshot()?;
             drop(core);
-            self.fork_writable_locked(&mut state, &source, &manifest, name)
+            self.fork_writable_locked(&_lock, &mut state, &source, &manifest, name)
         })();
         self.finish_writable_view(&source, result, remount)
     }
@@ -787,6 +804,7 @@ impl Store {
 
     pub(super) fn fork_writable_source(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         source: &Workspace,
         name: &str,
@@ -794,14 +812,15 @@ impl Store {
         let remount = matches!(source.backend, WorkspaceBackend::Writable { .. })
             && self.mount_state(source) == "mounted";
         let result = (|| {
-            let (manifest, _) = self.capture_workspace(source)?;
-            self.fork_writable_locked(state, source, &manifest, name)
+            let (manifest, _) = self.capture_workspace(_lock, source)?;
+            self.fork_writable_locked(_lock, state, source, &manifest, name)
         })();
         self.finish_writable_view(source, result, remount)
     }
 
     pub(super) fn resolve_writable_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         name: &str,
         mut workspace: Workspace,
@@ -810,7 +829,7 @@ impl Store {
         let source = workspace.clone();
         let remount = self.mount_state(&workspace) == "mounted";
         let result = (|| {
-            let (manifest, _) = self.capture_workspace(&workspace)?;
+            let (manifest, _) = self.capture_workspace(_lock, &workspace)?;
             let pending = workspace
                 .pending
                 .as_mut()
@@ -840,7 +859,7 @@ impl Store {
                 .conflicts
                 .retain(|conflict| !paths.contains(&conflict.path));
             state.workspaces.insert(name.into(), workspace.clone());
-            self.save(state)?;
+            self.save(_lock, state)?;
             Ok(self.workspace_result(name, &workspace))
         })();
         let mut value = self.finish_writable_view(&source, result, remount)?;

@@ -4,7 +4,12 @@ use super::*;
 use crate::GcResult;
 
 impl Store {
-    pub(super) fn gc_fingerprint(&self, state: &State, live: &BTreeSet<String>) -> Result<String> {
+    pub(super) fn gc_fingerprint(
+        &self,
+        state: &State,
+        live: &BTreeSet<String>,
+        observations: &observation_roots::ObservationPlan,
+    ) -> Result<String> {
         let mut inventory = Vec::new();
         for name in names(&self.objects())? {
             let metadata = platform::symlink_metadata(self.objects().join(&name))?;
@@ -24,22 +29,15 @@ impl Store {
             inventory.push((name, metadata.len(), digest));
         }
         let roots = self.protected_roots(state)?;
-        let mut backups = Vec::new();
-        for name in names(&self.root.join("backups"))? {
-            backups.push((
-                name.clone(),
-                blake3::hash(&fs::read(self.root.join("backups").join(name))?)
-                    .to_hex()
-                    .to_string(),
-            ));
-        }
+        // The observation plan already contains streaming content evidence for
+        // every backup, staged state, current state, and observation file.
         Ok(blake3::hash(&serde_json::to_vec(&(
-            "sprig-gc-plan-1",
+            "sprig-gc-plan-2",
             state,
             roots,
-            backups,
             live,
             inventory,
+            observations,
         ))?)
         .to_hex()
         .to_string())
@@ -57,7 +55,7 @@ impl Store {
             return Err(failure("invalid collection plan ID"));
         }
         let _lock = self.lock()?;
-        let plan = self.gc_locked()?;
+        let plan = self.gc_locked(&_lock)?;
         if plan.plan_id != plan_id {
             return Err(failure("collection plan is stale; generate a new plan"));
         }
@@ -79,16 +77,26 @@ impl Store {
                 ));
             }
         }
+        let observations =
+            self.prepare_observation_reclamation(&_lock, &plan.unreachable_observations)?;
         let compacted = packed::compact(&self.objects(), &live)?;
         let reclaimed = packed::reclaim_retired(&self.objects(), &live)?;
+        let (observation_files, observation_bytes) =
+            self.reclaim_observations(&_lock, observations)?;
         Ok(GcResult {
             plan_id: plan_id.into(),
             compacted_objects: compacted.live_objects,
             compacted_logical_bytes: compacted.logical_bytes,
             retired_pack_bytes: compacted.retired_packs.values().sum(),
             written_pack_bytes: compacted.written_pack_bytes,
-            removed_files: reclaimed.removed_files,
-            removed_bytes: reclaimed.removed_bytes,
+            removed_files: reclaimed
+                .removed_files
+                .checked_add(observation_files)
+                .ok_or_else(|| failure("collection count overflow"))?,
+            removed_bytes: reclaimed
+                .removed_bytes
+                .checked_add(observation_bytes)
+                .ok_or_else(|| failure("collection size overflow"))?,
             readers_busy: reclaimed.readers_busy,
         })
     }
@@ -124,37 +132,46 @@ impl Store {
             }
         }
         // Validate every backup before choosing a prefix to retire.
-        self.historical_states()?;
         let mut backups = Vec::new();
         for name in names(&self.root.join("backups"))? {
             let number = name
                 .strip_suffix(".json.zst")
                 .ok_or_else(|| failure("invalid backup name"))?
                 .parse::<u64>()?;
+            let (backup, _): (State, _) = metadata::read(&self.root.join("backups").join(&name))?;
+            validate_state(&backup)?;
             backups.push((number, name));
         }
         backups.sort();
         let remove_count = backups.len().saturating_sub(keep_backups);
-        let backups: Vec<String> = backups
-            .into_iter()
+        let retired: Vec<String> = backups
+            .iter()
             .take(remove_count)
-            .map(|(_, name)| name)
+            .map(|(_, name)| name.clone())
             .collect();
+        // A good older backup must not be discarded merely because a newer
+        // state's JSON is structurally valid. Its dependencies must be usable.
+        let mut kept_states = vec![state.clone()];
+        for (_, name) in backups.iter().skip(remove_count) {
+            let (kept, _): (State, _) = metadata::read(&self.root.join("backups").join(name))?;
+            kept_states.push(kept);
+        }
+        let observation_evidence = self.retained_observation_evidence(&_lock, &kept_states)?;
         let mut evidence = Vec::new();
-        for name in &backups {
-            evidence.push((
-                name,
-                blake3::hash(&fs::read(self.root.join("backups").join(name))?)
-                    .to_hex()
-                    .to_string(),
-            ));
+        // Fingerprint every kept backup too: a same-length mutation of one
+        // invalidates the plan before any older recovery point can be removed.
+        for (_, name) in &backups {
+            let (length, digest) =
+                self.observation_evidence(&_lock, &self.root.join("backups").join(name))?;
+            evidence.push((name, length, digest));
         }
         let plan_id = blake3::hash(&serde_json::to_vec(&(
-            "sprig-retention-1",
+            "sprig-retention-2",
             &state,
             keep_backups,
             &tokens,
             evidence,
+            observation_evidence,
         ))?)
         .to_hex()
         .to_string();
@@ -168,9 +185,9 @@ impl Store {
                 }
                 // Publication precedes retirement. Failure retains all backups;
                 // unknown publication requires rereading, not rollback/replay.
-                self.save(&mut state)?;
+                self.save(&_lock, &mut state)?;
             }
-            for name in &backups {
+            for name in &retired {
                 fs::remove_file(self.root.join("backups").join(name))?;
             }
             sync_directory(&self.root.join("backups"))?;
@@ -180,7 +197,7 @@ impl Store {
             applied: apply.is_some(),
             generation: state.generation,
             keep_backups,
-            backups,
+            backups: retired,
             forgotten_branch_trash: tokens,
         })
     }

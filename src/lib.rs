@@ -13,6 +13,7 @@ mod manifest_pages;
 pub mod merge;
 mod metadata;
 mod model;
+mod observations;
 mod packed;
 mod platform;
 #[cfg(all(target_os = "linux", feature = "projection"))]
@@ -29,6 +30,7 @@ pub use blame::{BlameLine, LineBlame as Blame};
 pub use copy_tree::CopyMode;
 pub use merge::MergeStrategy;
 pub use model::*;
+pub use observations::{ObservationBudget, ObservationRef};
 pub use store::Store;
 
 /// Errors retain their underlying filesystem or validation diagnostics.

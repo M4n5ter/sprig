@@ -44,6 +44,16 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "projected")]
     writable: bool,
 
+    /// Operation-local decoded observation metadata budget (bytes).
+    #[arg(long, global = true, default_value_t = 268435456)]
+    observation_bytes: u64,
+    /// Operation-local observation entry budget, adjustable for large trees/history.
+    #[arg(long, global = true, default_value_t = 1000000)]
+    observation_entries: u64,
+    /// Operation-local encoded observation IO budget (bytes).
+    #[arg(long, global = true, default_value_t = 536870912)]
+    observation_io_bytes: u64,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -409,6 +419,11 @@ pub(crate) fn run() -> i32 {
 }
 
 fn execute(cli: &Cli) -> Result<Output, CliError> {
+    let observation_budget = sprig::ObservationBudget {
+        max_raw_bytes: cli.observation_bytes,
+        max_entries: cli.observation_entries,
+        max_encoded_bytes: cli.observation_io_bytes,
+    };
     if let Command::WritableServe {
         revision,
         generation,
@@ -462,11 +477,17 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
         return result(json!({"initialized": true, "store": cli.store}));
     }
     if let Command::RecoverState { generation } = &cli.command {
-        return result(Store::recover_state(&cli.store, *generation)?);
+        return result(Store::recover_state_with_observation_budget(
+            &cli.store,
+            *generation,
+            observation_budget,
+        )?);
     }
-    let store = Store::open(&cli.store)?.with_projection_executable(
-        std::env::current_exe().map_err(|error| CliError::arguments(error.to_string()))?,
-    );
+    let store = Store::open(&cli.store)?
+        .with_observation_budget(observation_budget)
+        .with_projection_executable(
+            std::env::current_exe().map_err(|error| CliError::arguments(error.to_string()))?,
+        );
     let mode = if cli.copy {
         CopyMode::Copy
     } else {

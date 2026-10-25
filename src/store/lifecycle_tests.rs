@@ -34,7 +34,7 @@ fn restore_reuses_one_verified_revision_and_rechecks_next_operation() -> Result<
     core.sync()?;
     drop(core);
     CORE_OPENS.with(|c| c.set(0));
-    let (captured, _) = store.capture_workspace(&owned)?;
+    let (captured, _) = store.capture_workspace(&store.lock()?, &owned)?;
     assert_eq!(CORE_OPENS.with(Cell::get), 1);
     assert_eq!(
         content::read_file(&captured["file"], &store.objects())?,
@@ -87,7 +87,7 @@ fn stopped_owned_core_is_reused_with_lease_and_failure_checks_intact() -> Result
     drop(core);
     drop(store.writable_core(&workspace)?);
     CORE_OPENS.with(|c| c.set(0));
-    store.capture_workspace(&workspace)?;
+    store.capture_workspace(&store.lock()?, &workspace)?;
     assert_eq!(CORE_OPENS.with(Cell::get), 1);
     CORE_OPENS.with(|c| c.set(0));
     store.sync_workspace(&workspace)?;
@@ -152,7 +152,8 @@ fn native_fork_copies_identity_without_publishing_uncommitted_content() -> Resul
     let store = Store::init(&root.join("store"))?;
     let imported = store.import(&source, "main", CopyMode::Copy)?;
     let before = store.state()?;
-    let original = before.workspaces["main"].observed.clone();
+    let original_ref = before.workspaces["main"].observed.clone();
+    let original = store.read_observed(&store.lock()?, &original_ref)?;
     fs::rename(imported.path.join("old-dir"), imported.path.join("new-dir"))?;
     fs::write(
         imported.path.join("replacement"),
@@ -170,8 +171,8 @@ fn native_fork_copies_identity_without_publishing_uncommitted_content() -> Resul
     assert_eq!(files(&store.root.join("revisions"))?, revisions_before);
     assert_eq!(fork.base_revision, imported.base_revision);
     let state = store.state()?;
-    assert_eq!(state.workspaces["main"].observed, original);
-    let observed = &state.workspaces["fork"].observed;
+    assert_eq!(state.workspaces["main"].observed, original_ref);
+    let observed = store.read_observed(&store.lock()?, &state.workspaces["fork"].observed)?;
     assert_eq!(observed["new-dir"].id, original["old-dir"].id);
     assert_eq!(observed["new-dir/file"].id, original["old-dir/file"].id);
     assert_eq!(observed["a"].id, original["a"].id);
@@ -224,11 +225,14 @@ fn copied_pending_rename_merges_with_original_path_edit() -> Result<()> {
     fs::write(source.join("old"), b"base\n")?;
     let store = Store::init(&root.join("store"))?;
     let main = store.import(&source, "main", CopyMode::Copy)?;
-    let old_id = store.state()?.workspaces["main"].observed["old"].id.clone();
+    let old_id = store
+        .read_observed(&store.lock()?, &store.state()?.workspaces["main"].observed)?["old"]
+        .id
+        .clone();
     fs::rename(main.path.join("old"), main.path.join("renamed"))?;
     let fork = store.fork("main", "fork", CopyMode::Auto)?;
     assert_eq!(
-        store.state()?.workspaces["fork"].observed["renamed"].id,
+        store.read_observed(&store.lock()?, &store.state()?.workspaces["fork"].observed)?["renamed"].id,
         old_id
     );
     store.checkpoint("fork", "rename", None)?;

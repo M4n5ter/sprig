@@ -814,6 +814,19 @@ fn transactional_sdk_exec_leases_recovery_and_non_destructive_inspection() -> Re
     );
     assert_eq!(s.read("main", "document")?, b"one two\n");
     assert!(recovered.path.exists() && current.path.exists());
+    // Schema 14 retains opaque recovery evidence as a conservative GC barrier.
+    let report = s.doctor()?;
+    assert!(!report.healthy);
+    assert!(report.orphan_revisions.is_empty() && report.orphan_workspaces.is_empty());
+    assert!(s.gc().is_err());
+    // This disposable fixture explicitly archives only its known invalid bytes
+    // outside the Store before exercising unrelated collection assertions below.
+    for entry in fs::read_dir(f.store_path.join("staging"))? {
+        let entry = entry?;
+        if fs::read(entry.path())? == invalid_bytes {
+            fs::rename(entry.path(), f.root.join(entry.file_name()))?;
+        }
+    }
     assert!(s.doctor()?.healthy);
     let loose = b"unreachable test object";
     let loose_hash = blake3::hash(loose).to_hex().to_string();

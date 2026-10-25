@@ -567,6 +567,7 @@ STORE/
   native/GENERATION/  # Native/projection trees or owned journals, pins and leases
   staging/            # Unpublished data and retained recovery records
   backups/            # Compressed previous metadata generations
+  observations/       # Immutable physical-identity observation maps
   file-cache/         # Disposable, bounded verified whole-file clone sources
 ```
 
@@ -655,8 +656,29 @@ also does not measure kernel/RAM caches or filesystem-global metadata. Statistic
 are not an atomic snapshot of externally modified native trees; quiesce writers
 for reproducible measurements. `doctor` lists orphan/temporary entries.
 
-The current storage schema is **13**. Other schemas are rejected without
+The current storage schema is **14**. Other schemas are rejected without
 modification; no automatic migration is provided.
+
+Workspace and retained-trash metadata contain observation descriptors, not inline
+physical-identity maps. Each immutable map is checksummed and content-addressed;
+ordinary listing never silently loads it. Capture and native fork resolve only
+the selected map under the store lock. Missing or corrupt observations are errors,
+not empty identity hints. Full backup states remain independently recoverable and
+retain their referenced maps. GC also protects pending staged publication and
+recovery records; unreadable evidence blocks reclamation rather than dropping roots.
+
+Observation resource limits apply per operation, not to the storage format:
+`--observation-bytes` defaults to 268435456 decoded bytes,
+`--observation-entries` to 1000000 distinct-map entries, and
+`--observation-io-bytes` to 536870912 encoded IO bytes. Raise them explicitly for
+large trees or long retained histories. The SDK offers
+`Store::with_observation_budget(ObservationBudget { ... })`; state recovery has
+`Store::recover_state_with_observation_budget`. Reads and writes verify actual
+sizes/counts while streaming, without trusting descriptor sizes for allocation.
+Doctor, GC and retention use the same policy; insufficient budget fails closed,
+never truncates a map or silently deletes a recovery root. These limits do not
+bound total process memory, ordinary payload work, or operating-system caches.
+The public `Workspace.observed` field and its JSON form expose the descriptor.
 
 ## Guarantees and boundaries
 

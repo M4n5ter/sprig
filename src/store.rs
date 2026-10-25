@@ -3,9 +3,13 @@
 mod collection;
 #[cfg(test)]
 mod lifecycle_tests;
+mod observation_roots;
+#[cfg(test)]
+mod observation_tests;
 mod storage;
 mod writable;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -25,14 +29,22 @@ use crate::model::{
     Revision, RevisionSummary, State, Stats, Status, TrashItem, Workspace, WorkspaceBackend,
     WorkspaceResult,
 };
+use crate::observations::{self, Meter, ObservationBudget, ObservationRef};
 use crate::packed;
 use crate::platform;
 use crate::{Blame, Result};
 use serde::{Deserialize, Serialize};
 
 // Identifies the one supported layout; this is not a compatibility layer.
-const STORAGE_SCHEMA: u32 = 13;
-const AREAS: [&str; 5] = ["objects", "revisions", "native", "staging", "backups"];
+const STORAGE_SCHEMA: u32 = 14;
+const AREAS: [&str; 6] = [
+    "objects",
+    "revisions",
+    "native",
+    "staging",
+    "backups",
+    "observations",
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,9 +61,64 @@ struct StoredRevision {
 pub struct Store {
     root: PathBuf,
     projection_executable: Option<PathBuf>,
+    observation_budget: ObservationBudget,
+}
+
+struct StoreLock {
+    _file: File,
+    root: PathBuf,
+    observations: RefCell<Meter>,
 }
 
 impl Store {
+    /// Select explicit operation-local observation decoding limits. These are
+    /// resource guards, not format limits; maintenance fails closed on exhaustion.
+    pub fn with_observation_budget(mut self, budget: ObservationBudget) -> Self {
+        self.observation_budget = budget;
+        self
+    }
+
+    fn observation_directory(&self) -> PathBuf {
+        self.root.join("observations")
+    }
+
+    fn put_observed(&self, lock: &StoreLock, observed: &Observed) -> Result<ObservationRef> {
+        if lock.root != self.root {
+            return Err(failure("observation lock belongs to another store"));
+        }
+        require_directory(&self.observation_directory())?;
+        fault("observations-before-put")?;
+        let reference = observations::put(
+            &self.observation_directory(),
+            observed,
+            &mut lock.observations.borrow_mut(),
+        )?;
+        fault("observations-after-put")?;
+        Ok(reference)
+    }
+
+    fn read_observed(&self, lock: &StoreLock, reference: &ObservationRef) -> Result<Observed> {
+        if lock.root != self.root {
+            return Err(failure("observation lock belongs to another store"));
+        }
+        observations::read(
+            &self.observation_directory(),
+            reference,
+            &mut lock.observations.borrow_mut(),
+        )
+    }
+
+    fn verify_observed(&self, lock: &StoreLock, reference: &ObservationRef) -> Result<()> {
+        if lock.root != self.root {
+            return Err(failure("observation lock belongs to another store"));
+        }
+        observations::verify(
+            &self.observation_directory(),
+            reference,
+            &mut lock.observations.borrow_mut(),
+        )
+    }
+
     /// Configure the installed Sprig executable used for foreground FUSE workers.
     /// Library callers opt in explicitly; no helper or system setting is installed.
     pub fn with_projection_executable(mut self, executable: PathBuf) -> Self {
@@ -72,6 +139,7 @@ impl Store {
         let store = Self {
             root: root.canonicalize()?,
             projection_executable: None,
+            observation_budget: ObservationBudget::default(),
         };
         store.state()?;
         let path = store.root.join("native").join(generation);
@@ -134,7 +202,7 @@ impl Store {
             branch: "retained".into(),
             base_revision: revision,
             directory: generation.into(),
-            observed: Observed::new(),
+            observed: observations::empty_reference(),
             observation_epoch: None,
             pending: None,
         };
@@ -243,8 +311,13 @@ impl Store {
         }
     }
 
-    fn capture_workspace(&self, workspace: &Workspace) -> Result<(Manifest, Observed)> {
+    fn capture_workspace(
+        &self,
+        _lock: &StoreLock,
+        workspace: &Workspace,
+    ) -> Result<(Manifest, Observed)> {
         if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
+            self.verify_observed(_lock, &workspace.observed)?;
             let core = self.stop_writable_core(workspace)?;
             if core.recovery_info()?.read_only {
                 return Err(failure(
@@ -260,7 +333,7 @@ impl Store {
             WorkspaceBackend::Native => content::capture(
                 &self.tree(&workspace.directory),
                 &self.objects(),
-                &workspace.observed,
+                &self.read_observed(_lock, &workspace.observed)?,
             ),
             WorkspaceBackend::Projection { revision } => {
                 #[cfg(all(target_os = "linux", feature = "projection"))]
@@ -273,13 +346,14 @@ impl Store {
                         &generation.join("upper"),
                         &generation.join("lower"),
                     )?;
-                    let empty = Observed::new();
                     let epoch = self.observation_epoch(workspace)?;
-                    let previous = if epoch == workspace.observation_epoch {
-                        &workspace.observed
+                    let observed = if epoch == workspace.observation_epoch {
+                        self.read_observed(_lock, &workspace.observed)?
                     } else {
-                        &empty
+                        self.verify_observed(_lock, &workspace.observed)?;
+                        Observed::new()
                     };
+                    let previous = &observed;
                     captured.reconcile_identities(
                         &self.revision(&workspace.base_revision)?.manifest,
                         previous,
@@ -345,7 +419,7 @@ impl Store {
             branch: "preparing".into(),
             base_revision: revision.to_owned(),
             directory: directory.clone(),
-            observed: Observed::new(),
+            observed: observations::empty_reference(),
             observation_epoch: None,
             pending: None,
         };
@@ -414,14 +488,14 @@ impl Store {
             branch: name.into(),
             base_revision: revision.clone(),
             directory,
-            observed,
+            observed: self.put_observed(&_lock, &observed)?,
             observation_epoch: None,
             pending: None,
         };
         state.branches.insert(name.into(), revision);
         workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.into(), workspace.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(self.workspace_result(name, &workspace))
     }
 
@@ -453,7 +527,7 @@ impl Store {
             branch: branch.into(),
             base_revision: revision.clone(),
             directory,
-            observed,
+            observed: self.put_observed(&_lock, &observed)?,
             observation_epoch: None,
             pending: None,
         };
@@ -462,7 +536,7 @@ impl Store {
         }
         workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.into(), workspace.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(self.workspace_result(name, &workspace))
     }
 
@@ -478,6 +552,11 @@ impl Store {
             fs::create_dir(root.join(area))?;
             sync_directory(&root.join(area))?;
         }
+        observations::put(
+            &root.join("observations"),
+            &Observed::new(),
+            &mut Meter::default(),
+        )?;
         write_new(
             &root.join("objects").join(".compression"),
             if enabled { b"auto\n" } else { b"never\n" },
@@ -510,6 +589,7 @@ impl Store {
         let store = Self {
             root,
             projection_executable: None,
+            observation_budget: ObservationBudget::default(),
         };
         let _lock = store.lock()?;
         store.state()?;
@@ -519,10 +599,19 @@ impl Store {
     /// Restore a previously saved metadata generation after validating every
     /// referenced revision and native tree. Current bytes are retained in staging.
     pub fn recover_state(path: &Path, generation: u64) -> Result<Status> {
+        Self::recover_state_with_observation_budget(path, generation, ObservationBudget::default())
+    }
+
+    pub fn recover_state_with_observation_budget(
+        path: &Path,
+        generation: u64,
+        budget: ObservationBudget,
+    ) -> Result<Status> {
         require_directory(path)?;
         let store = Self {
             root: path.canonicalize()?,
             projection_executable: None,
+            observation_budget: budget,
         };
         for area in AREAS {
             require_directory(&store.root.join(area))?;
@@ -536,7 +625,8 @@ impl Store {
             require_file(&backup)?;
             let (mut restored, _): (State, _) = metadata::read(&backup)?;
             validate_state(&restored)?;
-            let roots = store.protected_roots(&restored)?;
+            store.verify_state_observations(&_lock, &restored)?;
+            let roots = store.protected_roots_inner(&restored, false)?;
             let reader = packed::Reader::open(&store.objects())?;
             for id in store.ancestors(&roots)? {
                 for hash in
@@ -545,7 +635,7 @@ impl Store {
                     reader.read(&hash)?;
                 }
             }
-            let protected_directories = store.protected_directories(&restored)?;
+            let protected_directories = store.protected_directories_inner(&restored, false)?;
             for directory in &protected_directories {
                 require_directory(&store.root.join("native").join(directory))?;
                 require_directory(&store.tree(directory))?;
@@ -634,7 +724,9 @@ impl Store {
                 .join(format!("recovered-state-{}.json", new_id()?));
             write_new(&staged, &serde_json::to_vec(&restored)?)?;
             sync_directory(&store.root.join("staging"))?;
+            fault("recovery-before-rename")?;
             platform::rename(&staged, &current_path)?;
+            fault("recovery-after-rename")?;
             sync_directory(&store.root)?;
         }
         store.status()
@@ -664,14 +756,14 @@ impl Store {
             branch: name.to_owned(),
             base_revision: revision.clone(),
             directory,
-            observed,
+            observed: self.put_observed(&_lock, &observed)?,
             observation_epoch: None,
             pending: None,
         };
         state.branches.insert(name.to_owned(), revision);
         workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         let mut result = self.workspace_result(name, &workspace);
         result.copy_stats = Some(copy_stats);
         Ok(result)
@@ -689,16 +781,16 @@ impl Store {
             ));
         }
         if matches!(source.backend, WorkspaceBackend::Writable { .. }) {
-            return self.fork_writable_source(&mut state, &source, name);
+            return self.fork_writable_source(&_lock, &mut state, &source, name);
         }
         if matches!(source.backend, WorkspaceBackend::Projection { .. }) {
-            let (manifest, _) = self.capture_workspace(&source)?;
+            let (manifest, _) = self.capture_workspace(&_lock, &source)?;
             if mode != CopyMode::Auto {
                 return Err(failure(
                     "native copy policy does not apply to a projected fork",
                 ));
             }
-            return self.fork_projected_locked(&mut state, &source, &manifest, name, false);
+            return self.fork_projected_locked(&_lock, &mut state, &source, &manifest, name, false);
         }
         let directory = self.new_native()?;
         // Reconcile against the checked source identities before rebinding to
@@ -709,20 +801,21 @@ impl Store {
             &self.tree(&directory),
             mode,
         )?;
-        let observed = content::observe_copied(&copied, &source.observed)?;
+        let observed =
+            content::observe_copied(&copied, &self.read_observed(&_lock, &source.observed)?)?;
         let mut fork = Workspace {
             backend: WorkspaceBackend::Native,
             branch: name.to_owned(),
             base_revision: source.base_revision.clone(),
             directory,
-            observed,
+            observed: self.put_observed(&_lock, &observed)?,
             observation_epoch: None,
             pending: source.pending.clone(),
         };
         state.branches.insert(name.to_owned(), source.base_revision);
         fork.observation_epoch = self.observation_epoch(&fork)?;
         state.workspaces.insert(name.to_owned(), fork.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         let mut result = self.workspace_result(name, &fork);
         result.copy_stats = Some(copy_stats);
         Ok(result)
@@ -738,7 +831,7 @@ impl Store {
             .ok_or_else(|| failure("branch not found"))?
             .clone();
         let data = self.revision(&revision)?;
-        self.restore_locked(&mut state, &revision, &data, branch, name, false)
+        self.restore_locked(&_lock, &mut state, &revision, &data, branch, name, false)
     }
 
     pub fn restore(&self, reference: &str, name: &str) -> Result<WorkspaceResult> {
@@ -746,11 +839,13 @@ impl Store {
         let mut state = self.state()?;
         fresh_name(&state, name, true)?;
         let (revision, data) = self.resolve_revision(&state, reference)?;
-        self.restore_locked(&mut state, &revision, &data, name, name, true)
+        self.restore_locked(&_lock, &mut state, &revision, &data, name, name, true)
     }
 
+    #[allow(clippy::too_many_arguments)] // Explicit StoreLock is the observation access proof.
     fn restore_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         revision: &str,
         data: &Revision,
@@ -766,7 +861,7 @@ impl Store {
             branch: branch.to_owned(),
             base_revision: revision.to_owned(),
             directory,
-            observed,
+            observed: self.put_observed(_lock, &observed)?,
             observation_epoch: None,
             pending: None,
         };
@@ -777,7 +872,7 @@ impl Store {
         }
         workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace.clone());
-        self.save(state)?;
+        self.save(_lock, state)?;
         Ok(self.workspace_result(name, &workspace))
     }
 
@@ -790,14 +885,15 @@ impl Store {
         let remount = matches!(source.backend, WorkspaceBackend::Writable { .. })
             && self.mount_state(&source) == "mounted";
         let result = (|| {
-            let (manifest, _) = self.capture_workspace(&source)?;
-            self.fork_projected_locked(&mut state, &source, &manifest, name, false)
+            let (manifest, _) = self.capture_workspace(&_lock, &source)?;
+            self.fork_projected_locked(&_lock, &mut state, &source, &manifest, name, false)
         })();
         self.finish_writable_view(&source, result, remount)
     }
 
     fn fork_projected_locked(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         source: &Workspace,
         manifest: &Manifest,
@@ -813,7 +909,7 @@ impl Store {
             branch: name.into(),
             base_revision: source.base_revision.clone(),
             directory,
-            observed,
+            observed: self.put_observed(_lock, &observed)?,
             observation_epoch: None,
             pending: source.pending.clone(),
         };
@@ -822,7 +918,7 @@ impl Store {
             .insert(name.into(), source.base_revision.clone());
         fork.observation_epoch = self.observation_epoch(&fork)?;
         state.workspaces.insert(name.into(), fork.clone());
-        self.save(state)?;
+        self.save(_lock, state)?;
         Ok(self.workspace_result(name, &fork))
     }
 
@@ -840,14 +936,18 @@ impl Store {
         let remount = matches!(workspace.backend, WorkspaceBackend::Writable { .. })
             && self.mount_state(&workspace) == "mounted";
         let result = (|| {
-            let (manifest, observed) = self.capture_workspace(&workspace)?;
-            self.commit_workspace(&mut state, name, workspace, manifest, observed, message)
+            let (manifest, observed) = self.capture_workspace(&_lock, &workspace)?;
+            self.commit_workspace(
+                &_lock, &mut state, name, workspace, manifest, observed, message,
+            )
         })();
         self.finish_writable_commit(&state, name, result, remount)
     }
 
+    #[allow(clippy::too_many_arguments)] // Explicit StoreLock is the observation access proof.
     fn commit_workspace(
         &self,
+        _lock: &StoreLock,
         state: &mut State,
         name: &str,
         mut workspace: Workspace,
@@ -922,7 +1022,7 @@ impl Store {
             workspace.directory = directory;
             workspace.backend = backend;
             workspace.base_revision = previous.clone();
-            workspace.observed = observed.clone();
+            workspace.observed = self.put_observed(_lock, &observed)?;
             if !merged.conflicts.is_empty() {
                 self.write_workspace_markers(&workspace, &merged.manifest, &merged.conflicts)?;
                 workspace.pending = Some(crate::PendingMerge {
@@ -932,7 +1032,7 @@ impl Store {
                 self.sync_workspace(&workspace)?;
                 workspace.observation_epoch = self.observation_epoch(&workspace)?;
                 state.workspaces.insert(name.to_owned(), workspace);
-                self.save(state)?;
+                self.save(_lock, state)?;
                 return Err(failure(
                     "merge_conflict: branch unchanged; a recoverable conflict generation is now active. Use show to inspect conflicts, edit, resolve, then checkpoint",
                 ));
@@ -967,14 +1067,14 @@ impl Store {
             final_observed = observed;
         }
         workspace.base_revision = revision.clone();
-        workspace.observed = final_observed;
+        workspace.observed = self.put_observed(_lock, &final_observed)?;
         workspace.pending = None;
         let branch = workspace.branch.clone();
         state.branches.insert(branch.clone(), revision.clone());
         self.sync_workspace(&workspace)?;
         workspace.observation_epoch = self.observation_epoch(&workspace)?;
         state.workspaces.insert(name.to_owned(), workspace);
-        self.save(state)?;
+        self.save(_lock, state)?;
         Ok(CommitResult {
             committed: true,
             revision,
@@ -1052,7 +1152,7 @@ impl Store {
         let mut workspace = workspace(&state, name)?.clone();
         let _lease = self.lease(&workspace)?;
         if matches!(workspace.backend, WorkspaceBackend::Writable { .. }) {
-            return self.resolve_writable_locked(&mut state, name, workspace, paths);
+            return self.resolve_writable_locked(&_lock, &mut state, name, workspace, paths);
         }
         self.ensure_mounted(&workspace)?;
         let Some(pending) = &mut workspace.pending else {
@@ -1086,7 +1186,7 @@ impl Store {
             .conflicts
             .retain(|conflict| !paths.contains(&conflict.path));
         state.workspaces.insert(name.to_owned(), workspace.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(self.workspace_result(name, &workspace))
     }
 
@@ -1100,7 +1200,7 @@ impl Store {
         }
         let revision = self.resolve(&state, reference)?;
         state.branches.insert(name.to_owned(), revision.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(BranchResult {
             name: name.to_owned(),
             revision,
@@ -1132,7 +1232,7 @@ impl Store {
                 ours_id
             };
             state.branches.insert(output.to_owned(), revision.clone());
-            self.save(&mut state)?;
+            self.save(&_lock, &mut state)?;
             return Ok(MergeOutcome {
                 committed: true,
                 revision: Some(revision),
@@ -1174,7 +1274,7 @@ impl Store {
             manifest: merged.manifest,
         })?;
         state.branches.insert(output.to_owned(), revision.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(MergeOutcome {
             committed: true,
             revision: Some(revision),
@@ -1206,7 +1306,7 @@ impl Store {
             manifest: self.revision(&target)?.manifest,
         })?;
         state.branches.insert(branch.to_owned(), revision.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(CommitResult {
             committed: true,
             revision,
@@ -1232,10 +1332,11 @@ impl Store {
         branch_head(&state, &original.branch, expected)?;
         if matches!(original.backend, WorkspaceBackend::Writable { .. }) {
             let remount = self.mount_state(&original) == "mounted";
-            let result = self.apply_writable_locked(&mut state, name, original, mutations, message);
+            let result =
+                self.apply_writable_locked(&_lock, &mut state, name, original, mutations, message);
             return self.finish_writable_commit(&state, name, result, remount);
         }
-        let (original_manifest, _) = self.capture_workspace(&original)?;
+        let (original_manifest, _) = self.capture_workspace(&_lock, &original)?;
         let directory = self.new_native()?;
         let tree = self.tree(&directory);
         copy_tree::copy_tree(&self.tree(&original.directory), &tree, CopyMode::Auto)?;
@@ -1249,7 +1350,7 @@ impl Store {
             let (projected, projected_observed, backend) = self.detached_projection(&manifest)?;
             replacement.directory = projected;
             replacement.backend = backend;
-            replacement.observed = projected_observed;
+            replacement.observed = self.put_observed(&_lock, &projected_observed)?;
             // This unpublished SDK preparation is reproducible from the retained
             // original and the already durable projected snapshot. Never remove
             // user-visible generations or anything after an uncertain save.
@@ -1260,7 +1361,7 @@ impl Store {
             replacement.directory = directory;
         }
         let observed = if matches!(replacement.backend, WorkspaceBackend::Projection { .. }) {
-            replacement.observed.clone()
+            self.read_observed(&_lock, &replacement.observed)?
         } else {
             observed
         };
@@ -1276,7 +1377,7 @@ impl Store {
             },
         );
         if replacement.pending.is_some() {
-            replacement.observed = observed;
+            replacement.observed = self.put_observed(&_lock, &observed)?;
             let result = CommitResult {
                 committed: false,
                 revision: replacement.base_revision.clone(),
@@ -1287,10 +1388,18 @@ impl Store {
             self.sync_workspace(&replacement)?;
             replacement.observation_epoch = self.observation_epoch(&replacement)?;
             state.workspaces.insert(name.to_owned(), replacement);
-            self.save(&mut state)?;
+            self.save(&_lock, &mut state)?;
             return Ok(result);
         }
-        self.commit_workspace(&mut state, name, replacement, manifest, observed, message)
+        self.commit_workspace(
+            &_lock,
+            &mut state,
+            name,
+            replacement,
+            manifest,
+            observed,
+            message,
+        )
     }
 
     pub fn exec(&self, name: &str, program: &str, arguments: &[String]) -> Result<i32> {
@@ -1379,7 +1488,7 @@ impl Store {
             _ => return Err(failure("drop kind must be workspace or branch")),
         };
         state.trash.insert(token, item.clone());
-        self.save(&mut state)?;
+        self.save(&_lock, &mut state)?;
         Ok(item)
     }
 
@@ -1395,7 +1504,7 @@ impl Store {
         match item.workspace {
             None => {
                 let data = self.revision(&item.revision)?;
-                self.restore_locked(&mut state, &item.revision, &data, name, name, true)
+                self.restore_locked(&_lock, &mut state, &item.revision, &data, name, name, true)
             }
             Some(old) => {
                 let _lease = self.lease(&old)?;
@@ -1405,10 +1514,10 @@ impl Store {
                             "native copy policy does not apply to writable recovery",
                         ));
                     }
-                    return self.fork_writable_source(&mut state, &old, name);
+                    return self.fork_writable_source(&_lock, &mut state, &old, name);
                 }
                 let previously_mounted = self.mount_state(&old) == "mounted";
-                let (manifest, _) = self.capture_workspace(&old)?;
+                let (manifest, _) = self.capture_workspace(&_lock, &old)?;
                 if matches!(old.backend, WorkspaceBackend::Projection { .. }) {
                     if mode != CopyMode::Auto {
                         return Err(failure(
@@ -1416,6 +1525,7 @@ impl Store {
                         ));
                     }
                     return self.fork_projected_locked(
+                        &_lock,
                         &mut state,
                         &old,
                         &manifest,
@@ -1432,14 +1542,14 @@ impl Store {
                     branch: name.to_owned(),
                     base_revision: old.base_revision.clone(),
                     directory,
-                    observed,
+                    observed: self.put_observed(&_lock, &observed)?,
                     observation_epoch: None,
                     pending: old.pending.clone(),
                 };
                 state.branches.insert(name.to_owned(), old.base_revision);
                 workspace.observation_epoch = self.observation_epoch(&workspace)?;
                 state.workspaces.insert(name.to_owned(), workspace.clone());
-                self.save(&mut state)?;
+                self.save(&_lock, &mut state)?;
                 let mut result = self.workspace_result(name, &workspace);
                 result.copy_stats = Some(copy_stats);
                 Ok(result)
@@ -1651,11 +1761,23 @@ impl Store {
         let _lock = self.lock()?;
         let state = self.state()?;
         let mut errors = Vec::new();
-        let roots = self.protected_roots(&state)?;
+        if let Err(error) = self.verify_observation_roots(&_lock, &state) {
+            errors.push(format!("observations: {error}"));
+        }
+        let mut reachability_complete = true;
+        let roots = match self.protected_roots(&state) {
+            Ok(roots) => roots,
+            Err(error) => {
+                errors.push(format!("retained roots: {error}"));
+                reachability_complete = false;
+                Vec::new()
+            }
+        };
         let reachable = match self.ancestors(&roots) {
             Ok(ids) => ids,
             Err(error) => {
                 errors.push(error.to_string());
+                reachability_complete = false;
                 BTreeSet::new()
             }
         };
@@ -1735,15 +1857,22 @@ impl Store {
                 }
             }
         }
-        let protected_directories = self.protected_directories(&state)?;
+        let protected_directories = match self.protected_directories(&state) {
+            Ok(directories) => directories,
+            Err(error) => {
+                errors.push(format!("retained directories: {error}"));
+                reachability_complete = false;
+                BTreeSet::new()
+            }
+        };
         let orphan_workspaces = names(&self.root.join("native"))?
             .into_iter()
-            .filter(|name| !protected_directories.contains(name))
+            .filter(|name| reachability_complete && !protected_directories.contains(name))
             .collect();
         let orphan_revisions = names(&self.root.join("revisions"))?
             .into_iter()
             .filter_map(|name| name.strip_suffix(".json.zst").map(str::to_owned))
-            .filter(|id| !reachable.contains(id))
+            .filter(|id| reachability_complete && !reachable.contains(id))
             .collect();
         Ok(DoctorReport {
             healthy: errors.is_empty(),
@@ -1759,11 +1888,12 @@ impl Store {
     /// work nor previously published history silently becomes collectible.
     pub fn gc(&self) -> Result<GcPlan> {
         let _lock = self.lock()?;
-        self.gc_locked()
+        self.gc_locked(&_lock)
     }
 
-    fn gc_locked(&self) -> Result<GcPlan> {
+    fn gc_locked(&self, _lock: &StoreLock) -> Result<GcPlan> {
         let state = self.state()?;
+        let observation_plan = self.observation_plan(_lock, &state)?;
         let reachable = self.ancestors(&self.protected_roots(&state)?)?;
         let mut objects = BTreeSet::new();
         let reader = packed::Reader::open(&self.objects())?;
@@ -1816,14 +1946,15 @@ impl Store {
             })
             .ok_or_else(|| failure("compaction size overflow"))?;
         Ok(GcPlan {
-            plan_id: self.gc_fingerprint(&state, &objects)?,
+            plan_id: self.gc_fingerprint(&state, &objects, &observation_plan)?,
             compaction_upper_bound_bytes,
             dry_run: true,
             generation: state.generation,
             unreachable_objects,
             unreachable_revisions,
+            unreachable_observations: observation_plan.unreachable,
             orphan_workspaces,
-            reclaimable_bytes,
+            reclaimable_bytes: reclaimable_bytes.checked_add(observation_plan.reclaimable_bytes).ok_or_else(|| failure("reclaimable size overflow"))?,
             note: "No files deleted. Heads, workspace bases, immutable lowers, trash, parents and backups remain protected. Apply the exact plan to compact and reclaim unreferenced payloads. Open readers defer deletion. Working generations and unknown files are never pruned.".into(),
         })
     }
@@ -2058,13 +2189,17 @@ impl Store {
         }
     }
 
-    fn lock(&self) -> Result<File> {
+    fn lock(&self) -> Result<StoreLock> {
         let path = self.root.join("lock");
         require_file(&path)?;
         let file = platform::open_read_write(&path)?;
         file.try_lock()
             .map_err(|error| failure(&format!("store_locked: {error}")))?;
-        Ok(file)
+        Ok(StoreLock {
+            _file: file,
+            root: self.root.clone(),
+            observations: RefCell::new(Meter::new(self.observation_budget)),
+        })
     }
 
     fn lease(&self, workspace: &Workspace) -> Result<File> {
@@ -2089,7 +2224,8 @@ impl Store {
         Ok(state)
     }
 
-    fn save(&self, state: &mut State) -> Result<()> {
+    fn save(&self, _lock: &StoreLock, state: &mut State) -> Result<()> {
+        fault("save-before-backup")?;
         let current = self.state()?;
         if current.generation != state.generation {
             return Err(failure(
@@ -2101,6 +2237,7 @@ impl Store {
             .join("backups")
             .join(format!("{}.json.zst", current.generation));
         write_immutable(&backup, &metadata::encode(&serde_json::to_vec(&current)?)?)?;
+        fault("save-after-backup")?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -2115,11 +2252,15 @@ impl Store {
             .join("staging")
             .join(format!("state-{}.json", new_id()?));
         write_new(&staged, &serde_json::to_vec(state)?)?;
+        fault("save-before-rename")?;
         platform::rename(&staged, &self.root.join("state.json"))?;
+        fault("save-after-rename")?;
         // An error after rename has an uncertain publication outcome. Inspect
         // generation/head before retrying; never blindly repeat a mutation.
         sync_directory(&self.root)?;
+        fault("save-after-root-sync")?;
         sync_directory(&self.root.join("staging"))?;
+        fault("save-after-staging-sync")?;
         Ok(())
     }
 
@@ -2272,7 +2413,14 @@ impl Store {
     }
 
     fn protected_roots(&self, state: &State) -> Result<Vec<String>> {
+        self.protected_roots_inner(state, true)
+    }
+
+    fn protected_roots_inner(&self, state: &State, include_staging: bool) -> Result<Vec<String>> {
         let mut states = self.historical_states()?;
+        if include_staging {
+            states.extend(self.staged_observation_states()?);
+        }
         states.push(state.clone());
         let mut roots = BTreeSet::new();
         for state in states {
@@ -2324,7 +2472,18 @@ impl Store {
     }
 
     fn protected_directories(&self, state: &State) -> Result<BTreeSet<String>> {
+        self.protected_directories_inner(state, true)
+    }
+
+    fn protected_directories_inner(
+        &self,
+        state: &State,
+        include_staging: bool,
+    ) -> Result<BTreeSet<String>> {
         let mut states = self.historical_states()?;
+        if include_staging {
+            states.extend(self.staged_observation_states()?);
+        }
         states.push(state.clone());
         let mut directories = BTreeSet::new();
         for state in states {
@@ -2429,6 +2588,7 @@ fn validate_state(state: &State) -> Result<()> {
 }
 
 fn validate_workspace(workspace: &Workspace) -> Result<()> {
+    observations::validate_descriptor(&workspace.observed)?;
     if workspace
         .observation_epoch
         .as_ref()
@@ -2916,4 +3076,13 @@ fn object_catalog(path: &Path, reader: &packed::Reader) -> Result<BTreeMap<Strin
         }
     }
     Ok(catalog)
+}
+
+#[inline]
+fn fault(point: &'static str) -> Result<()> {
+    #[cfg(test)]
+    observation_tests::inject(point)?;
+    #[cfg(not(test))]
+    let _ = point;
+    Ok(())
 }

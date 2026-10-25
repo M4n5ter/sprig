@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::content::{Manifest, Observed};
+use crate::ObservationRef;
+use crate::content::Manifest;
 use crate::merge::MergeConflict;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,7 +36,7 @@ pub struct Workspace {
     pub branch: String,
     pub base_revision: String,
     pub directory: String,
-    pub observed: Observed,
+    pub observed: ObservationRef,
     /// Random FUSE-session identity, not a timestamp or reusable mount number.
     pub observation_epoch: Option<String>,
     #[serde(default)]
@@ -164,6 +165,7 @@ pub struct GcPlan {
     pub generation: u64,
     pub unreachable_objects: Vec<String>,
     pub unreachable_revisions: Vec<String>,
+    pub unreachable_observations: Vec<String>,
     pub orphan_workspaces: Vec<String>,
     pub reclaimable_bytes: u64,
     pub note: String,

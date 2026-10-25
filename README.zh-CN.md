@@ -379,7 +379,23 @@ STORE/
 
 `stats.object_bytes` 汇总索引和 loose 布局中唯一对象解码后的字节数（文件内容块和元数据页块），包括未引用对象。`object_storage_bytes` 包含对象目录中的所有文件，包括索引、锁、孤立数据包和临时文件。Unix 上的 `object_allocated_bytes` 累加这些文件报告的已分配块，并不代表共享/CoW 存储上的独占物理占用；Windows 返回 null。`reachable_logical_bytes` 累加受保护修订中的文件长度，相同内容在不同修订中会重复计入。`storage` 逐个顶层区域拆账，`store_logical_bytes` 与 `store_allocated_bytes` 包含原生树、upper、日志、修订、备份、缓存及孤立文件；虚拟挂载的 lower/merged 视图不重复计入，实际后备内容已经统计。硬链接别名在每个区域内只计一次。分配量来自 Unix blocks 或 Windows `FILE_STANDARD_INFO`，不代表共享/CoW 卷上的独占物理 extent，也不包含内核/RAM 缓存或文件系统全局元数据。外部正在修改的原生树统计不是原子快照，可复现测量需要先停止写入。`doctor` 列出孤立/临时条目。
 
-当前存储结构（schema）为 **13**。其他结构版本会被拒绝且不会修改；不提供自动迁移。
+当前存储结构（schema）为 **14**。其他结构版本会被拒绝且不会修改；不提供自动迁移。
+
+工作区及保留回收项只存 observation 描述符，物理文件身份映射保存在
+`observations/` 内的不可变内容寻址文件。普通列表不会隐式加载映射；捕获和
+原生 fork 仅在 Store 锁内解析所需映射。文件缺失或损坏必须报错，不能当作空身份提示。
+完整状态备份仍可独立恢复，并保护所引用的映射。GC 同时保护尚未发布的暂存状态与
+恢复记录；证据不可读时拒绝回收，不丢弃历史根。
+
+资源预算按操作计算，不是格式的永久容量限制：`--observation-bytes` 默认
+268435456 解码字节，`--observation-entries` 默认 1000000 个不同映射的条目，
+`--observation-io-bytes` 默认 536870912 编码 IO 字节。大树或较长保留历史可显式调高。
+SDK 使用 `Store::with_observation_budget(ObservationBudget { ... })`，状态恢复提供
+`Store::recover_state_with_observation_budget`。读写流式核实实际长度与条目数，不按不可信
+描述符预分配内存。doctor、GC、retention 使用同一预算；不足时明确失败，不截断映射或
+静默删除恢复凭据。这些预算不代表进程总内存、普通文件数据操作或 OS 缓存的上限。
+公开 `Workspace.observed` 字段及其 JSON 输出现为描述符。
+
 
 ## 保证与边界
 

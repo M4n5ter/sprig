@@ -757,12 +757,9 @@ impl Inner {
     }
 
     fn sync_journal(&mut self) -> io::Result<()> {
-        let started = self
-            .diagnostics
-            .as_ref()
-            .and_then(|_| diagnostics::monotonic_ns());
+        let started = self.diagnostics.as_ref().map(|_| diagnostics::start());
         let result = self.journal.sync_all();
-        if let Some(diagnostics) = &self.diagnostics {
+        if let (Some(diagnostics), Some(started)) = (&self.diagnostics, started) {
             diagnostics
                 .borrow_mut()
                 .sync(started, self.next_sequence, result.is_ok());
@@ -790,10 +787,7 @@ impl Inner {
         let nlink = if node.links.is_empty() {
             0
         } else if matches!(node.entry.kind, EntryKind::Directory) {
-            let started = self
-                .diagnostics
-                .as_ref()
-                .and_then(|_| diagnostics::monotonic_ns());
+            let started = self.diagnostics.as_ref().map(|_| diagnostics::start());
             let nlink = 2 + self
                 .nodes
                 .iter()
@@ -804,7 +798,7 @@ impl Inner {
                         && matches!(n.entry.kind, EntryKind::Directory)
                 })
                 .count() as u32;
-            if let Some(diagnostics) = &self.diagnostics {
+            if let (Some(diagnostics), Some(started)) = (&self.diagnostics, started) {
                 diagnostics
                     .borrow_mut()
                     .attr(started, self.next_sequence, self.nodes.len());

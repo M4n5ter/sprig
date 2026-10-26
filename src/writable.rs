@@ -24,6 +24,9 @@
 //! hostile ancestor replacement. Platform helpers preserve their existing
 //! durability qualifications, notably for Windows directory publication.
 
+#[path = "writable_diagnostics.rs"]
+mod diagnostics;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -102,6 +105,7 @@ pub(crate) struct WritableCas {
 }
 
 struct Inner {
+    diagnostics: Option<std::cell::RefCell<diagnostics::Diagnostics>>,
     // This separate stable lock file is never replaced or unlinked here.
     _lease: File,
     journal: File,
@@ -229,7 +233,7 @@ impl WritableCas {
         let journal = platform::open_read_write(&generation_dir.join(JOURNAL_NAME))?;
         let mut inner = Inner::new(objects, base, revision, generation, lease, journal)?;
         inner.append(Operation::Init, &[])?;
-        inner.journal.sync_all()?;
+        inner.sync_journal()?;
         platform::sync_directory(generation_dir)?;
         if let Some(parent) = generation_dir.parent() {
             platform::sync_directory(parent)?;
@@ -569,12 +573,16 @@ impl WritableCas {
 
     /// fsync flushes the shared journal, including metadata and all open files.
     pub(crate) fn sync(&self) -> io::Result<()> {
-        let mut inner = self.lock()?;
-        if let Err(error) = inner.journal.sync_all() {
-            inner.poisoned = true;
-            return Err(error);
+        self.lock()?.sync_journal()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "projection"))]
+    pub(crate) fn emit_diagnostics(&self) {
+        if let Ok(inner) = self.lock()
+            && let Some(diagnostics) = &inner.diagnostics
+        {
+            diagnostics.borrow().emit();
         }
-        Ok(())
     }
 
     /// A prepare operation only: sync the verified journal, stream whole changed
@@ -587,10 +595,7 @@ impl WritableCas {
                 "reopen poisoned generation before checkpoint",
             ));
         }
-        if let Err(error) = inner.journal.sync_all() {
-            inner.poisoned = true;
-            return Err(error);
-        }
+        inner.sync_journal()?;
         let mut manifest = Manifest::new();
         let paths: Vec<_> = inner.paths.iter().map(|(p, i)| (p.clone(), *i)).collect();
         let mut batch = ObjectBatch::open(&self.objects).map_err(content_error)?;
@@ -726,6 +731,7 @@ impl Inner {
             paths.insert(path.clone(), inode);
         }
         Ok(Self {
+            diagnostics: diagnostics::Diagnostics::from_environment(),
             _lease: lease,
             journal,
             reader: packed::Reader::open(objects).map_err(content_error)?,
@@ -750,6 +756,23 @@ impl Inner {
         })
     }
 
+    fn sync_journal(&mut self) -> io::Result<()> {
+        let started = self
+            .diagnostics
+            .as_ref()
+            .and_then(|_| diagnostics::monotonic_ns());
+        let result = self.journal.sync_all();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics
+                .borrow_mut()
+                .sync(started, self.next_sequence, result.is_ok());
+        }
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     fn can_mutate(&self) -> io::Result<()> {
         if self.incomplete_tail || self.abandoned_session {
             return Err(read_only());
@@ -767,7 +790,11 @@ impl Inner {
         let nlink = if node.links.is_empty() {
             0
         } else if matches!(node.entry.kind, EntryKind::Directory) {
-            2 + self
+            let started = self
+                .diagnostics
+                .as_ref()
+                .and_then(|_| diagnostics::monotonic_ns());
+            let nlink = 2 + self
                 .nodes
                 .iter()
                 .filter(|(i, n)| {
@@ -776,7 +803,13 @@ impl Inner {
                         && !n.links.is_empty()
                         && matches!(n.entry.kind, EntryKind::Directory)
                 })
-                .count() as u32
+                .count() as u32;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics
+                    .borrow_mut()
+                    .attr(started, self.next_sequence, self.nodes.len());
+            }
+            nlink
         } else {
             node.links.len() as u32
         };

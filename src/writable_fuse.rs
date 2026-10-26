@@ -345,6 +345,7 @@ impl Filesystem for WritableFuse {
             }
             if crate::writable_session::read_stop(&self.generation, &self.session)? {
                 crate::writable_session::acknowledge(&self.generation, &self.session)?;
+                self.core.emit_diagnostics();
             }
             Ok(())
         })();

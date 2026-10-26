@@ -5,12 +5,70 @@
 
 use crate::{Result, packed, platform};
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const BUDGET: u64 = 256 * 1024 * 1024;
+const ENTRY_BUDGET: usize = 4096;
+const LARGE_FILE_MIN: u64 = 64 * 1024;
+
+fn cache_key(size: u64, chunks: &[String]) -> Result<String> {
+    Ok(
+        blake3::hash(&serde_json::to_vec(&("sprig-file-cache-1", size, chunks))?)
+            .to_hex()
+            .to_string(),
+    )
+}
+
+// A small-file fill is justified only by another independent materialization
+// in this tree. Hardlink aliases use content::materialize's existing target
+// inode and must not turn a one-use content key into an apparent cache reuse.
+// The planner runs once, stores at most ENTRY_BUDGET keys, and fails closed to
+// the original large-file policy if either admission bound is exceeded.
+fn reusable_small_keys(manifest: &crate::content::Manifest) -> Result<BTreeSet<String>> {
+    let mut seen: BTreeMap<String, (Option<&str>, bool)> = BTreeMap::new();
+    let mut charge = 0_u64;
+    for entry in manifest.values() {
+        let crate::content::EntryKind::File { size, chunks } = &entry.kind else {
+            continue;
+        };
+        if !cache_eligible(*size) || *size >= LARGE_FILE_MIN {
+            continue;
+        }
+        let key = cache_key(*size, chunks)?;
+        if let Some((first_group, reusable)) = seen.get_mut(&key) {
+            if !*reusable
+                && (entry.link_group.is_none() || *first_group != entry.link_group.as_deref())
+            {
+                *reusable = true;
+                // Each size is <64 KiB and there are at most 4096 keys.
+                charge += *size + 4096;
+                if charge > BUDGET {
+                    return Ok(BTreeSet::new());
+                }
+            }
+        } else {
+            if seen.len() == ENTRY_BUDGET {
+                return Ok(BTreeSet::new());
+            }
+            seen.insert(key, (entry.link_group.as_deref(), false));
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .filter_map(|(key, (_, reusable))| reusable.then_some(key))
+        .collect())
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Counters {
+    probes: Cell<usize>,
+    hits: Cell<usize>,
+    fills: Cell<usize>,
+}
 
 /// One optional cache lease for a fresh native tree. Contention or an invalid
 /// cache disables caching for this session, never the authoritative CAS reads.
@@ -18,13 +76,32 @@ const BUDGET: u64 = 256 * 1024 * 1024;
 pub(crate) struct Session<'a> {
     objects: &'a Path,
     cache: OnceCell<Option<Cache>>,
+    reusable_small_keys: BTreeSet<String>,
+    #[cfg(test)]
+    counters: Counters,
 }
 
 impl<'a> Session<'a> {
-    pub(crate) fn new(objects: &'a Path) -> Self {
+    pub(crate) fn for_manifest(
+        objects: &'a Path,
+        manifest: &crate::content::Manifest,
+    ) -> Result<Self> {
+        Ok(Self {
+            objects,
+            cache: OnceCell::new(),
+            reusable_small_keys: reusable_small_keys(manifest)?,
+            #[cfg(test)]
+            counters: Counters::default(),
+        })
+    }
+
+    #[cfg(test)]
+    fn new(objects: &'a Path) -> Self {
         Self {
             objects,
             cache: OnceCell::new(),
+            reusable_small_keys: BTreeSet::new(),
+            counters: Counters::default(),
         }
     }
 
@@ -35,18 +112,25 @@ impl<'a> Session<'a> {
         size: u64,
         target: &Path,
     ) -> Result<File> {
-        if !cache_eligible(size) {
+        if !cache_eligible(size) || (size < LARGE_FILE_MIN && self.reusable_small_keys.is_empty()) {
             return materialize_cas(reader, chunks, size, target);
         }
-        let key = blake3::hash(&serde_json::to_vec(&("sprig-file-cache-1", size, chunks))?)
-            .to_hex()
-            .to_string();
+        let key = cache_key(size, chunks)?;
+        if size < LARGE_FILE_MIN && !self.reusable_small_keys.contains(&key) {
+            return materialize_cas(reader, chunks, size, target);
+        }
         // Try once, lazily, and retain the same lock inode through the session.
         // The initial scan is shared; every fill still reserves its own budget.
         let cache = self.cache.get_or_init(|| open_cache(self.objects).ok());
         if let Some(cache) = cache.as_ref().filter(|cache| !cache.disabled.get()) {
+            #[cfg(test)]
+            self.counters.probes.set(self.counters.probes.get() + 1);
             match cached(reader, chunks, size, &cache.root, &key, target) {
-                Ok(Some(output)) => return Ok(output),
+                Ok(Some(output)) => {
+                    #[cfg(test)]
+                    self.counters.hits.set(self.counters.hits.get() + 1);
+                    return Ok(output);
+                }
                 Ok(None) => cache.inventory.borrow_mut().forget(&key),
                 // A clone can fail after creating its destination. Never
                 // overwrite an uncertain partial target or claim success.
@@ -56,6 +140,8 @@ impl<'a> Session<'a> {
         }
         let output = materialize_cas(reader, chunks, size, target)?;
         if let Some(cache) = cache.as_ref().filter(|cache| !cache.disabled.get()) {
+            #[cfg(test)]
+            self.counters.fills.set(self.counters.fills.get() + 1);
             // A failed fill can leave a pending entry. Keep its reservation and
             // disable this session; the next lock owner inventories it afresh.
             if populate(cache, &key, size, target).is_err() {
@@ -67,7 +153,7 @@ impl<'a> Session<'a> {
 }
 
 fn cache_eligible(size: u64) -> bool {
-    (64 * 1024..=BUDGET - 4096).contains(&size)
+    (1024..=BUDGET - 4096).contains(&size)
 }
 
 fn materialize_cas(
@@ -173,6 +259,8 @@ fn populate(cache: &Cache, key: &str, size: u64, target: &Path) -> Result<()> {
         .checked_add(4096)
         .ok_or("cache size overflow")?;
     cache.inventory.borrow_mut().reserve(root, key, charge)?;
+    #[cfg(test)]
+    tests::inject_fill_fault()?;
     let path = root.join(key);
     let input = platform::open_regular(target)?;
     let pending = root.join(format!("pending-{key}"));
@@ -277,7 +365,7 @@ impl Inventory {
             .checked_add(additional)
             .ok_or("cache size overflow")?
             > BUDGET
-            || self.charges.len() + additional_entries > 4096
+            || self.charges.len() + additional_entries > ENTRY_BUDGET
         {
             let (key, _) = self
                 .charges
@@ -321,6 +409,304 @@ mod tests {
     use super::*;
     use crate::content::{self, EntryKind};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    thread_local! { static FAIL_FILL: Cell<bool> = const { Cell::new(false) }; }
+
+    pub(super) fn inject_fill_fault() -> Result<()> {
+        if FAIL_FILL.get() {
+            return Err(std::io::Error::other("injected cache fill failure").into());
+        }
+        Ok(())
+    }
+
+    struct FillFault;
+    impl Drop for FillFault {
+        fn drop(&mut self) {
+            FAIL_FILL.set(false);
+        }
+    }
+
+    fn planned_manifest(count: usize, size: u64, distinct: bool) -> content::Manifest {
+        (0..count)
+            .map(|index| {
+                let path = format!("file-{index:06}");
+                (
+                    path.clone(),
+                    content::Entry {
+                        id: path,
+                        link_group: None,
+                        mode: 0o600,
+                        modified_ns: 0,
+                        kind: EntryKind::File {
+                            size,
+                            chunks: vec![format!("{:064x}", if distinct { index } else { 0 })],
+                        },
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn duplicate_entries(manifest: &mut content::Manifest) {
+        let copies: Vec<_> = manifest
+            .iter()
+            .map(|(path, entry)| {
+                let mut entry = entry.clone();
+                entry.id = format!("copy-{}", entry.id);
+                (format!("copy-{path}"), entry)
+            })
+            .collect();
+        manifest.extend(copies);
+    }
+
+    #[test]
+    fn small_admission_counts_independent_materializations_not_aliases() -> Result<()> {
+        let mut manifest = planned_manifest(10, 1024, false);
+        assert_eq!(reusable_small_keys(&manifest)?.len(), 1);
+        for entry in manifest.values_mut() {
+            entry.link_group = Some("one-inode".into());
+        }
+        assert!(reusable_small_keys(&manifest)?.is_empty());
+        manifest.get_mut("file-000009").unwrap().link_group = Some("second-inode".into());
+        assert_eq!(reusable_small_keys(&manifest)?.len(), 1);
+        manifest.get_mut("file-000009").unwrap().link_group = None;
+        assert_eq!(reusable_small_keys(&manifest)?.len(), 1);
+        // Path order and whether the unlinked inode comes first do not matter.
+        manifest.get_mut("file-000009").unwrap().link_group = Some("one-inode".into());
+        manifest.get_mut("file-000000").unwrap().link_group = None;
+        assert_eq!(reusable_small_keys(&manifest)?.len(), 1);
+        manifest.remove("file-000000");
+        assert!(reusable_small_keys(&manifest)?.is_empty());
+        assert!(reusable_small_keys(&planned_manifest(1, 1024, false))?.is_empty());
+        for size in [0, 1023, LARGE_FILE_MIN, BUDGET] {
+            assert!(reusable_small_keys(&planned_manifest(2, size, false))?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn small_admission_pressure_bounds_are_conservative_and_order_independent() -> Result<()> {
+        for count in [ENTRY_BUDGET, ENTRY_BUDGET + 1, 10_000] {
+            assert!(reusable_small_keys(&planned_manifest(count, 1024, true))?.is_empty());
+        }
+        let mut fit = planned_manifest(ENTRY_BUDGET, 1024, true);
+        duplicate_entries(&mut fit);
+        assert_eq!(reusable_small_keys(&fit)?.len(), ENTRY_BUDGET);
+        let mut overflow = planned_manifest(ENTRY_BUDGET + 1, 1024, true);
+        duplicate_entries(&mut overflow);
+        assert!(reusable_small_keys(&overflow)?.is_empty());
+        let reversed = overflow
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(index, (_, entry))| (format!("reversed-{index:06}"), entry))
+            .collect();
+        assert!(reusable_small_keys(&reversed)?.is_empty());
+        // Logical duplicate charges at the exact byte cap fit, but one extra
+        // byte per key declines all small fills; actual allocations are still
+        // independently charged by Inventory before each population.
+        let mut byte_fit = planned_manifest(ENTRY_BUDGET, 60 * 1024, true);
+        duplicate_entries(&mut byte_fit);
+        assert_eq!(reusable_small_keys(&byte_fit)?.len(), ENTRY_BUDGET);
+        for entry in byte_fit.values_mut() {
+            let EntryKind::File { size, .. } = &mut entry.kind else {
+                unreachable!()
+            };
+            *size += 1;
+        }
+        assert!(reusable_small_keys(&byte_fit)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_small_keys_never_probe_or_fill_even_an_existing_cache() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-independent-reject-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let objects = root.join("objects");
+        let bytes = vec![b'u'; 1024];
+        let EntryKind::File { size, chunks } = content::put_bytes(&bytes, &objects)? else {
+            unreachable!()
+        };
+        let reader = packed::Reader::open(&objects)?;
+        for count in [1, ENTRY_BUDGET, 10_000] {
+            let mut manifest = planned_manifest(count, size, true);
+            manifest.get_mut("file-000000").unwrap().kind = EntryKind::File {
+                size,
+                chunks: chunks.clone(),
+            };
+            let session = Session::for_manifest(&objects, &manifest)?;
+            let target = root.join(format!("unique-{count}"));
+            session.materialize(&reader, &chunks, size, &target)?;
+            assert_eq!(fs::read(target)?, bytes);
+            assert!(session.cache.get().is_none());
+            assert_eq!(session.counters.probes.get(), 0);
+            assert_eq!(session.counters.fills.get(), 0);
+        }
+        assert!(!root.join("file-cache").exists());
+        let cache = open_cache(&objects)?;
+        fs::write(cache.root.join(cache_key(size, &chunks)?), &bytes)?;
+        drop(cache);
+        // Another admitted key must not admit a singleton or a key absent from
+        // the plan. Large files keep their original independent policy.
+        let manifest = planned_manifest(2, size, false);
+        let session = Session::for_manifest(&objects, &manifest)?;
+        session.materialize(&reader, &chunks, size, &root.join("unplanned"))?;
+        assert!(session.cache.get().is_none());
+        assert_eq!(session.counters.probes.get(), 0);
+        drop(reader);
+        let large_bytes = vec![b'l'; LARGE_FILE_MIN as usize];
+        let EntryKind::File { size, chunks } = content::put_bytes(&large_bytes, &objects)? else {
+            unreachable!()
+        };
+        let reader = packed::Reader::open(&objects)?;
+        session.materialize(&reader, &chunks, size, &root.join("large"))?;
+        assert_eq!(fs::read(root.join("large"))?, large_bytes);
+        assert_eq!(session.counters.probes.get(), 1);
+        assert_eq!(session.counters.fills.get(), 1);
+        drop(session);
+        drop(reader);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_small_miss_hit_corruption_and_inode_isolation_remain_verified() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-independent-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let objects = root.join("objects");
+        let bytes = vec![b'd'; 1024];
+        let kind = content::put_bytes(&bytes, &objects)?;
+        let EntryKind::File { size, chunks } = &kind else {
+            unreachable!()
+        };
+        let reader = packed::Reader::open(&objects)?;
+        let mut manifest = planned_manifest(2, *size, false);
+        for entry in manifest.values_mut() {
+            entry.kind = kind.clone();
+        }
+        let first = root.join("first");
+        let cold = Session::for_manifest(&objects, &manifest)?;
+        cold.materialize(&reader, chunks, *size, &first)?;
+        assert_eq!(fs::read(&first)?, bytes);
+        assert_eq!(cold.counters.probes.get(), 1);
+        assert_eq!(cold.counters.hits.get(), 0);
+        assert_eq!(cold.counters.fills.get(), 1);
+        drop(cold);
+        let cached = root.join("file-cache").join(cache_key(*size, chunks)?);
+        // Exercise verified hits even on copy-only test filesystems.
+        if !cached.exists() {
+            fs::write(&cached, &bytes)?;
+        }
+        let warm = Session::for_manifest(&objects, &manifest)?;
+        let second = root.join("second");
+        warm.materialize(&reader, chunks, *size, &second)?;
+        assert_eq!(fs::read(&second)?, bytes);
+        assert_eq!(warm.counters.hits.get(), 1);
+        assert_eq!(warm.counters.fills.get(), 0);
+        assert_ne!(
+            platform::inode(&platform::symlink_metadata(&first)?),
+            platform::inode(&platform::symlink_metadata(&second)?)
+        );
+        assert_ne!(
+            platform::inode(&platform::symlink_metadata(&cached)?),
+            platform::inode(&platform::symlink_metadata(&second)?)
+        );
+        #[cfg(unix)]
+        platform::set_path_mode(&second, 0o600)?;
+        fs::write(&second, b"changed independent workspace")?;
+        assert_eq!(fs::read(&first)?, bytes);
+        assert_eq!(fs::read(&cached)?, bytes);
+        drop(warm);
+        #[cfg(unix)]
+        platform::set_path_mode(&cached, 0o600)?;
+        fs::write(&cached, vec![b'!'; bytes.len()])?;
+        let damaged = Session::for_manifest(&objects, &manifest)?;
+        let repaired = root.join("repaired");
+        damaged.materialize(&reader, chunks, *size, &repaired)?;
+        assert_eq!(fs::read(repaired)?, bytes);
+        assert_eq!(damaged.counters.hits.get(), 0);
+        assert_eq!(damaged.counters.fills.get(), 1);
+        drop(damaged);
+        drop(reader);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_manifest_aliases_bypass_cache_and_independent_duplicates_keep_topology() -> Result<()>
+    {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-independent-topology-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
+        let objects = root.join("objects");
+        let source = root.join("source");
+        fs::create_dir(&source)?;
+        let bytes = vec![b't'; 4096];
+        fs::write(source.join("a"), &bytes)?;
+        platform::hard_link(&source.join("a"), &source.join("alias"))?;
+        let (aliases, _) = content::capture(&source, &objects, &Default::default())?;
+        assert!(reusable_small_keys(&aliases)?.is_empty());
+        let alias_tree = root.join("aliases");
+        content::materialize(&aliases, &objects, &alias_tree)?;
+        assert!(!root.join("file-cache").exists());
+        assert_eq!(
+            platform::inode(&platform::symlink_metadata(alias_tree.join("a"))?),
+            platform::inode(&platform::symlink_metadata(alias_tree.join("alias"))?)
+        );
+        fs::write(source.join("independent"), &bytes)?;
+        let (manifest, _) = content::capture(&source, &objects, &Default::default())?;
+        assert_eq!(reusable_small_keys(&manifest)?.len(), 1);
+        #[cfg(unix)]
+        let manifest = {
+            let mut manifest = manifest;
+            manifest.get_mut("independent").unwrap().mode = 0;
+            manifest
+        };
+        let tree = root.join("independent");
+        content::materialize(&manifest, &objects, &tree)?;
+        let first_inode = platform::inode(&platform::symlink_metadata(tree.join("a"))?);
+        assert_eq!(
+            first_inode,
+            platform::inode(&platform::symlink_metadata(tree.join("alias"))?)
+        );
+        assert_ne!(
+            first_inode,
+            platform::inode(&platform::symlink_metadata(tree.join("independent"))?)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(tree.join("independent"))?.permissions().mode() & 0o777,
+                0
+            );
+            platform::set_path_mode(&tree.join("independent"), 0o600)?;
+        }
+        for path in ["a", "alias", "independent"] {
+            assert_eq!(fs::read(tree.join(path))?, bytes);
+            assert_eq!(fs::read(source.join(path))?, bytes);
+        }
+        fs::write(tree.join("independent"), b"private change")?;
+        assert_eq!(fs::read(tree.join("a"))?, bytes);
+        assert_eq!(fs::read(alias_tree.join("a"))?, bytes);
+        assert_eq!(fs::read(source.join("independent"))?, bytes);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn cache_is_disposable_bounded_verified_and_never_a_mutable_alias() -> Result<()> {
@@ -477,7 +863,13 @@ mod tests {
         let pending = cache.root.join(format!("pending-{key}"));
         fs::create_dir(&pending)?;
         fs::write(pending.join("evidence"), b"keep")?;
+        // Unsupported native cloning may return before inspecting pending.
+        // Inject an ordinary optional-fill error after reservation so the
+        // failure contract is deterministic on every supported platform.
+        FAIL_FILL.set(true);
+        let fault = FillFault;
         session.materialize(&reader, &chunks, size, &root.join("first"))?;
+        drop(fault);
         assert_eq!(fs::read(root.join("first"))?, bytes);
         assert!(cache.disabled.get());
         assert!(cache.inventory.borrow().total >= size + 4096);
@@ -527,7 +919,9 @@ mod tests {
         );
         assert!(session.cache.get().is_none());
         assert!(!root.join("file-cache").exists());
-        assert!(!cache_eligible(64 * 1024 - 1));
+        assert!(!cache_eligible(1023));
+        assert!(cache_eligible(1024));
+        assert!(cache_eligible(64 * 1024 - 1));
         assert!(cache_eligible(64 * 1024));
         assert!(cache_eligible(BUDGET - 4096));
         assert!(!cache_eligible(BUDGET - 4095));

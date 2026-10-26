@@ -767,14 +767,24 @@ impl Inner {
         let nlink = if node.links.is_empty() {
             0
         } else if matches!(node.entry.kind, EntryKind::Directory) {
+            let directory = node.links.keys().next().expect("linked directory");
+            let prefix = if directory.is_empty() {
+                String::new()
+            } else {
+                format!("{directory}/")
+            };
+            // Directory hardlinks are unsupported, so the live path index has
+            // exactly one entry per linked child directory. Ignore the root
+            // itself and descendants below an immediate child. Detached nodes
+            // remain addressable by inode but cannot contribute live links.
             2 + self
-                .nodes
-                .iter()
-                .filter(|(i, n)| {
-                    **i != ROOT_INODE
-                        && n.parent == inode
-                        && !n.links.is_empty()
-                        && matches!(n.entry.kind, EntryKind::Directory)
+                .paths
+                .range(prefix.clone()..)
+                .take_while(|(path, _)| path.starts_with(&prefix))
+                .filter(|(path, child)| {
+                    !path.is_empty()
+                        && parent_path(path) == directory
+                        && matches!(self.nodes[*child].entry.kind, EntryKind::Directory)
                 })
                 .count() as u32
         } else {
@@ -1672,6 +1682,120 @@ namespace_error!(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
+
+    #[test]
+    fn writable_directory_links_follow_live_child_paths_and_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-directory-links-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(&generation).unwrap();
+        let mut base = Manifest::new();
+        for path in [
+            "",
+            "hot",
+            "hot/child",
+            "hot/child/子目录",
+            "hotter",
+            "hotter/keep",
+            "target",
+            "target/empty",
+            "unrelated",
+        ] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: format!("dir:{path}"),
+                    link_group: None,
+                    mode: 0o755,
+                    modified_ns: 1,
+                    kind: EntryKind::Directory,
+                },
+            );
+        }
+        for index in 0..2048 {
+            let path = format!("unrelated/file-{index:04}");
+            base.insert(
+                path.clone(),
+                Entry {
+                    id: path,
+                    link_group: None,
+                    mode: 0o644,
+                    modified_ns: 1,
+                    kind: EntryKind::File {
+                        size: 0,
+                        chunks: vec![],
+                    },
+                },
+            );
+        }
+        let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
+        let hot = engine.lookup_path("hot").unwrap().inode;
+        let child = engine.lookup_path("hot/child").unwrap().inode;
+        let target = engine.lookup_path("target").unwrap().inode;
+        let victim = engine.lookup_path("target/empty").unwrap().inode;
+        let retained = engine.open_handle(victim, false).unwrap();
+        let check = |engine: &WritableCas| {
+            let inner = engine.lock().unwrap();
+            // Independent original node oracle covers every linked/deleted
+            // directory, not only the paths used in this fixture's operations.
+            for (inode, node) in &inner.nodes {
+                if !matches!(node.entry.kind, EntryKind::Directory) {
+                    continue;
+                }
+                let expected = if node.links.is_empty() {
+                    0
+                } else {
+                    2 + inner
+                        .nodes
+                        .iter()
+                        .filter(|(i, n)| {
+                            **i != ROOT_INODE
+                                && n.parent == *inode
+                                && !n.links.is_empty()
+                                && matches!(n.entry.kind, EntryKind::Directory)
+                        })
+                        .count() as u32
+                };
+                assert_eq!(inner.attr(*inode).unwrap().nlink, expected, "inode {inode}");
+            }
+        };
+        check(&engine);
+        assert_eq!(engine.getattr(ROOT_INODE).unwrap().nlink, 6);
+        assert_eq!(engine.getattr(hot).unwrap().nlink, 3);
+        let file = engine.create_file(hot, "file", 0o644).unwrap().inode;
+        engine.link(file, hot, "file-alias").unwrap();
+        engine.symlink(hot, "symlink", b"child").unwrap();
+        assert_eq!(engine.getattr(hot).unwrap().nlink, 3);
+        check(&engine);
+        engine.rename(hot, "child", target, "empty").unwrap();
+        assert_eq!(engine.getattr(victim).unwrap().nlink, 0);
+        assert_eq!(engine.getattr(hot).unwrap().nlink, 2);
+        assert_eq!(engine.getattr(target).unwrap().nlink, 3);
+        check(&engine);
+        engine.rmdir(child, "子目录").unwrap();
+        engine.rmdir(target, "empty").unwrap();
+        assert_eq!(engine.getattr(child).unwrap().nlink, 0);
+        check(&engine);
+        engine.rename(ROOT_INODE, "hot", target, "moved").unwrap();
+        check(&engine);
+        engine.sync().unwrap();
+        engine.release(retained).unwrap();
+        let snapshot = engine.snapshot().unwrap();
+        drop(engine);
+        let replayed = WritableCas::open(&objects, &generation, &base, "r", "g").unwrap();
+        check(&replayed);
+        assert_eq!(replayed.getattr(victim).unwrap().nlink, 0);
+        assert_eq!(replayed.snapshot().unwrap(), snapshot);
+        drop(replayed);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn writable_generation_namespace_content_recovery_and_checkpoint() {

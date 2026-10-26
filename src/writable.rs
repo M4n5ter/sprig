@@ -43,6 +43,7 @@ const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_NODES: u64 = 1_000_000;
+const _: () = assert!(MAX_NODES <= u32::MAX as u64);
 const MAX_LOGICAL_GROWTH: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = i64::MAX as u64;
 const MAGIC: &[u8; 8] = b"SPRGWR01";
@@ -128,7 +129,13 @@ struct Inner {
 struct Node {
     entry: Entry,
     accessed_ns: i128,
-    parent: u64,
+    // Only this private representation is narrow; public/journal inodes stay
+    // u64. Validated base IDs are unique and base.len() <= MAX_NODES, so base
+    // inodes (index + 1) fit. Each Create consumes one never-removed entry ID
+    // and increments next_inode once; links only consume more IDs. Therefore
+    // every assigned inode <= entry_ids.len() <= MAX_NODES. Create/Rename
+    // validate an existing directory parent before apply(), including replay.
+    parent: u32,
     // Derived from live, non-root directory nodes' stored parents, not paths.
     // Each child inode counts once even if it has multiple namespace links.
     child_directories: u32,
@@ -312,7 +319,7 @@ impl WritableCas {
         let node = inner.directory(parent, false)?;
         match name {
             "." => inner.attr(parent),
-            ".." => inner.attr(node.parent),
+            ".." => inner.attr(u64::from(node.parent)),
             _ => inner.attr_path(&inner.child_path(parent, name)?),
         }
     }
@@ -721,7 +728,8 @@ impl Inner {
                 Node {
                     entry: entry.clone(),
                     accessed_ns: entry.modified_ns,
-                    parent,
+                    parent: u32::try_from(parent)
+                        .map_err(|_| invalid("base parent exceeds inode quota"))?,
                     child_directories: 0,
                     links: BTreeMap::from([(path.clone(), entry.id.clone())]),
                     file,
@@ -1204,7 +1212,7 @@ impl Inner {
                         accessed_ns: now,
                         links: BTreeMap::from([(path.clone(), entry.id.clone())]),
                         entry,
-                        parent,
+                        parent: u32::try_from(parent).expect("validated parent within inode quota"),
                         child_directories: 0,
                         file,
                     },
@@ -1364,11 +1372,15 @@ impl Inner {
             && matches!(node.entry.kind, EntryKind::Directory)
         {
             let parent = node.parent;
-            self.nodes.get_mut(&parent).unwrap().child_directories -= 1;
+            self.nodes
+                .get_mut(&u64::from(parent))
+                .unwrap()
+                .child_directories -= 1;
         }
     }
 
     fn move_parent(&mut self, inode: u64, parent: u64) {
+        let parent = u32::try_from(parent).expect("validated parent within inode quota");
         let node = self.nodes.get_mut(&inode).expect("validated source");
         let old_parent = node.parent;
         node.parent = parent;
@@ -1379,8 +1391,14 @@ impl Inner {
         {
             // A directory alias can leave its canonical path elsewhere. Match
             // the stored-parent semantics rather than infer parent from paths.
-            self.nodes.get_mut(&old_parent).unwrap().child_directories -= 1;
-            self.nodes.get_mut(&parent).unwrap().child_directories += 1;
+            self.nodes
+                .get_mut(&u64::from(old_parent))
+                .unwrap()
+                .child_directories -= 1;
+            self.nodes
+                .get_mut(&u64::from(parent))
+                .unwrap()
+                .child_directories += 1;
         }
     }
 
@@ -1714,7 +1732,7 @@ mod tests {
             .iter()
             .filter(|(i, n)| {
                 **i != ROOT_INODE
-                    && n.parent == inode
+                    && u64::from(n.parent) == inode
                     && !n.links.is_empty()
                     && matches!(n.entry.kind, EntryKind::Directory)
             })
@@ -1783,6 +1801,170 @@ mod tests {
         let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
         assert_directory_counts(&engine);
         (root, base, engine)
+    }
+
+    #[test]
+    fn writable_narrow_parents_reject_large_public_identifiers_without_mutation() {
+        let (root, base, engine) = directory_count_fixture(&["", "left", "left/child", "right"]);
+        let left = engine.lookup_path("left").unwrap().inode;
+        let right = engine.lookup_path("right").unwrap().inode;
+        let child = engine.lookup_path("left/child").unwrap().inode;
+        let file = engine.lookup_path("base-file").unwrap().inode;
+        let snapshot = engine.snapshot().unwrap();
+        let journal_path = root.join("generation").join(JOURNAL_NAME);
+        let journal = fs::read(&journal_path).unwrap();
+        let next_inode = engine.lock().unwrap().next_inode;
+        macro_rules! missing {
+            ($operation:expr) => {
+                assert_eq!(
+                    $operation.expect_err("large identifier rejected").kind(),
+                    io::ErrorKind::NotFound
+                )
+            };
+        }
+        // These low bits name existing nodes, so a truncating conversion would
+        // turn malformed requests into real mutations rather than just miss.
+        for parent in [(1_u64 << 32) + ROOT_INODE, u64::MAX] {
+            missing!(engine.mkdir(parent, "must-not-appear", 0o755));
+            missing!(engine.rename(parent, "left", ROOT_INODE, "moved"));
+            missing!(engine.rename(ROOT_INODE, "left", parent, "moved"));
+            missing!(engine.lookup(parent, ".."));
+        }
+        for inode in [(1_u64 << 32) + file, u64::MAX] {
+            missing!(engine.getattr(inode));
+            missing!(engine.open_handle(inode, false));
+            missing!(engine.link(inode, ROOT_INODE, "must-not-link"));
+        }
+        assert_eq!(engine.lock().unwrap().next_inode, next_inode);
+        assert_eq!(fs::read(&journal_path).unwrap(), journal);
+        assert_eq!(engine.snapshot().unwrap(), snapshot);
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, left);
+        assert_directory_counts(&engine);
+
+        // A subsequent valid parent change still widens back to the public
+        // inode type and replays through the same checked constructor/update.
+        let created = engine.mkdir(right, "created", 0o755).unwrap().inode;
+        assert_eq!(engine.lookup(created, "..").unwrap().inode, right);
+        engine.rename(left, "child", right, "moved").unwrap();
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, right);
+        engine.sync().unwrap();
+        drop(engine);
+        let engine = WritableCas::open(
+            &root.join("objects"),
+            &root.join("generation"),
+            &base,
+            "r",
+            "g",
+        )
+        .unwrap();
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, right);
+        assert_eq!(engine.lookup(created, "..").unwrap().inode, right);
+        assert_directory_counts(&engine);
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_narrow_parents_reject_large_checksummed_replay_identifiers() {
+        let (root, base, engine) = directory_count_fixture(&["", "left", "right"]);
+        let right = engine.lookup_path("right").unwrap().inode;
+        let snapshot = engine.snapshot().unwrap();
+        let (binding, sequence, next_inode) = {
+            let inner = engine.lock().unwrap();
+            (inner.binding.clone(), inner.next_sequence, inner.next_inode)
+        };
+        let journal_path = root.join("generation").join(JOURNAL_NAME);
+        let journal = fs::read(&journal_path).unwrap();
+        drop(engine);
+        let create = |parent, inode| Operation::Create {
+            parent,
+            name: "must-not-appear".into(),
+            inode,
+            entry: Entry {
+                id: new_id(&binding, inode),
+                link_group: None,
+                mode: 0o755,
+                modified_ns: 1,
+                kind: EntryKind::Directory,
+            },
+        };
+        let rename = |parent, new_parent| Operation::Rename {
+            parent,
+            name: "left".into(),
+            new_parent,
+            new_name: "moved".into(),
+            now_ns: 1,
+        };
+        for (operation, expected) in [
+            (
+                create((1_u64 << 32) + ROOT_INODE, next_inode),
+                io::ErrorKind::NotFound,
+            ),
+            (create(u64::MAX, next_inode), io::ErrorKind::NotFound),
+            (
+                create(ROOT_INODE, (1_u64 << 32) + next_inode),
+                io::ErrorKind::StorageFull,
+            ),
+            (create(ROOT_INODE, u64::MAX), io::ErrorKind::StorageFull),
+            (
+                rename((1_u64 << 32) + ROOT_INODE, right),
+                io::ErrorKind::NotFound,
+            ),
+            (
+                rename(ROOT_INODE, (1_u64 << 32) + right),
+                io::ErrorKind::NotFound,
+            ),
+            (rename(ROOT_INODE, u64::MAX), io::ErrorKind::NotFound),
+        ] {
+            // Test-only construction of an authenticated frame: do not call
+            // append/apply or bypass semantic validation in production code.
+            let metadata = serde_json::to_vec(&Record {
+                binding: binding.clone(),
+                operation,
+            })
+            .unwrap();
+            assert!(metadata.len() <= MAX_METADATA_BYTES);
+            let mut header = [0_u8; HEADER_BYTES];
+            header[..8].copy_from_slice(MAGIC);
+            header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+            header[12..16].copy_from_slice(&(metadata.len() as u32).to_le_bytes());
+            header[20..28].copy_from_slice(&sequence.to_le_bytes());
+            let header_hash = blake3::hash(&header[..28]);
+            header[28..60].copy_from_slice(header_hash.as_bytes());
+            let mut hash = blake3::Hasher::new();
+            hash.update(&header[..60]);
+            hash.update(&metadata);
+            header[60..].copy_from_slice(hash.finalize().as_bytes());
+            let mut malformed = journal.clone();
+            malformed.extend_from_slice(&header);
+            malformed.extend_from_slice(&metadata);
+            fs::write(&journal_path, &malformed).unwrap();
+            let error = match WritableCas::open(
+                &root.join("objects"),
+                &root.join("generation"),
+                &base,
+                "r",
+                "g",
+            ) {
+                Ok(_) => panic!("checksummed malformed identifier passed semantic validation"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), expected);
+            assert_eq!(fs::read(&journal_path).unwrap(), malformed);
+        }
+        fs::write(&journal_path, journal).unwrap();
+        let engine = WritableCas::open(
+            &root.join("objects"),
+            &root.join("generation"),
+            &base,
+            "r",
+            "g",
+        )
+        .unwrap();
+        assert_eq!(engine.snapshot().unwrap(), snapshot);
+        assert_directory_counts(&engine);
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

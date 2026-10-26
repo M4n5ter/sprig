@@ -173,6 +173,8 @@ fn populate(cache: &Cache, key: &str, size: u64, target: &Path) -> Result<()> {
         .checked_add(4096)
         .ok_or("cache size overflow")?;
     cache.inventory.borrow_mut().reserve(root, key, charge)?;
+    #[cfg(test)]
+    tests::inject_fill_fault()?;
     let path = root.join(key);
     let input = platform::open_regular(target)?;
     let pending = root.join(format!("pending-{key}"));
@@ -321,6 +323,22 @@ mod tests {
     use super::*;
     use crate::content::{self, EntryKind};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    thread_local! { static FAIL_FILL: Cell<bool> = const { Cell::new(false) }; }
+
+    pub(super) fn inject_fill_fault() -> Result<()> {
+        if FAIL_FILL.get() {
+            return Err(std::io::Error::other("injected cache fill failure").into());
+        }
+        Ok(())
+    }
+
+    struct FillFault;
+    impl Drop for FillFault {
+        fn drop(&mut self) {
+            FAIL_FILL.set(false);
+        }
+    }
 
     #[test]
     fn cache_is_disposable_bounded_verified_and_never_a_mutable_alias() -> Result<()> {
@@ -477,7 +495,13 @@ mod tests {
         let pending = cache.root.join(format!("pending-{key}"));
         fs::create_dir(&pending)?;
         fs::write(pending.join("evidence"), b"keep")?;
+        // Unsupported native cloning may return before inspecting pending.
+        // Inject an ordinary optional-fill error after reservation so the
+        // failure contract is deterministic on every supported platform.
+        FAIL_FILL.set(true);
+        let fault = FillFault;
         session.materialize(&reader, &chunks, size, &root.join("first"))?;
+        drop(fault);
         assert_eq!(fs::read(root.join("first"))?, bytes);
         assert!(cache.disabled.get());
         assert!(cache.inventory.borrow().total >= size + 4096);

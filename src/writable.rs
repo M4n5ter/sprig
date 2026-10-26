@@ -126,6 +126,9 @@ struct Inner {
     abandoned_session: bool,
 }
 
+// Keep the private attribute payload first instead of allowing field reordering.
+// This is an in-memory layout choice, not a serialized format or size promise.
+#[repr(C)]
 struct Node {
     entry: Entry,
     accessed_ns: i128,

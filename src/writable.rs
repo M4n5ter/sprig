@@ -129,6 +129,9 @@ struct Node {
     entry: Entry,
     accessed_ns: i128,
     parent: u64,
+    // Derived from live, non-root directory nodes' stored parents, not paths.
+    // Each child inode counts once even if it has multiple namespace links.
+    child_directories: u32,
     // Each directory entry keeps its own identity; inode state is shared.
     links: BTreeMap<String, String>,
     file: Option<FileData>,
@@ -719,10 +722,17 @@ impl Inner {
                     entry: entry.clone(),
                     accessed_ns: entry.modified_ns,
                     parent,
+                    child_directories: 0,
                     links: BTreeMap::from([(path.clone(), entry.id.clone())]),
                     file,
                 },
             );
+            if inode != ROOT_INODE && matches!(entry.kind, EntryKind::Directory) {
+                nodes
+                    .get_mut(&parent)
+                    .expect("base parent")
+                    .child_directories += 1;
+            }
             paths.insert(path.clone(), inode);
         }
         Ok(Self {
@@ -767,16 +777,7 @@ impl Inner {
         let nlink = if node.links.is_empty() {
             0
         } else if matches!(node.entry.kind, EntryKind::Directory) {
-            2 + self
-                .nodes
-                .iter()
-                .filter(|(i, n)| {
-                    **i != ROOT_INODE
-                        && n.parent == inode
-                        && !n.links.is_empty()
-                        && matches!(n.entry.kind, EntryKind::Directory)
-                })
-                .count() as u32
+            2 + node.child_directories
         } else {
             node.links.len() as u32
         };
@@ -1192,6 +1193,7 @@ impl Inner {
                     extents: vec![],
                 });
                 let now = entry.modified_ns;
+                let directory = matches!(entry.kind, EntryKind::Directory);
                 if file.is_some() {
                     self.content_dirty.insert(inode);
                 }
@@ -1203,9 +1205,13 @@ impl Inner {
                         links: BTreeMap::from([(path.clone(), entry.id.clone())]),
                         entry,
                         parent,
+                        child_directories: 0,
                         file,
                     },
                 );
+                if directory {
+                    self.nodes.get_mut(&parent).unwrap().child_directories += 1;
+                }
                 self.paths.insert(path.clone(), inode);
                 self.next_inode += 1;
                 self.mark_path(&path);
@@ -1301,7 +1307,7 @@ impl Inner {
             } => {
                 let path = self.child_path(parent, &name).expect("validated child");
                 let inode = self.paths.remove(&path).expect("validated target");
-                self.nodes.get_mut(&inode).unwrap().links.remove(&path);
+                self.remove_link(inode, &path);
                 self.mark_path(&path);
                 self.touch_parent(parent, now_ns);
             }
@@ -1322,7 +1328,7 @@ impl Inner {
                     return;
                 }
                 if let Some(victim) = self.paths.remove(&new) {
-                    self.nodes.get_mut(&victim).unwrap().links.remove(&new);
+                    self.remove_link(victim, &new);
                 }
                 let prefix = format!("{old}/");
                 let moved: Vec<_> = std::iter::once((old.clone(), source))
@@ -1343,10 +1349,38 @@ impl Inner {
                     self.mark_path(&path);
                     self.mark_path(&renamed);
                 }
-                self.nodes.get_mut(&source).unwrap().parent = new_parent;
+                self.move_parent(source, new_parent);
                 self.touch_parent(parent, now_ns);
                 self.touch_parent(new_parent, now_ns);
             }
+        }
+    }
+
+    fn remove_link(&mut self, inode: u64, path: &str) {
+        let node = self.nodes.get_mut(&inode).expect("validated target");
+        node.links.remove(path);
+        if inode != ROOT_INODE
+            && node.links.is_empty()
+            && matches!(node.entry.kind, EntryKind::Directory)
+        {
+            let parent = node.parent;
+            self.nodes.get_mut(&parent).unwrap().child_directories -= 1;
+        }
+    }
+
+    fn move_parent(&mut self, inode: u64, parent: u64) {
+        let node = self.nodes.get_mut(&inode).expect("validated source");
+        let old_parent = node.parent;
+        node.parent = parent;
+        if inode != ROOT_INODE
+            && old_parent != parent
+            && !node.links.is_empty()
+            && matches!(node.entry.kind, EntryKind::Directory)
+        {
+            // A directory alias can leave its canonical path elsewhere. Match
+            // the stored-parent semantics rather than infer parent from paths.
+            self.nodes.get_mut(&old_parent).unwrap().child_directories -= 1;
+            self.nodes.get_mut(&parent).unwrap().child_directories += 1;
         }
     }
 
@@ -1672,6 +1706,375 @@ namespace_error!(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
+
+    // Keep the original arena-scan definition independent of the derived field.
+    fn original_directory_child_count(inner: &Inner, inode: u64) -> u32 {
+        inner
+            .nodes
+            .iter()
+            .filter(|(i, n)| {
+                **i != ROOT_INODE
+                    && n.parent == inode
+                    && !n.links.is_empty()
+                    && matches!(n.entry.kind, EntryKind::Directory)
+            })
+            .count() as u32
+    }
+
+    fn assert_directory_counts(engine: &WritableCas) {
+        let inner = engine.lock().unwrap();
+        for (inode, node) in &inner.nodes {
+            let children = original_directory_child_count(&inner, *inode);
+            assert_eq!(node.child_directories, children, "child count at {inode}");
+            let expected = if node.links.is_empty() {
+                0
+            } else if matches!(node.entry.kind, EntryKind::Directory) {
+                2 + children
+            } else {
+                node.links.len() as u32
+            };
+            assert_eq!(inner.attr(*inode).unwrap().nlink, expected, "inode {inode}");
+            for path in node.links.keys() {
+                assert_eq!(inner.attr_path(path).unwrap().nlink, expected, "{path}");
+            }
+        }
+    }
+
+    fn directory_count_fixture(paths: &[&str]) -> (PathBuf, Manifest, WritableCas) {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-directory-counts-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(&generation).unwrap();
+        let mut base = Manifest::new();
+        for path in paths {
+            base.insert(
+                (*path).into(),
+                Entry {
+                    id: format!("dir:{path}"),
+                    link_group: None,
+                    mode: 0o755,
+                    modified_ns: 1,
+                    kind: EntryKind::Directory,
+                },
+            );
+        }
+        for path in ["base-file", "base-file-alias"] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: path.into(),
+                    link_group: Some("base-group".into()),
+                    mode: 0o644,
+                    modified_ns: 1,
+                    kind: EntryKind::File {
+                        size: 0,
+                        chunks: vec![],
+                    },
+                },
+            );
+        }
+        let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
+        assert_directory_counts(&engine);
+        (root, base, engine)
+    }
+
+    #[test]
+    fn writable_directory_counts_track_mutations_and_replay() {
+        let (root, base, engine) = directory_count_fixture(&[
+            "",
+            "left",
+            "left/base",
+            "left/base/deep",
+            "right",
+            "right/victim",
+            "sibling",
+        ]);
+        let left = engine.lookup_path("left").unwrap().inode;
+        let right = engine.lookup_path("right").unwrap().inode;
+        macro_rules! checked {
+            ($operation:expr) => {{
+                let result = $operation.unwrap();
+                assert_directory_counts(&engine);
+                result
+            }};
+        }
+        let before = engine.stats().unwrap().journal_bytes;
+        assert!(engine.rmdir(ROOT_INODE, "left").is_err());
+        assert!(engine.mkdir(ROOT_INODE, "left", 0o755).is_err());
+        assert!(engine.rename(ROOT_INODE, "left", left, "cycle").is_err());
+        assert!(
+            engine
+                .rename(ROOT_INODE, "left", ROOT_INODE, "base-file")
+                .is_err()
+        );
+        assert_eq!(engine.stats().unwrap().journal_bytes, before);
+        assert_directory_counts(&engine);
+        for index in 0..24 {
+            let name = format!("tree-{index}");
+            let tree = checked!(engine.mkdir(left, &name, 0o755)).inode;
+            let child = checked!(engine.mkdir(tree, "子目录", 0o755)).inode;
+            let held_tree = engine.open_handle(tree, false).unwrap();
+            let file = checked!(engine.create_file(child, "file", 0o644)).inode;
+            let held_file = engine.open_handle(file, true).unwrap();
+            checked!(engine.link(file, right, "file-alias"));
+            checked!(engine.write(held_file, 0, b"contents"));
+            checked!(engine.setattr(
+                file,
+                SetAttr {
+                    size: Some(3),
+                    mode: Some(0o600),
+                    ..Default::default()
+                }
+            ));
+            checked!(engine.symlink(child, "symlink", b"file"));
+            checked!(engine.rename(left, &name, right, "moved"));
+            checked!(engine.rename(right, "moved", right, "renamed"));
+            // Both same-path and same-inode alias renames are no-ops.
+            checked!(engine.rename(right, "renamed", right, "renamed"));
+            checked!(engine.rename(child, "file", right, "file-alias"));
+            let victim = checked!(engine.mkdir(left, "victim", 0o755)).inode;
+            let held_victim = engine.open_handle(victim, false).unwrap();
+            checked!(engine.rename(right, "renamed", left, "victim"));
+            assert_eq!(engine.getattr(victim).unwrap().nlink, 0);
+            assert_eq!(engine.lookup(tree, "..").unwrap().inode, left);
+            assert_eq!(engine.lookup(child, "..").unwrap().inode, tree);
+            checked!(engine.unlink(child, "file"));
+            assert_eq!(engine.read(held_file, 0, 99).unwrap(), b"con");
+            checked!(engine.unlink(right, "file-alias"));
+            checked!(engine.unlink(child, "symlink"));
+            checked!(engine.rmdir(tree, "子目录"));
+            checked!(engine.rmdir(left, "victim"));
+            assert_eq!(engine.getattr(tree).unwrap().nlink, 0);
+            assert_eq!(engine.getattr(child).unwrap().nlink, 0);
+            assert!(engine.readdir(tree).unwrap().is_empty());
+            // Reusing the path must not revive either retained directory inode.
+            let replacement = checked!(engine.mkdir(left, "victim", 0o755)).inode;
+            assert_ne!(replacement, victim);
+            assert_ne!(replacement, tree);
+            checked!(engine.rmdir(left, "victim"));
+            for handle in [held_tree, held_file, held_victim] {
+                engine.release(handle).unwrap();
+            }
+        }
+        let snapshot = engine.snapshot().unwrap();
+        let expected: BTreeMap<_, _> = {
+            let inner = engine.lock().unwrap();
+            inner
+                .nodes
+                .keys()
+                .map(|inode| (*inode, inner.attr(*inode).unwrap().nlink))
+                .collect()
+        };
+        engine.sync().unwrap();
+        drop(engine);
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        let engine = WritableCas::open(&objects, &generation, &base, "r", "g").unwrap();
+        assert_directory_counts(&engine);
+        for (inode, count) in expected {
+            assert_eq!(engine.getattr(inode).unwrap().nlink, count);
+        }
+        assert_eq!(engine.snapshot().unwrap(), snapshot);
+        let verified_bytes = engine.stats().unwrap().journal_bytes;
+        engine.mkdir(ROOT_INODE, "incomplete", 0o755).unwrap();
+        let length = engine.stats().unwrap().journal_bytes;
+        drop(engine);
+        OpenOptions::new()
+            .write(true)
+            .open(generation.join(JOURNAL_NAME))
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        let engine = WritableCas::open(&objects, &generation, &base, "r", "g").unwrap();
+        assert!(engine.recovery_info().unwrap().incomplete_tail);
+        assert_eq!(
+            engine.recovery_info().unwrap().verified_bytes,
+            verified_bytes
+        );
+        assert_directory_counts(&engine);
+        assert!(engine.lookup_path("incomplete").is_err());
+        assert_eq!(engine.snapshot().unwrap(), snapshot);
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn add_directory_alias(engine: &WritableCas, inode: u64, path: &str) {
+        // Directory aliases cannot be imported by validate_manifest or created
+        // by link(). Still preserve the original internal-state semantics.
+        let mut inner = engine.lock().unwrap();
+        assert!(matches!(
+            inner.nodes[&inode].entry.kind,
+            EntryKind::Directory
+        ));
+        let id = format!("alias:{path}");
+        assert!(inner.entry_ids.insert(id.clone()));
+        assert!(inner.paths.insert(path.into(), inode).is_none());
+        assert!(
+            inner
+                .nodes
+                .get_mut(&inode)
+                .unwrap()
+                .links
+                .insert(path.into(), id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn writable_directory_counts_preserve_alias_parent_and_unique_node_semantics() {
+        let (root, _, engine) = directory_count_fixture(&[
+            "",
+            "a",
+            "a/child",
+            "a/child/deep",
+            "b",
+            "b/victim",
+            "c",
+            "c/victim",
+            "z",
+        ]);
+        let a = engine.lookup_path("a").unwrap().inode;
+        let b = engine.lookup_path("b").unwrap().inode;
+        let c = engine.lookup_path("c").unwrap().inode;
+        let child = engine.lookup_path("a/child").unwrap().inode;
+        let deep = engine.lookup_path("a/child/deep").unwrap().inode;
+        let victim = engine.lookup_path("b/victim").unwrap().inode;
+        let held = engine.open_handle(child, false).unwrap();
+        add_directory_alias(&engine, child, "b/alias");
+        add_directory_alias(&engine, child, "c/alias");
+        add_directory_alias(&engine, victim, "c/victim-alias");
+        assert_directory_counts(&engine);
+        assert_eq!(engine.getattr(a).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(b).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(c).unwrap().nlink, 3);
+        macro_rules! checked {
+            ($operation:expr) => {{
+                let result = $operation.unwrap();
+                assert_directory_counts(&engine);
+                result
+            }};
+        }
+        checked!(engine.rename(a, "child", b, "alias"));
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, a);
+        // The source path is not canonical, and its parent is not Node.parent.
+        checked!(engine.rename(b, "alias", c, "noncanonical"));
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, c);
+        assert_eq!(engine.getattr(a).unwrap().nlink, 2);
+        assert_eq!(engine.getattr(c).unwrap().nlink, 4);
+        assert!(engine.lookup_path("a/child/deep").is_ok());
+        checked!(engine.rename(a, "child", b, "moved"));
+        assert_eq!(engine.lookup(deep, "..").unwrap().inode, child);
+        assert_eq!(engine.lookup_path("b/moved/deep").unwrap().inode, deep);
+        checked!(engine.rmdir(child, "deep"));
+        // Overwriting one victim alias does not remove the victim contribution.
+        checked!(engine.rename(b, "moved", b, "victim"));
+        assert_eq!(engine.getattr(victim).unwrap().nlink, 2);
+        assert_eq!(engine.getattr(b).unwrap().nlink, 4);
+        // Removing the canonical link changes canonical path but not parent.
+        checked!(engine.rmdir(b, "victim"));
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, b);
+        let new_child = checked!(engine.mkdir(child, "new", 0o755)).inode;
+        assert_eq!(engine.lookup_path("c/alias/new").unwrap().inode, new_child);
+        checked!(engine.rmdir(child, "new"));
+        checked!(engine.rmdir(c, "noncanonical"));
+        checked!(engine.rmdir(c, "alias"));
+        assert_eq!(engine.getattr(child).unwrap().nlink, 0);
+        assert_eq!(engine.getattr(b).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(c).unwrap().nlink, 3);
+        assert!(engine.readdir(child).unwrap().is_empty());
+        // Final-link overwrite also subtracts the victim's stored parent (b),
+        // not the target path's parent (c).
+        checked!(engine.rename(c, "victim", c, "victim-alias"));
+        assert_eq!(engine.getattr(victim).unwrap().nlink, 0);
+        assert_eq!(engine.getattr(b).unwrap().nlink, 2);
+        checked!(engine.rmdir(c, "victim-alias"));
+        engine.release(held).unwrap();
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_directory_counts_preserve_root_aliases_self_parents_and_tombstones() {
+        let (root, _, engine) = directory_count_fixture(&["", "a", "a/child", "b"]);
+        let a = engine.lookup_path("a").unwrap().inode;
+        let b = engine.lookup_path("b").unwrap().inode;
+        let child = engine.lookup_path("a/child").unwrap().inode;
+        add_directory_alias(&engine, ROOT_INODE, "b/root-alias");
+        assert_directory_counts(&engine);
+        engine.rename(b, "root-alias", a, "root-moved").unwrap();
+        assert_directory_counts(&engine);
+        assert_eq!(engine.getattr(a).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(b).unwrap().nlink, 2);
+        assert_eq!(engine.lookup(ROOT_INODE, "..").unwrap().inode, a);
+        // apply() is also checked for the root exclusion on link removal;
+        // rmdir validation rejects this synthetic root alias as nonempty.
+        engine.lock().unwrap().apply(
+            Operation::Remove {
+                parent: a,
+                name: "root-moved".into(),
+                directory: true,
+                now_ns: 2,
+            },
+            0,
+            &[],
+        );
+        assert_directory_counts(&engine);
+        add_directory_alias(&engine, child, "b/alias");
+        engine.rename(b, "alias", child, "self").unwrap();
+        assert_directory_counts(&engine);
+        assert_eq!(engine.lookup(child, "..").unwrap().inode, child);
+        assert_eq!(engine.getattr(child).unwrap().nlink, 3);
+        assert_eq!(engine.getattr(a).unwrap().nlink, 2);
+        // Removing the self alias leaves the unique node live and self-parented.
+        engine.rmdir(child, "self").unwrap_err();
+        assert_directory_counts(&engine);
+        engine.lock().unwrap().apply(
+            Operation::Remove {
+                parent: child,
+                name: "self".into(),
+                directory: true,
+                now_ns: 3,
+            },
+            0,
+            &[],
+        );
+        assert_directory_counts(&engine);
+        assert_eq!(engine.getattr(child).unwrap().nlink, 3);
+        engine.rmdir(a, "child").unwrap();
+        assert_directory_counts(&engine);
+        assert_eq!(engine.getattr(child).unwrap().nlink, 0);
+
+        // An alias can expose an empty canonical path while a live child is
+        // retained under a different path; a tombstone can still own children.
+        let descendant = engine.mkdir(a, "descendant", 0o755).unwrap().inode;
+        add_directory_alias(&engine, a, "0-empty");
+        engine.rmdir(ROOT_INODE, "a").unwrap();
+        assert_directory_counts(&engine);
+        engine.rmdir(ROOT_INODE, "0-empty").unwrap();
+        assert_directory_counts(&engine);
+        assert_eq!(engine.getattr(a).unwrap().nlink, 0);
+        assert_eq!(engine.lookup(descendant, "..").unwrap().inode, a);
+        assert_eq!(engine.lock().unwrap().nodes[&a].child_directories, 1);
+        // Even a synthetic final root-link removal must not subtract from the
+        // root's stored parent, which still owns the live descendant above.
+        {
+            let mut inner = engine.lock().unwrap();
+            assert_eq!(inner.paths.remove(""), Some(ROOT_INODE));
+            inner.remove_link(ROOT_INODE, "");
+        }
+        assert_directory_counts(&engine);
+        assert_eq!(engine.getattr(ROOT_INODE).unwrap().nlink, 0);
+        assert_eq!(engine.lock().unwrap().nodes[&a].child_directories, 1);
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn writable_generation_namespace_content_recovery_and_checkpoint() {

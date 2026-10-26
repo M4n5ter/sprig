@@ -767,26 +767,29 @@ impl Inner {
         let nlink = if node.links.is_empty() {
             0
         } else if matches!(node.entry.kind, EntryKind::Directory) {
-            let directory = node.links.keys().next().expect("linked directory");
-            let prefix = if directory.is_empty() {
-                String::new()
+            if let Some((prefix, paths)) = self.bounded_directory_range(inode) {
+                let directory = node.links.keys().next().expect("linked directory");
+                2 + paths
+                    .take_while(|(path, _)| path.starts_with(&prefix))
+                    .filter(|(path, child)| {
+                        parent_path(path) == directory
+                            && matches!(self.nodes[*child].entry.kind, EntryKind::Directory)
+                    })
+                    .count() as u32
             } else {
-                format!("{directory}/")
-            };
-            // Directory hardlinks are unsupported, so the live path index has
-            // exactly one entry per linked child directory. Ignore the root
-            // itself and descendants below an immediate child. Detached nodes
-            // remain addressable by inode but cannot contribute live links.
-            2 + self
-                .paths
-                .range(prefix.clone()..)
-                .take_while(|(path, _)| path.starts_with(&prefix))
-                .filter(|(path, child)| {
-                    !path.is_empty()
-                        && parent_path(path) == directory
-                        && matches!(self.nodes[*child].entry.kind, EntryKind::Directory)
-                })
-                .count() as u32
+                // Preserve the original scan for root, tiny namespaces, and
+                // subtrees whose path count could exceed their inode count.
+                2 + self
+                    .nodes
+                    .iter()
+                    .filter(|(i, n)| {
+                        **i != ROOT_INODE
+                            && n.parent == inode
+                            && !n.links.is_empty()
+                            && matches!(n.entry.kind, EntryKind::Directory)
+                    })
+                    .count() as u32
+            }
         } else {
             node.links.len() as u32
         };
@@ -796,6 +799,37 @@ impl Inner {
             accessed_ns: node.accessed_ns,
             nlink,
         })
+    }
+
+    fn bounded_directory_range(
+        &self,
+        inode: u64,
+    ) -> Option<(String, std::collections::btree_map::Range<'_, String, u64>)> {
+        // The range path trades a linear numeric-parent walk for string tests
+        // and per-child BTreeMap lookups. Only use it when a bounded probe
+        // proves the entire live subtree is small relative to unique nodes.
+        // These conservative work limits are not a universal speed guarantee.
+        const MIN_NODES: usize = 256;
+        const NODES_PER_PATH: usize = 64;
+        const MAX_PATHS: usize = 64;
+        if inode == ROOT_INODE || self.nodes.len() < MIN_NODES {
+            return None;
+        }
+        let directory = self.nodes[&inode].links.keys().next()?;
+        let prefix = format!("{directory}/");
+        let budget = (self.nodes.len() / NODES_PER_PATH).min(MAX_PATHS);
+        // Do not look up child inodes during this proof. In particular, many
+        // file aliases must not turn a tiny unique-inode scan into path work.
+        let paths = self.paths.range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()),
+            std::ops::Bound::Unbounded,
+        ));
+        let visited = paths
+            .clone()
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .take(budget + 1)
+            .count();
+        (visited <= budget).then_some((prefix, paths))
     }
 
     fn attr_path(&self, path: &str) -> io::Result<NodeAttr> {
@@ -1682,6 +1716,118 @@ namespace_error!(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
+
+    #[test]
+    fn writable_directory_range_proof_is_bounded_and_preserves_fallbacks() {
+        for (nodes, children, aliases, fast) in [
+            (5, 1, false, false),
+            (255, 3, false, false),
+            (256, 0, false, true),
+            (256, 4, false, true),
+            (256, 5, false, false),
+            (512, 8, false, true),
+            (512, 9, false, false),
+            (4096, 64, false, true),
+            (4096, 65, false, false),
+            (8192, 64, false, true),
+            (8192, 65, false, false),
+            (256, 4, true, true),
+            (256, 64, true, false),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "sprig-directory-proof-{}-{}",
+                std::process::id(),
+                now_ns()
+            ));
+            fs::create_dir(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let objects = root.join("objects");
+            let generation = root.join("generation");
+            fs::create_dir(&objects).unwrap();
+            fs::create_dir(&generation).unwrap();
+            let mut base = Manifest::new();
+            for path in ["", "hot", "padding"] {
+                base.insert(
+                    path.into(),
+                    Entry {
+                        id: format!("dir:{path}"),
+                        link_group: None,
+                        mode: 0o755,
+                        modified_ns: 1,
+                        kind: EntryKind::Directory,
+                    },
+                );
+            }
+            for index in 0..children {
+                // This edge crosses the budget with nested descendants,
+                // not five immediate children: proof must count the subtree.
+                let path = if nodes == 256 && children == 5 && !aliases && index > 0 {
+                    format!("hot/item-000/nested-{index:03}")
+                } else {
+                    format!("hot/item-{index:03}")
+                };
+                base.insert(
+                    path.clone(),
+                    Entry {
+                        id: path,
+                        link_group: aliases.then(|| "ordinary-aliases".into()),
+                        mode: 0o644,
+                        modified_ns: 1,
+                        kind: if index == 0 && !aliases {
+                            EntryKind::Directory
+                        } else {
+                            EntryKind::File {
+                                size: 0,
+                                chunks: vec![],
+                            }
+                        },
+                    },
+                );
+            }
+            let distinct_children = if aliases { 1 } else { children };
+            for index in 0..nodes - 3 - distinct_children {
+                let path = format!("padding/item-{index:05}");
+                base.insert(
+                    path.clone(),
+                    Entry {
+                        id: path,
+                        link_group: None,
+                        mode: 0o644,
+                        modified_ns: 1,
+                        kind: EntryKind::File {
+                            size: 0,
+                            chunks: vec![],
+                        },
+                    },
+                );
+            }
+            let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
+            let hot = engine.lookup_path("hot").unwrap().inode;
+            {
+                let inner = engine.lock().unwrap();
+                assert_eq!(inner.nodes.len(), nodes);
+                assert!(inner.bounded_directory_range(ROOT_INODE).is_none());
+                assert_eq!(
+                    inner.bounded_directory_range(hot).is_some(),
+                    fast,
+                    "nodes={nodes}, children={children}, aliases={aliases}"
+                );
+                let expected = 2 + inner
+                    .nodes
+                    .iter()
+                    .filter(|(i, n)| {
+                        **i != ROOT_INODE
+                            && n.parent == hot
+                            && !n.links.is_empty()
+                            && matches!(n.entry.kind, EntryKind::Directory)
+                    })
+                    .count() as u32;
+                assert_eq!(inner.attr(hot).unwrap().nlink, expected);
+            }
+            drop(engine);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn writable_directory_links_follow_live_child_paths_and_replay() {

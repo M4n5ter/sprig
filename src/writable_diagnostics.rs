@@ -144,10 +144,11 @@ impl Diagnostics {
     pub(super) fn emit(&self) {
         // Only called after a clean, requested normal unmount. No per-operation
         // writes; output failure cannot change journal/session correctness.
-        use std::io::Write;
-        let mut stderr = std::io::stderr().lock();
-        if serde_json::to_writer(&mut stderr, self).is_ok() {
-            let _ = stderr.write_all(b"\n");
+        use std::io::{BufWriter, Write};
+        let stderr = std::io::stderr().lock();
+        let mut output = BufWriter::with_capacity(64 * 1024, stderr);
+        if serde_json::to_writer(&mut output, self).is_ok() && output.write_all(b"\n").is_ok() {
+            let _ = output.flush();
         }
     }
 }

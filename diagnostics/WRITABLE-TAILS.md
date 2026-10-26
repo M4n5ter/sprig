@@ -49,3 +49,11 @@ Before publication: run format, focused diagnostic aggregation test, existing
 writable tests, projection compile/tests and clippy under root's serialized
 validation ownership. No builds or mounted runs have been performed by the
 preparing agent.
+
+The final JSON dump uses a bounded 64 KiB buffer and an explicit flush before
+returning, while the original journal lease is still held. This avoids one
+write syscall per JSON fragment; it does not fsync the diagnostic log or alter
+any filesystem barrier, acknowledgement, lease ordering or timeout. Consumers
+must require a complete, schema-valid JSON record with valid totals/events;
+missing or truncated output is unavailable trace evidence, never zero cost.
+Clock failures or ring overwrites must be reported as coverage limitations.

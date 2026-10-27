@@ -30,11 +30,24 @@ use crate::projection::ReadySignal;
 use crate::writable::{NodeAttr, SetAttr, WritableCas};
 
 const TTL: Duration = Duration::ZERO;
+const REGULAR_FILE_READ_TTL: Duration = Duration::from_secs(60);
 const MAX_IO_BYTES: usize = 1024 * 1024;
 // Core inode numbers are never reused within a mounted session. Every entry
 // reply for an inode, including hardlink aliases, must keep this generation.
 // A mismatch tells the kernel the old inode (and its live mappings) is stale.
 const INODE_GENERATION: u64 = 1;
+
+// Only successful LOOKUP/GETATTR replies opt into this experiment. Mutation
+// replies, directories, symlinks and missing names retain the zero-TTL policy.
+// See diagnostics/REGULAR-FILE-TTL.md for coherence assumptions and required
+// mounted regressions; pure policy tests do not establish kernel coherence.
+fn lookup_getattr_ttl(kind: FileType) -> Duration {
+    if kind == FileType::RegularFile {
+        REGULAR_FILE_READ_TTL
+    } else {
+        TTL
+    }
+}
 
 struct Handle {
     inode: u64,
@@ -364,7 +377,7 @@ impl Filesystem for WritableFuse {
         {
             Ok(attr) => {
                 self.remember(attr.ino);
-                reply.entry(&TTL, &attr, INODE_GENERATION);
+                reply.entry(&lookup_getattr_ttl(attr.kind), &attr, INODE_GENERATION);
             }
             Err(error) => reply.error(errno(&error)),
         }
@@ -400,7 +413,7 @@ impl Filesystem for WritableFuse {
             self.attr(&self.core.getattr(inode)?)
         })();
         match result {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&lookup_getattr_ttl(attr.kind), &attr),
             Err(error) => reply.error(errno(&error)),
         }
     }
@@ -962,5 +975,37 @@ impl Filesystem for WritableFuse {
         reply: ReplyWrite,
     ) {
         reply.error(libc::EOPNOTSUPP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regular_file_lookup_getattr_uses_sixty_seconds() {
+        assert_eq!(
+            lookup_getattr_ttl(FileType::RegularFile),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn other_file_types_keep_zero_lookup_getattr_ttl() {
+        for kind in [
+            FileType::NamedPipe,
+            FileType::CharDevice,
+            FileType::BlockDevice,
+            FileType::Directory,
+            FileType::Symlink,
+            FileType::Socket,
+        ] {
+            assert_eq!(lookup_getattr_ttl(kind), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn mutation_reply_ttl_stays_zero() {
+        assert_eq!(TTL, Duration::ZERO);
     }
 }

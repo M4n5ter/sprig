@@ -116,6 +116,9 @@ struct Inner {
     next_handle: u64,
     next_sequence: u64,
     journal_bytes: u64,
+    // Replaying valid bytes does not establish that an earlier writer synced
+    // them. Only a successful barrier in this owner clears this flag.
+    journal_unsynced: bool,
     logical_bytes: u64,
     logical_limit: u64,
     dirty_paths: BTreeSet<String>,
@@ -229,7 +232,7 @@ impl WritableCas {
         let journal = platform::open_read_write(&generation_dir.join(JOURNAL_NAME))?;
         let mut inner = Inner::new(objects, base, revision, generation, lease, journal)?;
         inner.append(Operation::Init, &[])?;
-        inner.journal.sync_all()?;
+        inner.sync_journal(File::sync_all)?;
         platform::sync_directory(generation_dir)?;
         if let Some(parent) = generation_dir.parent() {
             platform::sync_directory(parent)?;
@@ -569,12 +572,7 @@ impl WritableCas {
 
     /// fsync flushes the shared journal, including metadata and all open files.
     pub(crate) fn sync(&self) -> io::Result<()> {
-        let mut inner = self.lock()?;
-        if let Err(error) = inner.journal.sync_all() {
-            inner.poisoned = true;
-            return Err(error);
-        }
-        Ok(())
+        self.lock()?.sync_journal(File::sync_all)
     }
 
     /// A prepare operation only: sync the verified journal, stream whole changed
@@ -587,10 +585,7 @@ impl WritableCas {
                 "reopen poisoned generation before checkpoint",
             ));
         }
-        if let Err(error) = inner.journal.sync_all() {
-            inner.poisoned = true;
-            return Err(error);
-        }
+        inner.sync_journal(File::sync_all)?;
         let mut manifest = Manifest::new();
         let paths: Vec<_> = inner.paths.iter().map(|(p, i)| (p.clone(), *i)).collect();
         let mut batch = ObjectBatch::open(&self.objects).map_err(content_error)?;
@@ -738,6 +733,7 @@ impl Inner {
             next_handle: 1,
             next_sequence: 0,
             journal_bytes: 0,
+            journal_unsynced: true,
             logical_bytes,
             logical_limit: logical_bytes
                 .checked_add(MAX_LOGICAL_GROWTH)
@@ -758,6 +754,29 @@ impl Inner {
             return Err(io::Error::other(
                 "journal append/sync failed; reopen generation before mutation",
             ));
+        }
+        Ok(())
+    }
+
+    fn sync_journal(&mut self, sync: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
+        if !self.journal_unsynced {
+            return Ok(());
+        }
+        if let Err(error) = sync(&self.journal) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.journal_unsynced = false;
+        Ok(())
+    }
+
+    fn write_journal(&mut self, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+        // A failed write can leave a partial frame without advancing the
+        // logical journal length. Mark dirty before attempting any file I/O.
+        self.journal_unsynced = true;
+        if let Err(error) = write(&mut self.journal) {
+            self.poisoned = true;
+            return Err(error);
         }
         Ok(())
     }
@@ -1078,21 +1097,18 @@ impl Inner {
         hash.update(&metadata);
         hash.update(payload);
         header[60..].copy_from_slice(hash.finalize().as_bytes());
-        let result = (|| {
-            if platform::file_metadata(&self.journal)?.len() != self.journal_bytes {
+        let journal_bytes = self.journal_bytes;
+        self.write_journal(|journal| {
+            if platform::file_metadata(journal)?.len() != journal_bytes {
                 return Err(invalid(
                     "journal length changed outside the generation writer",
                 ));
             }
-            self.journal.seek(SeekFrom::Start(self.journal_bytes))?;
-            self.journal.write_all(&header)?;
-            self.journal.write_all(&metadata)?;
-            self.journal.write_all(payload)
-        })();
-        if let Err(error) = result {
-            self.poisoned = true;
-            return Err(error);
-        }
+            journal.seek(SeekFrom::Start(journal_bytes))?;
+            journal.write_all(&header)?;
+            journal.write_all(&metadata)?;
+            journal.write_all(payload)
+        })?;
         let payload_offset = self.journal_bytes + HEADER_BYTES as u64 + metadata.len() as u64;
         self.apply(record.operation, payload_offset, payload);
         self.journal_bytes = end;
@@ -1672,6 +1688,173 @@ namespace_error!(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
+
+    fn journal_sync_fixture() -> (PathBuf, Manifest, WritableCas) {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-journal-sync-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(&generation).unwrap();
+        let base = Manifest::from([(
+            String::new(),
+            Entry {
+                id: "root".into(),
+                link_group: None,
+                mode: 0o755,
+                modified_ns: 10,
+                kind: EntryKind::Directory,
+            },
+        )]);
+        let engine =
+            WritableCas::create(&objects, &generation, &base, "revision", "generation").unwrap();
+        (root, base, engine)
+    }
+
+    #[test]
+    fn writable_journal_sync_tracks_global_writes_and_reopen() {
+        let (root, base, engine) = journal_sync_fixture();
+        // Creation already performed its journal and directory barriers.
+        assert!(!engine.lock().unwrap().journal_unsynced);
+        engine
+            .lock()
+            .unwrap()
+            .sync_journal(|_| panic!("clean create must not resync"))
+            .unwrap();
+        let inode = engine.create_file(ROOT_INODE, "file", 0o600).unwrap().inode;
+        let writer = engine.open_handle(inode, true).unwrap();
+        let reader = engine.open_handle(inode, false).unwrap();
+        engine.write(writer, 0, b"first").unwrap();
+        assert!(engine.lock().unwrap().journal_unsynced);
+        let mut barriers = 0;
+        for _ in 0..3 {
+            engine
+                .lock()
+                .unwrap()
+                .sync_journal(|journal| {
+                    barriers += 1;
+                    journal.sync_all()
+                })
+                .unwrap();
+        }
+        assert_eq!(barriers, 1);
+        // A read-only handle does not define the barrier's scope. Another
+        // handle's append dirties the same journal and requires a new barrier.
+        assert_eq!(engine.read(reader, 0, 5).unwrap(), b"first");
+        engine.write(writer, 0, b"later").unwrap();
+        engine.sync().unwrap();
+        assert!(!engine.lock().unwrap().journal_unsynced);
+        engine.write(writer, 0, b"final").unwrap();
+        let expected = engine.snapshot().unwrap();
+        assert!(!engine.lock().unwrap().journal_unsynced);
+        drop(engine);
+
+        // Even a known-clean prior owner cannot transfer an in-memory proof.
+        // Every reopen must establish its own first successful barrier.
+        for _ in 0..2 {
+            let reopened = WritableCas::open(
+                &root.join("objects"),
+                &root.join("generation"),
+                &base,
+                "revision",
+                "generation",
+            )
+            .unwrap();
+            assert!(reopened.lock().unwrap().journal_unsynced);
+            let mut barriers = 0;
+            for _ in 0..2 {
+                reopened
+                    .lock()
+                    .unwrap()
+                    .sync_journal(|journal| {
+                        barriers += 1;
+                        journal.sync_all()
+                    })
+                    .unwrap();
+            }
+            assert_eq!(barriers, 1);
+            assert_eq!(reopened.snapshot().unwrap(), expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_journal_sync_partial_write_remains_dirty() {
+        let (root, base, engine) = journal_sync_fixture();
+        let path = root.join("generation").join(JOURNAL_NAME);
+        let before = engine.stats().unwrap().journal_bytes;
+        {
+            let mut inner = engine.lock().unwrap();
+            assert!(!inner.journal_unsynced);
+            // The same private writer used by append: some physical bytes
+            // were written, but the frame did not complete or advance state.
+            let error = inner
+                .write_journal(|journal| {
+                    journal.seek(SeekFrom::End(0))?;
+                    journal.write_all(&MAGIC[..3])?;
+                    Err(io::Error::other("partial frame write"))
+                })
+                .unwrap_err();
+            assert_eq!(error.to_string(), "partial frame write");
+            assert!(inner.journal_unsynced && inner.poisoned);
+            assert_eq!(inner.journal_bytes, before);
+        }
+        assert_eq!(fs::metadata(&path).unwrap().len(), before + 3);
+        engine.sync().unwrap();
+        assert!(!engine.lock().unwrap().journal_unsynced);
+        assert!(engine.recovery_info().unwrap().read_only);
+        assert!(engine.snapshot().is_err());
+        drop(engine);
+
+        let recovered = WritableCas::open(
+            &root.join("objects"),
+            &root.join("generation"),
+            &base,
+            "revision",
+            "generation",
+        )
+        .unwrap();
+        assert!(recovered.lock().unwrap().journal_unsynced);
+        assert!(recovered.recovery_info().unwrap().incomplete_tail);
+        assert_eq!(recovered.snapshot().unwrap(), base);
+        assert!(!recovered.lock().unwrap().journal_unsynced);
+        assert_eq!(fs::metadata(&path).unwrap().len(), before + 3);
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writable_journal_sync_failure_requires_another_barrier() {
+        let (root, _, engine) = journal_sync_fixture();
+        engine.create_file(ROOT_INODE, "file", 0o600).unwrap();
+        {
+            let mut inner = engine.lock().unwrap();
+            let error = inner
+                .sync_journal(|_| Err(io::Error::other("journal sync failed")))
+                .unwrap_err();
+            assert_eq!(error.to_string(), "journal sync failed");
+            assert!(inner.journal_unsynced && inner.poisoned);
+            let mut barriers = 0;
+            inner
+                .sync_journal(|journal| {
+                    barriers += 1;
+                    journal.sync_all()
+                })
+                .unwrap();
+            assert_eq!(barriers, 1);
+            assert!(!inner.journal_unsynced);
+            assert!(inner.poisoned, "a successful sync does not repair poison");
+        }
+        assert!(engine.create_file(ROOT_INODE, "refused", 0o600).is_err());
+        assert!(engine.snapshot().is_err());
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn writable_generation_namespace_content_recovery_and_checkpoint() {

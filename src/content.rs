@@ -510,6 +510,55 @@ pub(crate) fn observe_copied(
 
 /// Writes a fresh tree only. The caller owns staging and atomic publication.
 pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result<()> {
+    materialize_inner(manifest, objects, target, || Ok(None), || {})
+}
+
+/// Native restore, checkout and branch-trash recovery share this candidate.
+/// Other materialization callers, including projections, stay serial.
+pub(crate) fn materialize_native_restore(
+    manifest: &Manifest,
+    objects: &Path,
+    target: &Path,
+) -> Result<()> {
+    materialize_inner(
+        manifest,
+        objects,
+        target,
+        || {
+            if cfg!(target_os = "linux") {
+                crate::file_sync::FileSync::new().map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        || {},
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn materialize_with_test_sync(
+    manifest: &Manifest,
+    objects: &Path,
+    target: &Path,
+    sync: crate::file_sync::FileSync,
+    on_directory_sync: impl FnMut(),
+) -> Result<()> {
+    materialize_inner(
+        manifest,
+        objects,
+        target,
+        || Ok(Some(sync)),
+        on_directory_sync,
+    )
+}
+
+fn materialize_inner(
+    manifest: &Manifest,
+    objects: &Path,
+    target: &Path,
+    create_sync: impl FnOnce() -> io::Result<Option<crate::file_sync::FileSync>>,
+    mut on_directory_sync: impl FnMut(),
+) -> Result<()> {
     validate_manifest(manifest)?;
     validate_native_manifest(manifest)?;
     let target = normalized_root(target)?;
@@ -527,52 +576,79 @@ pub fn materialize(manifest: &Manifest, objects: &Path, target: &Path) -> Result
     let cache = crate::file_cache::Session::new(objects);
     let mut directories = Vec::new();
     let mut linked_files: BTreeMap<&str, PathBuf> = BTreeMap::new();
-    for (relative, entry) in manifest {
-        let path = target.join(relative);
-        match &entry.kind {
-            EntryKind::Directory => {
-                if !relative.is_empty() {
-                    platform::create_dir(&path, 0o700)?;
-                    platform::set_path_mode(&path, 0o700)?;
+    let mut sync = create_sync()?;
+    let traversal = (|| -> Result<()> {
+        for (relative, entry) in manifest {
+            let path = target.join(relative);
+            match &entry.kind {
+                EntryKind::Directory => {
+                    if !relative.is_empty() {
+                        platform::create_dir(&path, 0o700)?;
+                        platform::set_path_mode(&path, 0o700)?;
+                    }
+                    directories.push((path, entry.mode, entry.modified_ns));
                 }
-                directories.push((path, entry.mode, entry.modified_ns));
-            }
-            EntryKind::File { size, chunks } => {
-                if let Some(first) = entry
-                    .link_group
-                    .as_deref()
-                    .and_then(|group| linked_files.get(group))
-                {
-                    // The representative is inside this fresh destination, not
-                    // a mutable file in any existing workspace or object store.
-                    platform::hard_link(first, &path)?;
-                    continue;
+                EntryKind::File { size, chunks } => {
+                    // Group representatives and aliases keep their original serial
+                    // ordering, including singleton groups retained for continuity.
+                    if entry.link_group.is_some()
+                        && let Some(sync) = &mut sync
+                    {
+                        sync.drain()?;
+                    }
+                    if let Some(first) = entry
+                        .link_group
+                        .as_deref()
+                        .and_then(|group| linked_files.get(group))
+                    {
+                        // The representative is inside this fresh destination, not
+                        // a mutable file in any existing workspace or object store.
+                        platform::hard_link(first, &path)?;
+                        continue;
+                    }
+                    let output = cache.materialize(&reader, chunks, *size, &path)?;
+                    platform::set_mode(&output, entry.mode)?;
+                    output.set_times(
+                        FileTimes::new().set_modified(modified_time(entry.modified_ns)?),
+                    )?;
+                    if entry.link_group.is_none()
+                        && let Some(sync) = &mut sync
+                    {
+                        sync.submit(output)?;
+                    } else {
+                        output.sync_all()?;
+                    }
+                    if let Some(group) = entry.link_group.as_deref() {
+                        linked_files.insert(group, path);
+                    }
                 }
-                let output = cache.materialize(&reader, chunks, *size, &path)?;
-                platform::set_mode(&output, entry.mode)?;
-                output
-                    .set_times(FileTimes::new().set_modified(modified_time(entry.modified_ns)?))?;
-                output.sync_all()?;
-                if let Some(group) = entry.link_group.as_deref() {
-                    linked_files.insert(group, path);
+                EntryKind::Symlink { target: link } => {
+                    create_symlink(link, &path)?;
+                    #[cfg(target_os = "macos")]
+                    set_symlink_permissions(&path, entry.mode)?;
+                    crate::copy_tree::set_symlink_modified(&path, entry.modified_ns)?;
                 }
-            }
-            EntryKind::Symlink { target: link } => {
-                create_symlink(link, &path)?;
-                #[cfg(target_os = "macos")]
-                set_symlink_permissions(&path, entry.mode)?;
-                crate::copy_tree::set_symlink_modified(&path, entry.modified_ns)?;
             }
         }
+        Ok(())
+    })();
+    if let Some(sync) = sync {
+        sync.finish(traversal)?;
+    } else {
+        traversal?;
     }
+    // All file work, including on error paths, has finished before returning or
+    // entering the existing child-before-parent directory publication barriers.
     // Child directories are finalized before parents, including mode-000 dirs.
     directories.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
     for (path, mode, modified_ns) in directories {
         let directory = platform::open_directory(&path)?;
         platform::set_mode(&directory, mode)?;
         directory.set_times(FileTimes::new().set_modified(modified_time(modified_ns)?))?;
+        on_directory_sync();
         platform::sync_directory_file(&directory)?;
     }
+    on_directory_sync();
     platform::sync_directory(
         target
             .parent()
@@ -1078,6 +1154,87 @@ mod tests {
         assert!(validate_manifest(&manifest).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mixed_hardlink_and_singleton_groups_drain_pending_independent_files() -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = fs::canonicalize(std::env::temp_dir())?
+            .join(format!("sprig-mixed-restore-{}", unique_id("test", 0, 0)));
+        fs::create_dir(&root)?;
+        let _cleanup = Cleanup(root.clone());
+        let source = root.join("source");
+        fs::create_dir(&source)?;
+        for (name, length) in [("a", 1), ("b", 2), ("c", 3), ("e", 5), ("f", 6), ("g", 7)] {
+            fs::write(source.join(name), vec![b'x'; length])?;
+        }
+        fs::hard_link(source.join("b"), source.join("d"))?;
+        fs::hard_link(source.join("b"), source.join("h"))?;
+        let objects = root.join("objects");
+        let (mut manifest, _) = capture(&source, &objects, &Observed::new())?;
+        let singleton = manifest.get_mut("f").unwrap();
+        singleton.link_group = Some(singleton.id.clone());
+        let target = root.join("restored");
+        let worker_target = target.clone();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let worker_completed = completed.clone();
+        let sync = crate::file_sync::FileSync::for_test(move |file| {
+            let next_group_path = match file.metadata()?.len() {
+                1 => "b",
+                3 => "d",
+                5 => "f",
+                7 => "h",
+                other => panic!("group representative incorrectly queued: {other}"),
+            };
+            // This worker must finish before the following representative or
+            // alias is created. Every tested group boundary has a pending job.
+            assert!(!worker_target.join(next_group_path).exists());
+            file.sync_all()?;
+            worker_completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })?;
+        let barriers = std::cell::Cell::new(0);
+        materialize_with_test_sync(&manifest, &objects, &target, sync, || {
+            assert_eq!(completed.load(Ordering::SeqCst), 4);
+            barriers.set(barriers.get() + 1);
+        })?;
+        assert_eq!(completed.load(Ordering::SeqCst), 4);
+        assert_eq!(Arc::strong_count(&completed), 1);
+        assert_eq!(barriers.get(), 2, "root and parent directory barriers");
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            assert_eq!(fs::read(target.join(name))?, fs::read(source.join(name))?);
+            let actual = platform::symlink_metadata(target.join(name))?;
+            assert_eq!(actual.mode() & 0o777, manifest[name].mode);
+            assert_eq!(
+                actual.mtime() as i128 * 1_000_000_000 + actual.mtime_nsec() as i128,
+                manifest[name].modified_ns
+            );
+        }
+        let b = platform::symlink_metadata(target.join("b"))?;
+        for alias in ["d", "h"] {
+            assert!(same_node(
+                &b,
+                &platform::symlink_metadata(target.join(alias))?
+            ));
+        }
+        assert!(!same_node(
+            &b,
+            &platform::symlink_metadata(source.join("b"))?
+        ));
+        assert!(!same_node(
+            &b,
+            &platform::symlink_metadata(target.join("f"))?
+        ));
+        Ok(())
+    }
+
     #[test]
     fn preserves_native_link_topology_and_inode_continuity() -> Result<()> {
         struct Fixture(PathBuf);
@@ -1108,12 +1265,14 @@ mod tests {
 
         let restored = fixture.0.join("restored");
         materialize(&manifest, &objects, &restored)?;
+        let native_restore = fixture.0.join("native-restore");
+        materialize_native_restore(&manifest, &objects, &native_restore)?;
         let copied = fixture.0.join("copied");
         let stats =
             crate::copy_tree::copy_tree(&source, &copied, crate::copy_tree::CopyMode::Copy)?;
         assert_eq!(stats.copied, 2);
         assert_eq!(stats.hardlinks, 1);
-        for target in [&restored, &copied] {
+        for target in [&restored, &native_restore, &copied] {
             let a = platform::symlink_metadata(target.join("a"))?;
             let b = platform::symlink_metadata(target.join("directory/b"))?;
             let original = platform::symlink_metadata(source.join("a"))?;

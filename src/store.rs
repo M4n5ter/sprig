@@ -853,8 +853,32 @@ impl Store {
         name: &str,
         new_branch: bool,
     ) -> Result<WorkspaceResult> {
+        self.restore_locked_with_materializer(
+            _lock,
+            state,
+            revision,
+            data,
+            branch,
+            name,
+            new_branch,
+            content::materialize_native_restore,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Test seam around the same publication pipeline.
+    fn restore_locked_with_materializer(
+        &self,
+        _lock: &StoreLock,
+        state: &mut State,
+        revision: &str,
+        data: &Revision,
+        branch: &str,
+        name: &str,
+        new_branch: bool,
+        materialize: impl FnOnce(&content::Manifest, &Path, &Path) -> Result<()>,
+    ) -> Result<WorkspaceResult> {
         let directory = self.new_native()?;
-        content::materialize(&data.manifest, &self.objects(), &self.tree(&directory))?;
+        materialize(&data.manifest, &self.objects(), &self.tree(&directory))?;
         let observed = observe_manifest(&self.tree(&directory), &data.manifest)?;
         let mut workspace = Workspace {
             backend: WorkspaceBackend::Native,

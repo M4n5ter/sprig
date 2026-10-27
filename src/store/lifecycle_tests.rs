@@ -290,3 +290,107 @@ fn query_operations_decode_each_reference_once_without_cross_operation_cache() -
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn assert_restore_sync_failure_is_unpublished(file_count: usize) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = std::env::temp_dir().join(format!("sprig-restore-sync-failure-{}", new_id()?));
+    fs::create_dir(&root)?;
+    let root = root.canonicalize()?;
+    let _cleanup = Cleanup(root.clone());
+    let source = root.join("source");
+    fs::create_dir(&source)?;
+    for index in 1..=file_count {
+        fs::write(source.join(format!("file-{index}")), vec![b'x'; index])?;
+    }
+    let store = Store::init(&root.join("store"))?;
+    let imported = store.import(&source, "main", CopyMode::Copy)?;
+    let lock = store.lock()?;
+    let mut state = store.state()?;
+    let before_state = serde_json::to_vec(&state)?;
+    let before_persisted = fs::read(store.root.join("state.json"))?;
+    let before_generation = state.generation;
+    let revision = imported.base_revision;
+    let data = store.revision(&revision)?;
+    let finished = Arc::new(AtomicUsize::new(0));
+    let finished_worker = finished.clone();
+    let sync = crate::file_sync::FileSync::for_test(move |file| {
+        let result = if file.metadata()?.len() == 1 {
+            Err(io::Error::other("injected first-file sync failure"))
+        } else {
+            file.sync_all()
+        };
+        finished_worker.fetch_add(1, Ordering::SeqCst);
+        result
+    })?;
+    let barriers = Cell::new(0);
+    let target = std::cell::RefCell::new(None);
+    let result = store.restore_locked_with_materializer(
+        &lock,
+        &mut state,
+        &revision,
+        &data,
+        "failed-branch",
+        "failed-workspace",
+        true,
+        |manifest, objects, tree| {
+            target.replace(Some(tree.to_owned()));
+            content::materialize_with_test_sync(manifest, objects, tree, sync, || {
+                barriers.set(barriers.get() + 1);
+            })
+        },
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "injected first-file sync failure"
+    );
+    assert_eq!(finished.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        Arc::strong_count(&finished),
+        1,
+        "all workers must be joined"
+    );
+    assert_eq!(
+        barriers.get(),
+        0,
+        "no directory/parent sync after file failure"
+    );
+    assert_eq!(state.generation, before_generation);
+    assert_eq!(serde_json::to_vec(&state)?, before_state);
+    assert_eq!(fs::read(store.root.join("state.json"))?, before_persisted);
+    assert_eq!(serde_json::to_vec(&store.state()?)?, before_state);
+    assert!(!state.branches.contains_key("failed-branch"));
+    assert!(!state.workspaces.contains_key("failed-workspace"));
+    let target = target.into_inner().expect("materialization started");
+    for index in 1..=file_count {
+        assert_eq!(
+            fs::read(target.join(format!("file-{index}")))?,
+            vec![b'x'; index]
+        );
+    }
+    // Three files reaches submit's full-batch drain after writing file three;
+    // two files reaches finish's final drain. Only the first two were submitted.
+    assert_eq!(names(&target)?.len(), file_count);
+    assert_eq!(fs::read(imported.path.join("file-1"))?, b"x");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_restore_full_batch_sync_failure_skips_barriers_and_publication() -> Result<()> {
+    assert_restore_sync_failure_is_unpublished(3)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_restore_final_drain_sync_failure_skips_barriers_and_publication() -> Result<()> {
+    assert_restore_sync_failure_is_unpublished(2)
+}

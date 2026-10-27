@@ -1377,14 +1377,16 @@ impl Inner {
         self.mark_inode(inode);
     }
 
-    fn ensure_spans(&mut self, inode: u64) -> io::Result<()> {
+    // Return whether this call discovered spans and filled the base portion of
+    // output. Verified bytes are reused only within this read, never cached.
+    fn ensure_spans(&mut self, inode: u64, start: u64, output: &mut [u8]) -> io::Result<bool> {
         let node = self.nodes.get_mut(&inode).ok_or_else(not_found)?;
         let file = node
             .file
             .as_mut()
             .ok_or_else(|| invalid("not a regular file"))?;
         if file.spans.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let EntryKind::File { chunks, .. } = &node.entry.kind else {
             unreachable!()
@@ -1401,6 +1403,17 @@ impl Inner {
             if bytes.is_empty() || end > file.base_size {
                 return Err(invalid("base chunk lengths exceed file size"));
             }
+            let copy_start = start.max(offset);
+            // The caller sizes output from a checked range end (or leaves it
+            // empty on overflow), so start + output.len() cannot overflow.
+            let copy_end = (start + output.len() as u64)
+                .min(end)
+                .min(file.base_visible);
+            if copy_start < copy_end {
+                output[(copy_start - start) as usize..(copy_end - start) as usize].copy_from_slice(
+                    &bytes[(copy_start - offset) as usize..(copy_end - offset) as usize],
+                );
+            }
             spans.push(Span {
                 start: offset,
                 end,
@@ -1412,7 +1425,7 @@ impl Inner {
             return Err(invalid("base chunk lengths do not match file size"));
         }
         file.spans = Some(spans);
-        Ok(())
+        Ok(true)
     }
 
     fn read(&mut self, inode: u64, offset: u64, length: usize) -> io::Result<Vec<u8>> {
@@ -1423,23 +1436,29 @@ impl Inner {
         if offset >= size || length == 0 {
             return Ok(vec![]);
         }
-        if offset
+        // Keep the original error ordering: discover/validate all base chunks
+        // before reporting a requested-range overflow. In that case there is
+        // no output to fill, but span discovery still performs every check.
+        let end = offset.checked_add(length as u64).map(|end| size.min(end));
+        let mut output = vec![0_u8; end.map_or(0, |end| (end - offset) as usize)];
+        let discovered = if offset
             < self.nodes[&inode]
                 .file
                 .as_ref()
                 .expect("regular file")
                 .base_visible
         {
-            self.ensure_spans(inode)?;
-        }
-        let end = size.min(
-            offset
-                .checked_add(length as u64)
-                .ok_or_else(invalid_input)?,
-        );
-        let mut output = vec![0_u8; (end - offset) as usize];
+            self.ensure_spans(inode, offset, &mut output)?
+        } else {
+            false
+        };
+        let end = end.ok_or_else(invalid_input)?;
         let file = self.nodes[&inode].file.as_ref().expect("regular file");
-        let spans = file.spans.as_deref().unwrap_or(&[]);
+        let spans: &[Span] = if discovered {
+            &[]
+        } else {
+            file.spans.as_deref().unwrap_or(&[])
+        };
         let first = spans.partition_point(|span| span.end <= offset);
         for span in &spans[first..] {
             if span.start >= end.min(file.base_visible) {
@@ -1672,6 +1691,291 @@ namespace_error!(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
+
+    fn verified_read_fixture() -> (PathBuf, WritableCas, u64, Vec<String>) {
+        verified_read_fixture_with_chunks(&[b"abcd", b"efghi", b"jkl"], false)
+    }
+
+    fn verified_read_fixture_with_chunks(
+        parts: &[&[u8]],
+        packed: bool,
+    ) -> (PathBuf, WritableCas, u64, Vec<String>) {
+        let root = std::env::temp_dir().join(format!(
+            "sprig-verified-read-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let objects = root.join("objects");
+        let generation = root.join("generation");
+        fs::create_dir(&objects).unwrap();
+        fs::create_dir(&generation).unwrap();
+        // Explicit chunk boundaries keep both backing variants independent of CDC.
+        let chunks: Vec<_> = if packed {
+            let mut batch = packed::Batch::open(&objects).unwrap();
+            let chunks = parts
+                .iter()
+                .map(|bytes| batch.put(bytes).unwrap())
+                .collect();
+            batch.finish().unwrap();
+            chunks
+        } else {
+            parts
+                .iter()
+                .map(|bytes| {
+                    let hash = blake3::hash(bytes).to_hex().to_string();
+                    fs::write(objects.join(&hash), bytes).unwrap();
+                    hash
+                })
+                .collect()
+        };
+        let mut base = Manifest::new();
+        for (path, kind) in [
+            ("", EntryKind::Directory),
+            (
+                "file",
+                EntryKind::File {
+                    size: parts.iter().map(|bytes| bytes.len() as u64).sum(),
+                    chunks: chunks.clone(),
+                },
+            ),
+        ] {
+            base.insert(
+                path.into(),
+                Entry {
+                    id: format!("entry:{path}"),
+                    link_group: None,
+                    mode: 0o755,
+                    modified_ns: 1,
+                    kind,
+                },
+            );
+        }
+        let engine = WritableCas::create(&objects, &generation, &base, "r", "g").unwrap();
+        let inode = engine.lookup_path("file").unwrap().inode;
+        (root, engine, inode, chunks)
+    }
+
+    #[test]
+    fn verified_base_read_compressed_packed_chunks() {
+        let parts = [vec![b'a'; 4096], vec![b'b'; 8192], vec![b'c'; 2048]];
+        let (root, engine, inode, chunks) =
+            verified_read_fixture_with_chunks(&[&parts[0], &parts[1], &parts[2]], true);
+        let locations = packed::Reader::open(&root.join("objects"))
+            .unwrap()
+            .locations();
+        for hash in &chunks {
+            let location = &locations[hash];
+            assert_eq!(location.codec, packed::Codec::Zstd);
+            assert!(location.stored_length < location.length);
+            assert!(!root.join("objects").join(hash).exists());
+        }
+        assert!(
+            engine.lock().unwrap().nodes[&inode]
+                .file
+                .as_ref()
+                .unwrap()
+                .spans
+                .is_none()
+        );
+        assert_eq!(engine.read_inode(inode, 4094, 6).unwrap(), b"aabbbb");
+        assert_eq!(engine.read_inode(inode, 4094, 6).unwrap(), b"aabbbb");
+        assert_eq!(engine.read_inode(inode, 12286, 6).unwrap(), b"bbcccc");
+        assert_eq!(engine.read_inode(inode, 14334, 20).unwrap(), b"cc");
+        assert_eq!(engine.read_inode(inode, 0, 14336).unwrap(), parts.concat());
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_base_read_ranges_and_cached_spans() {
+        for (offset, length) in [
+            (0, 12),
+            (1, 2),
+            (3, 7),
+            (4, 5),
+            (8, 3),
+            (11, 9),
+            (12, 1),
+            (0, 0),
+        ] {
+            let (root, engine, inode, chunks) = verified_read_fixture();
+            let expected = &b"abcdefghijkl"[offset as usize..12.min(offset as usize + length)];
+            assert_eq!(engine.read_inode(inode, offset, length).unwrap(), expected);
+            assert_eq!(engine.read_inode(inode, offset, length).unwrap(), expected);
+            if offset < 12 && length != 0 {
+                // Discovered spans must not turn into a content cache across reads.
+                fs::write(root.join("objects").join(&chunks[0]), b"bad!").unwrap();
+                assert!(engine.read_inode(inode, 0, 1).is_err());
+            } else {
+                assert!(
+                    engine.lock().unwrap().nodes[&inode]
+                        .file
+                        .as_ref()
+                        .unwrap()
+                        .spans
+                        .is_none()
+                );
+            }
+            drop(engine);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_base_read_overlays_truncate_growth_and_hardlink() {
+        let (root, engine, inode, _) = verified_read_fixture();
+        let handle = engine.open_handle(inode, true).unwrap();
+        engine.write(handle, 2, b"123456").unwrap();
+        engine.write(handle, 4, b"XY").unwrap();
+        engine
+            .setattr(
+                inode,
+                SetAttr {
+                    size: Some(7),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        engine
+            .setattr(
+                inode,
+                SetAttr {
+                    size: Some(14),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let alias = engine.link(inode, ROOT_INODE, "alias").unwrap();
+        assert_eq!(alias.inode, inode);
+        assert!(
+            engine.lock().unwrap().nodes[&inode]
+                .file
+                .as_ref()
+                .unwrap()
+                .spans
+                .is_none()
+        );
+        assert_eq!(
+            engine.read_inode(alias.inode, 1, 20).unwrap(),
+            b"b12XY5\0\0\0\0\0\0\0"
+        );
+        assert_eq!(
+            engine.read(handle, 0, 20).unwrap(),
+            b"ab12XY5\0\0\0\0\0\0\0"
+        );
+
+        // An overwritten historical extent is still checked, in original order.
+        {
+            let mut inner = engine.lock().unwrap();
+            let payload = inner.nodes[&inode].file.as_ref().unwrap().extents[0].payload_offset;
+            inner.journal.seek(SeekFrom::Start(payload)).unwrap();
+            inner.journal.write_all(b"!").unwrap();
+        }
+        assert_eq!(
+            engine.read_inode(inode, 4, 1).unwrap_err().to_string(),
+            "journal write extent checksum mismatch"
+        );
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_base_read_checks_overwritten_and_unrequested_chunks() {
+        for corrupt_chunk in 0..3 {
+            let (root, engine, inode, chunks) = verified_read_fixture();
+            let handle = engine.open_handle(inode, true).unwrap();
+            engine.write(handle, 0, b"replacement!").unwrap();
+            engine
+                .setattr(
+                    inode,
+                    SetAttr {
+                        size: Some(5),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let path = root.join("objects").join(&chunks[corrupt_chunk]);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, vec![b'!'; original.len()]).unwrap();
+            assert!(engine.read_inode(inode, 0, 1).is_err());
+            assert!(
+                engine.lock().unwrap().nodes[&inode]
+                    .file
+                    .as_ref()
+                    .unwrap()
+                    .spans
+                    .is_none()
+            );
+            // Failed discovery must publish neither a partial result nor spans.
+            fs::write(&path, original).unwrap();
+            assert_eq!(engine.read_inode(inode, 0, 1).unwrap(), b"r");
+            drop(engine);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_base_read_preserves_size_checks_and_overflow_error_order() {
+        let (root, engine, inode, _) = verified_read_fixture();
+        for (base_size, message) in [
+            (11, "base chunk lengths exceed file size"),
+            (13, "base chunk lengths do not match file size"),
+        ] {
+            engine
+                .lock()
+                .unwrap()
+                .nodes
+                .get_mut(&inode)
+                .unwrap()
+                .file
+                .as_mut()
+                .unwrap()
+                .base_size = base_size;
+            assert_eq!(
+                engine.read_inode(inode, 0, 1).unwrap_err().to_string(),
+                message
+            );
+        }
+        {
+            // Inject otherwise unreachable metadata to exercise the range-overflow
+            // guard without a huge fixture, preserving base-validation precedence.
+            let mut inner = engine.lock().unwrap();
+            let node = inner.nodes.get_mut(&inode).unwrap();
+            let EntryKind::File { size, .. } = &mut node.entry.kind else {
+                unreachable!()
+            };
+            *size = u64::MAX;
+            node.file.as_mut().unwrap().base_visible = u64::MAX;
+        }
+        assert_eq!(
+            engine
+                .read_inode(inode, u64::MAX - 1, 2)
+                .unwrap_err()
+                .to_string(),
+            "base chunk lengths do not match file size"
+        );
+        engine
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&inode)
+            .unwrap()
+            .file
+            .as_mut()
+            .unwrap()
+            .base_size = 12;
+        assert_eq!(
+            engine
+                .read_inode(inode, u64::MAX - 1, 2)
+                .unwrap_err()
+                .kind(),
+            invalid_input().kind()
+        );
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn writable_generation_namespace_content_recovery_and_checkpoint() {

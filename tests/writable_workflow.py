@@ -17,6 +17,7 @@ import signal
 import sys
 import subprocess
 import tempfile
+import time
 
 
 def run(binary):
@@ -71,12 +72,19 @@ def run(binary):
         return invoke("list")["branches"]["main"]
 
     def busy_checkpoint():
+        mounted = path("main")
+        cache_started = time.monotonic()
+        attrs = (mounted / "a.txt").stat()
         before = head()
         proc = invoke("checkpoint", "main", fail=True)
         message = json.loads(proc.stdout)["error"]["message"].lower()
         assert "busy" in message or "os error 16" in message, message
         assert head() == before
-        path("main")
+        assert path("main") == mounted
+        after = (mounted / "a.txt").stat()
+        assert (after.st_ino, after.st_size, after.st_mtime_ns, after.st_mode) == (
+            attrs.st_ino, attrs.st_size, attrs.st_mtime_ns, attrs.st_mode)
+        assert time.monotonic() - cache_started < 60, "busy check exceeded cache TTL"
 
     failure = None
     remaining = []
@@ -89,14 +97,55 @@ def run(binary):
         invoke("mount", "main")
         tree = path("main")
         assert (tree / "a.txt").read_text() == "alpha\nbeta\n"
-        assert (tree / "linked.txt").stat().st_ino == (tree / "directory/linked-alias.txt").stat().st_ino
+        # Prewarm positive metadata, then observe mutations before the candidate's
+        # 60-second TTL expires. Expiry must not turn a stale-cache case into a pass.
+        past_ns = 1_234_567_890_123_456_789
+        cache_started = time.monotonic()
+        linked = tree / "linked.txt"
+        alias = tree / "directory/linked-alias.txt"
+        linked_before = linked.stat()
+        assert linked_before.st_ino == alias.stat().st_ino
+        assert linked_before.st_nlink == 2
         os.link(tree / "linked.txt", tree / "third-link.txt")
-        assert (tree / "linked.txt").stat().st_nlink == 3
+        assert linked.stat().st_nlink == alias.stat().st_nlink == 3
+        os.utime(linked, ns=(past_ns, past_ns))
+        assert linked.stat().st_mtime_ns == alias.stat().st_mtime_ns == past_ns
         (tree / "third-link.txt").write_text("all aliases\n")
-        assert (tree / "directory/linked-alias.txt").read_text() == "all aliases\n"
+        assert alias.read_text() == "all aliases\n"
+        after_write = alias.stat()
+        assert after_write.st_ino == linked_before.st_ino
+        assert after_write.st_size == len(b"all aliases\n")
+        assert after_write.st_mtime_ns != past_ns
         (tree / "third-link.txt").unlink()
-        assert (tree / "linked.txt").stat().st_nlink == 2
+        assert linked.stat().st_nlink == alias.stat().st_nlink == 2
+        os.chmod(linked, 0o600)
+        os.utime(linked, ns=(past_ns, past_ns))
+        same_process = alias.stat()
+        assert same_process.st_mode & 0o777 == 0o600
+        assert same_process.st_mtime_ns == past_ns
+        assert time.monotonic() - cache_started < 60, "alias checks exceeded cache TTL"
 
+        with linked.open("rb") as held:
+            cache_started = time.monotonic()
+            assert os.fstat(held.fileno()).st_size == alias.stat().st_size == len(b"all aliases\n")
+            changed_ns = past_ns + 101
+            child = subprocess.run([sys.executable, "-c",
+                "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); "
+                "before=os.fstat(fd); assert before.st_size==12; "
+                "assert os.pwrite(fd,b'CHILD',12)==5; written=os.fstat(fd); "
+                "assert written.st_size==17 and written.st_mtime_ns!=before.st_mtime_ns; "
+                "os.fchmod(fd,0o640); assert os.fstat(fd).st_mode & 0o777==0o640; "
+                "ns=int(sys.argv[2]); os.utime(fd,ns=(ns,ns)); "
+                "assert os.fstat(fd).st_mtime_ns==ns; os.close(fd)",
+                str(alias), str(changed_ns)], capture_output=True, text=True, timeout=15)
+            assert child.returncode == 0, child.stderr
+            for attrs in [linked.stat(), alias.stat(), os.fstat(held.fileno())]:
+                assert attrs.st_ino == linked_before.st_ino and attrs.st_nlink == 2
+                assert attrs.st_size == len(b"all aliases\nCHILD")
+                assert attrs.st_mtime_ns == changed_ns
+                assert attrs.st_mode & 0o777 == 0o640
+            assert held.read() == alias.read_bytes() == b"all aliases\nCHILD"
+            assert time.monotonic() - cache_started < 60, "child checks exceeded cache TTL"
 
         invoke("exec", "main", "--", "sh", "-eu", "-c",
                "printf 'atomic\nbeta\n' > .save; mv .save a.txt; "
@@ -121,12 +170,26 @@ def run(binary):
             fcntl.fcntl(random, fcntl.F_SETFL, original_flags & ~os.O_APPEND)
             assert os.pwrite(random, b"Z", 0) == 1
             assert os.pread(random, 8, 0) == b"ZbXYef++"
+            cache_started = time.monotonic()
+            os.utime(random, ns=(past_ns, past_ns))
+            before_truncate = os.fstat(random)
+            assert before_truncate.st_size == (tree / "random.bin").stat().st_size == 8
+            assert before_truncate.st_mtime_ns == past_ns
             os.ftruncate(random, 3)
+            for attrs in [os.fstat(random), (tree / "random.bin").stat()]:
+                assert attrs.st_size == 3 and attrs.st_ino == before_truncate.st_ino
+                assert attrs.st_mtime_ns != past_ns
+            os.utime(random, ns=(past_ns, past_ns))
+            assert os.fstat(random).st_mtime_ns == (tree / "random.bin").stat().st_mtime_ns == past_ns
             os.ftruncate(random, 9)
+            for attrs in [os.fstat(random), (tree / "random.bin").stat()]:
+                assert attrs.st_size == 9 and attrs.st_ino == before_truncate.st_ino
+                assert attrs.st_mtime_ns != past_ns
             assert os.pread(random, 9, 0) == b"ZbX" + b"\0" * 6
             assert os.pwrite(random, b"Q", 7) == 1
             assert os.pread(random, 9, 0) == b"ZbX" + b"\0" * 4 + b"Q\0"
             os.fsync(random)
+            assert time.monotonic() - cache_started < 60, "truncate checks exceeded cache TTL"
         finally:
             os.close(random)
         directory = os.open(tree, os.O_RDONLY | os.O_DIRECTORY)
@@ -138,18 +201,30 @@ def run(binary):
         # Rename replacement and unlink must not redirect existing handles to
         # the new path's node, recycle the inode, or lose its private contents.
         victim = tree / "victim"
+        replacement = tree / "replacement"
         victim.write_bytes(b"old victim")
-        (tree / "replacement").write_bytes(b"new victim")
-        with victim.open("rb") as old:
+        replacement.write_bytes(b"new replacement victim")
+        with victim.open("rb") as old, replacement.open("rb") as retained_source:
+            cache_started = time.monotonic()
             old_inode = os.fstat(old.fileno()).st_ino
-            os.replace(tree / "replacement", victim)
+            assert victim.stat().st_ino == old_inode
+            source_attrs = replacement.stat()
+            assert os.fstat(retained_source.fileno()).st_ino == source_attrs.st_ino
+            os.replace(replacement, victim)
+            moved = victim.stat()
+            assert (moved.st_ino, moved.st_size, moved.st_mtime_ns, moved.st_mode) == (
+                source_attrs.st_ino, source_attrs.st_size, source_attrs.st_mtime_ns, source_attrs.st_mode)
+            assert not replacement.exists()
+            assert os.fstat(old.fileno()).st_nlink == 0
             with victim.open("rb") as new:
                 assert os.fstat(new.fileno()).st_ino != old_inode
                 victim.unlink()
                 assert old.read() == b"old victim"
-                assert new.read() == b"new victim"
+                assert new.read() == retained_source.read() == b"new replacement victim"
                 assert os.fstat(old.fileno()).st_nlink == 0
                 assert os.fstat(new.fileno()).st_nlink == 0
+                assert os.fstat(retained_source.fileno()).st_nlink == 0
+            assert time.monotonic() - cache_started < 60, "rename checks exceeded cache TTL"
 
         # The ordinary page cache is shared by aliases and processes. msync is
         # a durability boundary; checkpoint still requires every mapping closed.
@@ -271,9 +346,16 @@ def run(binary):
             assert (retained / "writable.journal").read_bytes() == journal
         finally:
             obstruction.rmdir()  # Only the empty obstruction created above.
+        cache_started = time.monotonic()
+        before_rotation = (tree / "a.txt").stat()
         committed = invoke("checkpoint", "main")["revision"]
         assert committed != initial and head() == committed
         assert path("main") != tree, "checkpoint did not publish a new clean generation"
+        after_rotation = (path("main") / "a.txt").stat()
+        assert (after_rotation.st_size, after_rotation.st_mtime_ns, after_rotation.st_mode) == (
+            before_rotation.st_size, before_rotation.st_mtime_ns, before_rotation.st_mode)
+        assert not list(tree.iterdir()), "old generation remained mounted"
+        assert time.monotonic() - cache_started < 60, "rotation checks exceeded cache TTL"
         assert (retained / "writable.journal").read_bytes() == journal
         assert read(committed, "a.txt") == "atomic\nbeta\nappend\n"
         assert read(initial, "a.txt") == "alpha\nbeta\n"
@@ -289,11 +371,17 @@ def run(binary):
             opened.write(b"durable before checkpoint\n")
             opened.flush()
             os.fsync(opened.fileno())
+        cache_started = time.monotonic()
+        before_remount = (tree / "journal.txt").stat()
         invoke("unmount", "main")
         assert head() == committed
         assert not list(path("main", mounted=False).iterdir())
         invoke("mount", "main")
         assert (path("main") / "journal.txt").read_bytes() == b"durable before checkpoint\n"
+        after_remount = (path("main") / "journal.txt").stat()
+        assert (after_remount.st_size, after_remount.st_mtime_ns, after_remount.st_mode) == (
+            before_remount.st_size, before_remount.st_mtime_ns, before_remount.st_mode)
+        assert time.monotonic() - cache_started < 60, "remount checks exceeded cache TTL"
         reopened = invoke("checkpoint", "main")["revision"]
         assert read(reopened, "journal.txt") == "durable before checkpoint\n"
 
@@ -305,9 +393,14 @@ def run(binary):
         first = invoke("checkpoint", "writer-a")["revision"]
         old_b = path("writer-b")
         (old_b / "b.txt").write_text("writer b\n")
+        cache_started = time.monotonic()
+        stale_attrs = (old_b / "a.txt").stat()
         merged = invoke("checkpoint", "writer-b")["revision"]
         assert merged != first and path("writer-b") != old_b
         assert (path("writer-b") / "a.txt").read_text() == "writer a\nbeta\n"
+        merged_attrs = (path("writer-b") / "a.txt").stat()
+        assert merged_attrs.st_size == len(b"writer a\nbeta\n") != stale_attrs.st_size
+        assert time.monotonic() - cache_started < 60, "merge checks exceeded cache TTL"
         assert read("main", "b.txt") == "writer b\n"
         invoke("write", "writer-b", "sdk.txt", "--text", "SDK apply\n")
         assert (path("writer-b") / "sdk.txt").read_text() == "SDK apply\n"
@@ -414,6 +507,8 @@ def run(binary):
         # Exhaust only this synthetic generation's journal, not the host disk.
         # A background mmap write failure must survive daemon exit and block
         # ordinary publication; explicit recovery keeps the journal evidence.
+        # This is NOT the still-unverified logical-write-then-O_SYNC/O_DSYNC
+        # sync-failure case; exhausting the append quota does not establish it.
         invoke("--writable", "restore", initial, "quota")
         invoke("mount", "quota")
         quota_tree = path("quota")

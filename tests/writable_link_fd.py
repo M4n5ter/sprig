@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def exercise(tree, events):
@@ -18,19 +19,46 @@ def exercise(tree, events):
     try:
         assert os.write(fd,payload)==len(payload)
         os.fsync(fd)
+        cache_started=time.monotonic()
         before=os.fstat(fd)
+        assert source.stat().st_ino==before.st_ino and before.st_nlink==1
         assert os.pread(fd,len(payload),0)==payload
         events.append('open fd verified before hardlink')
         os.link(source,alias)
+        assert os.fstat(fd).st_nlink==source.stat().st_nlink==alias.stat().st_nlink==2
         events.append('ordinary hardlink created while fd remains open')
         assert os.pread(fd,len(payload),0)==payload
+        past_ns=1_234_567_890_123_456_789
+        os.utime(fd,ns=(past_ns,past_ns))
+        assert os.fstat(fd).st_mtime_ns==alias.stat().st_mtime_ns==past_ns
         assert os.pwrite(fd,b'AFTER',17)==5
         os.fsync(fd)
         expected=payload[:17]+b'AFTER'+payload[22:]
         assert alias.read_bytes()==source.read_bytes()==expected
+        assert os.fstat(fd).st_mtime_ns!=past_ns
+        assert alias.stat().st_size==len(expected)
+        alias_fd=os.open(alias,os.O_WRONLY)
+        try:
+            assert os.pwrite(alias_fd,b'END',len(expected))==3
+            os.fsync(alias_fd)
+        finally:os.close(alias_fd)
+        expected+=b'END'
+        assert os.pread(fd,len(expected),0)==source.read_bytes()==alias.read_bytes()==expected
         original=os.fstat(fd);linked=alias.stat();current=source.stat()
         assert (original.st_dev,original.st_ino)==(linked.st_dev,linked.st_ino)==(current.st_dev,current.st_ino)==(before.st_dev,before.st_ino)
         assert original.st_nlink==linked.st_nlink==current.st_nlink==2
+        assert original.st_size==linked.st_size==current.st_size==len(expected)
+        assert original.st_mtime_ns==linked.st_mtime_ns==current.st_mtime_ns!=past_ns
+        alias.unlink()
+        assert os.fstat(fd).st_nlink==source.stat().st_nlink==1
+        source.unlink()
+        assert os.fstat(fd).st_nlink==0
+        os.ftruncate(fd,0)
+        assert os.fstat(fd).st_size==0
+        os.ftruncate(fd,len(expected))
+        assert os.fstat(fd).st_size==len(expected)
+        assert os.pread(fd,len(expected),0)==b'\0'*len(expected)
+        assert time.monotonic()-cache_started<60,'held-fd checks exceeded cache TTL'
         events.append('held fd pread/pwrite/fsync and alias identity passed')
     finally:os.close(fd)
 

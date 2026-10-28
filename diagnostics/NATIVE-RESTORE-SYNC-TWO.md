@@ -67,3 +67,26 @@ cold-cache, Btrfs, macOS/Windows runtime, power-loss or whole-Cargo validation.
 Concurrency may regress on other storage. Fallible startup is handled but no
 resource-exhaustion startup test was run. This experiment needs broader native
 filesystem and portability validation before considering main-branch promotion.
+
+## Main integration validation (2026-10-28)
+
+Source commit `d8e13ba0f346f441ac6d580765b5bac8dab1258b` subsequently passed
+[CI run 40469018834](https://github.com/M4n5ter/sprig/actions/runs/40469018834):
+Ubuntu, Linux projection, macOS and Windows jobs all succeeded. This updates the
+ordinary portability-validation status above; it does not add broad Linux
+filesystem, cold-cache or power-loss performance evidence.
+
+The main integration selects only the bounded Linux native
+checkout, restore and branch-trash recovery file synchronization. No mounted
+Cargo, LayerFS superiority, checkpoint or non-Linux speedup is claimed.
+
+Three independent canonical-backup regression tests are extracted unchanged
+from `1bd8793eda1be01dfe35b22abe00c14e5fff4fc9`: canonical backup/recovery with
+retained workspaces, full state validation before backup, and canonical retry
+with fail-closed recovery representation collisions. Current production already
+uses the same canonical backup policy. No exact-byte backup experiment,
+parallel-checkpoint implementation or combined checkpoint experiment is included.
+The combined source passed local default tests (58 library and 6 other tests),
+projection tests (74 library and 6 other tests), formatting and strict Clippy in
+both configurations. These runs do not establish a native FUSE mount or other
+platform runtime coverage; the final published commit has its own CI run.

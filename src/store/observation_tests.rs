@@ -310,3 +310,53 @@ fn observation_recovery_and_collection_faults_never_erase_published_roots() -> R
     }
     Ok(())
 }
+
+#[test]
+fn canonical_backup_retry_accepts_equivalent_state_and_recovery_collision_fails_closed()
+-> Result<()> {
+    for rewrite_after_backup in [false, true] {
+        let (root, source, store) = fixture()?;
+        store.import(&source, "main", CopyMode::Copy)?;
+        let generation = store.state()?.generation;
+        let state_path = store.root.join("state.json");
+        let canonical = fs::read(&state_path)?;
+        let value: serde_json::Value = serde_json::from_slice(&canonical)?;
+        let pretty = serde_json::to_vec_pretty(&value)?;
+        if !rewrite_after_backup {
+            fs::write(&state_path, &pretty)?;
+        }
+        let injected = inject_at("save-after-backup");
+        assert!(store.branch("failed", "main").is_err());
+        drop(injected);
+        let backup_path = store
+            .root
+            .join("backups")
+            .join(format!("{generation}.json.zst"));
+        let backup = fs::read(&backup_path)?;
+        let (_, hash): (State, _) = metadata::read(&backup_path)?;
+        assert_eq!(hash, blake3::hash(&canonical));
+        if rewrite_after_backup {
+            fs::write(&state_path, &pretty)?;
+        }
+        // Recovery has always preserved exact current bytes. A representation
+        // collision must remain fail-closed without replacing either file.
+        assert!(
+            Store::recover_state(&store.root, generation)
+                .unwrap_err()
+                .to_string()
+                .contains("collision")
+        );
+        assert_eq!(fs::read(&state_path)?, pretty);
+        assert_eq!(fs::read(&backup_path)?, backup);
+        // Ordinary save canonicalizes equivalent state, so retry must succeed
+        // whether whitespace changed before or after the interrupted backup.
+        store.branch("retry", "main")?;
+        assert_eq!(fs::read(&backup_path)?, backup);
+        Store::recover_state(&store.root, generation)?;
+        assert!(!store.state()?.branches.contains_key("failed"));
+        assert!(!store.state()?.branches.contains_key("retry"));
+        assert_eq!(store.read("main", "file")?, b"contents");
+        fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
